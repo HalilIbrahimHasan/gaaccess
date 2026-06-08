@@ -21,16 +21,6 @@ SOURCE_DATA_DIR: Path = PROJECT_ROOT / "source_data"
 ASSETS_DIR: Path = PROJECT_ROOT / "assets"
 
 # ---------------------------------------------------------------------------
-# Which issuers to process — edit ONLY this list, then run: python src/main.py
-# All year/month partitions for each listed issuer are processed automatically.
-# Issuers not in this list are ignored even if folders exist under source_data/.
-# ---------------------------------------------------------------------------
-PROCESS_ISSUERS: list[str] = [
-    "54372",
-    "64357",
-]
-
-# ---------------------------------------------------------------------------
 # PII handling — default is safe; set EXPORT_PII=True only for debugging
 # ---------------------------------------------------------------------------
 EXPORT_PII: bool = False
@@ -181,21 +171,21 @@ def log_path_configuration() -> None:
     log = get_logger(__name__)
     cwd = os.getcwd()
     log.info("Current working directory : %s", cwd)
-    log.info("Resolved project root     : %s", PROJECT_ROOT)
-    log.info("Resolved source root      : %s", SOURCE_DATA_DIR)
-    log.info("Resolved assets root      : %s", ASSETS_DIR)
-    log.info("Source root exists        : %s", SOURCE_DATA_DIR.exists())
+    log.info("PROJECT_ROOT            : %s", PROJECT_ROOT)
+    log.info("SOURCE_ROOT             : %s", SOURCE_DATA_DIR)
+    log.info("ASSETS_ROOT             : %s", ASSETS_DIR)
+    log.info("SOURCE_ROOT exists      : %s", SOURCE_DATA_DIR.exists())
 
     if not SOURCE_DATA_DIR.exists():
-        log.info("Immediate folders under source root: (directory missing)")
+        log.info("Issuer folders found    : (source root missing)")
         return
 
-    folders = sorted(
+    issuer_folders = sorted(
         p.name
         for p in SOURCE_DATA_DIR.iterdir()
-        if p.is_dir() and not p.name.startswith(".")
+        if p.is_dir() and p.name.isdigit()
     )
     log.info(
-        "Immediate folders under source root: %s",
-        folders if folders else "(none)",
+        "Issuer folders found    : %s",
+        issuer_folders if issuer_folders else "(none)",
     )

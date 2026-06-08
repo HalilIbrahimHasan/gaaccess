@@ -1,12 +1,12 @@
 """
 834 Issuer ETL — main orchestrator.
 
-Which issuers to run is controlled by PROCESS_ISSUERS in src/config.py.
-Just edit that list and run:
+Fully folder-driven: discovers every issuer/year/month under source_data/
+automatically. Add folders and XML files, then run:
 
     python src/main.py
 
-No CLI flags needed. All year/month partitions for each listed issuer are processed.
+No config issuer list, no CLI filters, no manual updates for new issuers.
 """
 
 import json
@@ -18,7 +18,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import PROCESS_ISSUERS, log_path_configuration
+from config import log_path_configuration
 from dashboard.plotly_dashboard import PlotlyDashboard
 from extract.xml_reader import LocalFileSource, XmlReader
 from load.excel_exporter import ExcelExporter
@@ -67,7 +67,7 @@ class PipelineSummary:
 
 
 class IssuerEtlPipeline:
-    """End-to-end ETL pipeline driven by PROCESS_ISSUERS in config."""
+    """End-to-end ETL pipeline — processes every discovered partition."""
 
     def __init__(self, source: LocalFileSource | None = None) -> None:
         self.reader = XmlReader(source=source or LocalFileSource())
@@ -82,14 +82,13 @@ class IssuerEtlPipeline:
         self.dashboard = PlotlyDashboard()
 
     def run(self) -> PipelineSummary:
-        """Execute the pipeline for every partition matching PROCESS_ISSUERS."""
+        """Discover and process every issuer/year/month partition with XML files."""
         partitions = discover_partitions()
         summary = PipelineSummary(discovered=len(partitions))
 
         if not partitions:
             logger.error(
-                "No valid partitions to process. "
-                "Check PROCESS_ISSUERS in src/config.py and ensure folders exist: "
+                "No valid partitions found. Expected structure: "
                 "source_data/{issuer_id}/{year}/{month}/*.xml"
             )
             self._print_summary(summary)
@@ -269,15 +268,22 @@ class IssuerEtlPipeline:
         logger.info("=" * 60)
         logger.info("PROCESSING SUMMARY")
         logger.info("=" * 60)
-        logger.info("PROCESS_ISSUERS            : %s", PROCESS_ISSUERS)
         logger.info("Total partitions discovered : %d", summary.discovered)
         logger.info("Total partitions processed  : %d", summary.processed)
         logger.info("Total partitions skipped    : %d", summary.skipped)
         logger.info("Total partitions failed     : %d", summary.failed)
         if summary.rollup_issuers:
-            logger.info("Rollups created for issuers : %s", ", ".join(summary.rollup_issuers))
+            logger.info(
+                "Rollups created for issuers : %s",
+                ", ".join(summary.rollup_issuers),
+            )
+        else:
+            logger.info("Rollups created for issuers : (none)")
         if summary.failed_rollups:
-            logger.info("Rollups failed for issuers  : %s", ", ".join(summary.failed_rollups))
+            logger.info(
+                "Rollups failed for issuers  : %s",
+                ", ".join(summary.failed_rollups),
+            )
         for result in summary.results:
             p = result.partition
             if result.status == "processed":
@@ -296,13 +302,8 @@ class IssuerEtlPipeline:
 
 
 def main() -> None:
-    """CLI entry point — issuer selection is in config.PROCESS_ISSUERS only."""
-    logger.info("=" * 60)
-    logger.info("PROCESS_ISSUERS (from config.py): %s", PROCESS_ISSUERS)
-    logger.info("=" * 60)
-
+    """CLI entry point — fully automatic partition discovery from source_data/."""
     log_path_configuration()
-
     pipeline = IssuerEtlPipeline(source=LocalFileSource())
     summary = pipeline.run()
     if summary.failed > 0 or summary.failed_rollups:

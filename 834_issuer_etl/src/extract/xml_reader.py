@@ -20,13 +20,8 @@ class DataSource(ABC):
     """Abstract contract for locating and reading partitioned issuer XML files."""
 
     @abstractmethod
-    def discover_partitions(
-        self,
-        issuer_id: str | None = None,
-        year: str | None = None,
-        month: str | None = None,
-    ) -> list[SourcePartition]:
-        """Return all partitions matching optional issuer/year/month filters."""
+    def discover_partitions(self) -> list[SourcePartition]:
+        """Return all partitions discovered under the source root."""
 
     @abstractmethod
     def read_bytes(self, file_id: str) -> bytes:
@@ -39,18 +34,8 @@ class LocalFileSource(DataSource):
     def __init__(self, source_dir: Path | None = None) -> None:
         self.source_dir = source_dir or config.SOURCE_DATA_DIR
 
-    def discover_partitions(
-        self,
-        issuer_id: str | None = None,
-        year: str | None = None,
-        month: str | None = None,
-    ) -> list[SourcePartition]:
-        return discover_partitions(
-            source_root=self.source_dir,
-            issuer_id=issuer_id,
-            year=year,
-            month=month,
-        )
+    def discover_partitions(self) -> list[SourcePartition]:
+        return discover_partitions(source_root=self.source_dir)
 
     def read_bytes(self, file_id: str) -> bytes:
         path = Path(file_id)
