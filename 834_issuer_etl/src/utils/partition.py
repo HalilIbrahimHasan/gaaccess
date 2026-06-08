@@ -8,6 +8,7 @@ No config issuer list, no CLI filters, no hardcoded issuers.
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -341,3 +342,84 @@ def monthly_output_stem(partition: SourcePartition) -> str:
 
 def rollup_output_stem(issuer_id: str) -> str:
     return f"{issuer_id}_all_periods"
+
+
+def list_source_issuer_ids(source_roots: list[Path] | None = None) -> set[str]:
+    """Return every numeric issuer folder name under source_data."""
+    ids: set[str] = set()
+    for root in source_roots or iter_source_roots():
+        if not root.exists():
+            continue
+        for p in root.iterdir():
+            if p.is_dir() and _is_issuer_folder(p.name):
+                ids.add(p.name)
+    return ids
+
+
+def list_asset_issuer_ids() -> set[str]:
+    """Return every numeric issuer folder name under assets/."""
+    ids: set[str] = set()
+    if not config.ASSETS_DIR.exists():
+        return ids
+    for p in config.ASSETS_DIR.iterdir():
+        if p.is_dir() and _is_issuer_folder(p.name):
+            ids.add(p.name)
+    return ids
+
+
+def log_issuer_gaps(
+    partitions: list[SourcePartition],
+    source_roots: list[Path] | None = None,
+) -> None:
+    """
+    Warn when source_data has issuer folders with no valid partitions,
+    or assets/ contains leftover folders from old runs or git history.
+    """
+    source_ids = list_source_issuer_ids(source_roots)
+    active_ids = {p.issuer_id for p in partitions}
+    asset_ids = list_asset_issuer_ids()
+
+    skipped = sorted(source_ids - active_ids)
+    if skipped:
+        logger.warning(
+            "Issuers in source_data with NO valid partitions (check year/month/XML): %s",
+            ", ".join(skipped),
+        )
+        for iid in skipped:
+            logger.warning(
+                "  → %s needs: source_data/%s/{year}/{month}/*.xml",
+                iid,
+                iid,
+            )
+
+    stale_assets = sorted(asset_ids - active_ids)
+    if stale_assets:
+        logger.warning(
+            "Stale assets/ issuer folders (old run or git) — will be removed: %s",
+            ", ".join(stale_assets),
+        )
+
+
+def clean_stale_asset_issuers(active_issuer_ids: set[str]) -> list[str]:
+    """
+    Delete assets/{issuer}/ folders for issuers not in the current run.
+
+    assets/ is regenerated every run; leftover folders (e.g. 64357 from git)
+    confuse Explorer even when the console shows the correct issuers.
+    """
+    removed: list[str] = []
+    if not config.ASSETS_DIR.exists():
+        return removed
+
+    for path in sorted(config.ASSETS_DIR.iterdir(), key=lambda p: p.name):
+        if not path.is_dir() or not _is_issuer_folder(path.name):
+            continue
+        if path.name in active_issuer_ids:
+            continue
+        shutil.rmtree(path)
+        removed.append(path.name)
+        logger.info("Removed stale assets folder: %s", path)
+
+    if removed:
+        logger.info("Cleaned stale asset issuers: %s", ", ".join(removed))
+    return removed

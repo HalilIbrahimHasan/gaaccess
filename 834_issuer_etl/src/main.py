@@ -36,10 +36,12 @@ from transform.xml_parser import Xml834Parser  # noqa: E402
 from utils.logger import get_logger  # noqa: E402
 from utils.partition import (  # noqa: E402
     SourcePartition,
+    clean_stale_asset_issuers,
     discover_partitions,
     ensure_partition_asset_dirs,
     ensure_rollup_asset_dirs,
     iter_source_roots,
+    log_issuer_gaps,
     monthly_output_stem,
     rollup_output_stem,
 )
@@ -87,6 +89,10 @@ class IssuerEtlPipeline:
     def run(self) -> PipelineSummary:
         partitions = discover_partitions()
         summary = PipelineSummary(discovered=len(partitions))
+        active_issuers = {p.issuer_id for p in partitions}
+
+        log_issuer_gaps(partitions)
+        clean_stale_asset_issuers(active_issuers)
 
         if not partitions:
             logger.error("Nothing to process.")
