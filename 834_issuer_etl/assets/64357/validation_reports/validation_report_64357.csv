@@ -1,0 +1,19 @@
+issuer_id,check_category,check_name,status,message,details,affected_count
+64357,schema,required_columns_exist,PASS,All 49 required columns present,,0
+64357,data_quality,required_id_issuer_id,PASS,0 null/empty value(s) in issuer_id,Total rows: 150,0
+64357,data_quality,required_id_exchg_indiv_identifier,PASS,0 null/empty value(s) in exchg_indiv_identifier,Total rows: 150,0
+64357,data_quality,required_id_exchg_assigned_policy_id,PASS,0 null/empty value(s) in exchg_assigned_policy_id,Total rows: 150,0
+64357,data_quality,duplicate_within_file,PASS,0 duplicate row(s) on issuer+file+member,,0
+64357,data_quality,duplicate_across_files,PASS,0 row(s) with duplicate issuer+member across files,Expected for maintenance updates; review if unexpected,0
+64357,data_quality,qtyt_consistency,PASS,0 enrollment segment(s) with QTYt mismatch,,0
+64357,data_quality,subscriber_flag_valid,PASS,0 invalid subscriber_flag value(s),"Expected: {'Y', 'N'}",0
+64357,data_profile,insurance_type_codes_tracked,PASS,1 distinct insurance type code(s) found,DEN,1
+64357,data_quality,total_premium_amt_numeric,PASS,0 non-numeric value(s) in total_premium_amt,,0
+64357,data_quality,health_coverage_premium_amt_numeric,PASS,0 non-numeric value(s) in health_coverage_premium_amt,,0
+64357,data_quality,total_indiv_responsibility_amt_numeric,PASS,0 non-numeric value(s) in total_indiv_responsibility_amt,,0
+64357,data_quality,aptc_amt_numeric,PASS,0 non-numeric value(s) in aptc_amt,,0
+64357,data_quality,total_premium_amt_non_negative,PASS,0 negative total_premium_amt value(s),,0
+64357,data_quality,benefit_effective_begin_date_not_null,PASS,0 null benefit_effective_begin_date value(s),,0
+64357,data_quality,source_exchg_id_present,PASS,0 missing source_exchg_id value(s),Field should be present when available in source XML,0
+64357,data_profile,high_missingness_columns,WARN,1 column(s) with >50% missingness,member_entity_identifier_code(100.0%),1
+64357,data_profile,row_counts_by_file,PASS,4 file(s) profiled,from_64357_GA_834_INDV_20260204071545.xml: 128 rows; from_64357_GA_834_INDV_20260211071730.xml: 13 rows; from_64357_GA_834_INDV_20260218064929.xml: 4 rows; from_64357_GA_834_INDV_20260225064930.xml: 5 rows,4
