@@ -34,6 +34,9 @@ PII_COLUMNS: list[str] = [
 REQUIRED_COLUMNS: list[str] = [
     "source_file",
     "issuer_id",
+    "source_year",
+    "source_month",
+    "source_period",
     "isa09",
     "isa10",
     "isa13",
@@ -116,10 +119,15 @@ VALID_SUBSCRIBER_FLAGS: set[str] = {"Y", "N"}
 # Default issuer used in examples / CLI help text only — not hardcoded in logic
 DEFAULT_ISSUER_EXAMPLE: str = "64357"
 
-# SQLite table names
+# SQLite table names (monthly partitions)
 TABLE_ENROLLEES: str = "issuer_enrollees"
 TABLE_KPIS: str = "issuer_kpis"
 TABLE_VALIDATION: str = "validation_results"
+
+# SQLite table names (issuer rollup across all periods)
+TABLE_ENROLLEES_ROLLUP: str = "issuer_enrollees_all_periods"
+TABLE_KPIS_ROLLUP: str = "issuer_kpis_all_periods"
+TABLE_VALIDATION_ROLLUP: str = "validation_results_all_periods"
 
 # Logging
 LOG_FORMAT: str = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"

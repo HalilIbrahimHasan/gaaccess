@@ -1,8 +1,8 @@
 # 834 Issuer ETL Framework
 
-A scalable Python ETL framework for processing **834 XML issuer enrollment files**. The pipeline extracts XML from per-issuer folders, parses enrollee records into normalized DataFrames, validates data quality, computes KPIs, and exports results to Excel, cleaned XML, SQLite, and an interactive Plotly HTML dashboard.
+A scalable Python ETL framework for processing **834 XML issuer enrollment files** at **issuer / year / month** partition granularity. The pipeline extracts XML from partitioned folders, parses enrollee records into normalized DataFrames, validates data quality, computes KPIs, and exports results to Excel, cleaned XML, SQLite, JSON validation reports, and interactive Plotly HTML dashboards.
 
-Designed to process **any number of issuers dynamically** — no hardcoded issuer logic.
+Designed to process **any number of issuers and time partitions dynamically** — no hardcoded issuer logic.
 
 ---
 
@@ -20,41 +20,77 @@ pip install -r requirements.txt
 
 ---
 
+## Input Folder Structure
+
+XML files must be organized by issuer, year, and month:
+
+```
+source_data/
+└── 64357/
+    └── 2026/
+        └── 02/
+            ├── from_64357_GA_834_INDV_20260204071545.xml
+            ├── from_64357_GA_834_INDV_20260211071730.xml
+            ├── from_64357_GA_834_INDV_20260218064929.xml
+            └── from_64357_GA_834_INDV_20260225064930.xml
+```
+
+Additional issuers follow the same pattern:
+
+```
+source_data/
+├── 64357/
+│   └── 2026/
+│       └── 02/
+├── 68806/
+│   └── 2026/
+│       ├── 01/
+│       └── 02/
+└── 49046/
+    └── 2025/
+        └── 12/
+```
+
+---
+
 ## Project Structure
 
 ```
 834_issuer_etl/
-├── source_data/                  # Input XML files (local; SFTP-ready design)
-│   └── 64357/
-│       └── *.xml
-├── assets/                       # All generated outputs
-│   └── 64357/
-│       ├── cleaned_xml/
-│       ├── excel/
-│       ├── sqlite/
-│       ├── dashboards/
-│       └── validation_reports/
+├── source_data/                  # Input XML (local; SFTP-ready design)
+│   └── {issuer_id}/{year}/{month}/*.xml
+├── assets/                       # Generated outputs
+│   └── {issuer_id}/
+│       ├── {year}/{month}/       # Monthly partition outputs
+│       │   ├── cleaned_xml/
+│       │   ├── excel/
+│       │   ├── sqlite/
+│       │   ├── dashboards/
+│       │   └── validation_reports/
+│       └── rollups/              # Issuer-level combined outputs
+│           ├── excel/
+│           ├── sqlite/
+│           └── dashboards/
 ├── src/
-│   ├── config.py                 # Paths, schema, PII policy, validation rules
-│   ├── main.py                   # Pipeline orchestrator
-│   ├── extract/
-│   │   └── xml_reader.py         # DataSource abstraction (local + future SFTP)
+│   ├── config.py
+│   ├── main.py
+│   ├── extract/xml_reader.py     # DataSource abstraction
 │   ├── transform/
-│   │   ├── xml_parser.py         # 834 XML → flat enrollee rows
-│   │   ├── cleaner.py            # Type conversion, PII masking, metadata
-│   │   └── kpi_builder.py        # Issuer-level KPIs and breakdowns
+│   │   ├── xml_parser.py
+│   │   ├── cleaner.py
+│   │   └── kpi_builder.py
 │   ├── validate/
-│   │   ├── schema_validator.py   # Required column checks
-│   │   └── data_quality_validator.py  # Business rules + profiling
+│   │   ├── schema_validator.py
+│   │   └── data_quality_validator.py
 │   ├── load/
 │   │   ├── excel_exporter.py
 │   │   ├── xml_exporter.py
 │   │   └── sqlite_loader.py
-│   ├── dashboard/
-│   │   └── plotly_dashboard.py
+│   ├── dashboard/plotly_dashboard.py
 │   └── utils/
-│       ├── logger.py
-│       └── file_utils.py
+│       ├── partition.py          # Partition discovery
+│       ├── file_utils.py
+│       └── logger.py
 ├── requirements.txt
 └── README.md
 ```
@@ -63,56 +99,43 @@ pip install -r requirements.txt
 
 ## How to Run
 
-### Process all issuers
+### Process all issuers, years, and months
 
 ```bash
 python src/main.py
 ```
 
-### Process a single issuer
+### Process all partitions for one issuer
 
 ```bash
 python src/main.py --issuer 64357
 ```
 
-The pipeline will:
+### Process all months in a year for one issuer
 
-1. Discover issuer folders under `source_data/`
-2. Parse all `*.xml` files per issuer (continues if one file fails)
-3. Clean and standardize enrollee records
-4. Run schema and data-quality validation
-5. Compute issuer KPIs
-6. Export outputs to `assets/{issuer_id}/`
+```bash
+python src/main.py --issuer 64357 --year 2026
+```
 
----
+### Process a single month
 
-## Output Locations
+```bash
+python src/main.py --issuer 64357 --year 2026 --month 02
+```
 
-| Output | Path |
-|--------|------|
-| Cleaned enrollees (Excel) | `assets/{issuer_id}/excel/cleaned_enrollees_{issuer_id}.xlsx` |
-| KPI summary (Excel) | `assets/{issuer_id}/excel/kpi_summary_{issuer_id}.xlsx` |
-| Validation report (Excel) | `assets/{issuer_id}/excel/validation_report_{issuer_id}.xlsx` |
-| Cleaned enrollees (XML) | `assets/{issuer_id}/cleaned_xml/cleaned_enrollees_{issuer_id}.xml` |
-| SQLite database | `assets/{issuer_id}/sqlite/issuer_{issuer_id}.db` |
-| Interactive dashboard | `assets/{issuer_id}/dashboards/issuer_{issuer_id}_dashboard.html` |
-| Validation CSV | `assets/{issuer_id}/validation_reports/validation_report_{issuer_id}.csv` |
+After monthly processing, the pipeline automatically builds **issuer rollup** outputs combining all processed months for each issuer.
 
 ---
 
-## Adding a New Issuer
+## Adding a New Issuer / Year / Month
 
-1. Create a folder under `source_data/` named with the numeric issuer ID:
-
-   ```
-   source_data/68806/
-   ```
-
-2. Place 834 XML files in that folder:
+1. Create the folder path:
 
    ```
-   source_data/68806/from_68806_GA_834_INDV_20260301080000.xml
+   source_data/68806/2026/03/
    ```
+
+2. Place 834 XML files in that month folder.
 
 3. Run the pipeline:
 
@@ -120,25 +143,69 @@ The pipeline will:
    python src/main.py
    ```
 
-   Outputs are automatically created under `assets/68806/`.
+   Monthly outputs appear under `assets/68806/2026/03/`.
+   Rollup outputs appear under `assets/68806/rollups/` after all months for that issuer are processed in the same run.
 
 No code changes are required.
 
 ---
 
+## Monthly Output Locations
+
+For partition `64357 / 2026 / 02`:
+
+| Output | Path |
+|--------|------|
+| Cleaned enrollees (Excel) | `assets/64357/2026/02/excel/cleaned_enrollees_64357_2026_02.xlsx` |
+| KPI summary (Excel) | `assets/64357/2026/02/excel/kpi_summary_64357_2026_02.xlsx` |
+| Validation report (Excel) | `assets/64357/2026/02/excel/validation_report_64357_2026_02.xlsx` |
+| Validation report (JSON) | `assets/64357/2026/02/validation_reports/validation_report_64357_2026_02.json` |
+| Cleaned enrollees (XML) | `assets/64357/2026/02/cleaned_xml/cleaned_enrollees_64357_2026_02.xml` |
+| SQLite database | `assets/64357/2026/02/sqlite/issuer_64357_2026_02.db` |
+| Dashboard | `assets/64357/2026/02/dashboards/issuer_64357_2026_02_dashboard.html` |
+
+---
+
+## Rollup Output Locations
+
+For issuer `64357` (all processed months combined):
+
+| Output | Path |
+|--------|------|
+| Cleaned enrollees (Excel) | `assets/64357/rollups/excel/cleaned_enrollees_64357_all_periods.xlsx` |
+| KPI summary (Excel) | `assets/64357/rollups/excel/kpi_summary_64357_all_periods.xlsx` |
+| SQLite database | `assets/64357/rollups/sqlite/issuer_64357_all_periods.db` |
+| Dashboard | `assets/64357/rollups/dashboards/issuer_64357_all_periods_dashboard.html` |
+
+---
+
+## Partition Columns
+
+Every cleaned enrollee row includes:
+
+| Column | Description |
+|--------|-------------|
+| `issuer_id` | From folder name |
+| `source_year` | From year folder (e.g. `2026`) |
+| `source_month` | From month folder (e.g. `02`) |
+| `source_period` | `YYYY-MM` format (e.g. `2026-02`) |
+| `source_file` | Original XML filename |
+| `load_timestamp` | UTC timestamp when row was processed |
+
+---
+
 ## PII Handling
 
-By default, sensitive fields are **masked** in all outputs:
+By default, sensitive fields are **masked** in all outputs (SSN, phone, email, names, address).
 
-- SSN, phone, email, first/last name, full address
-
-To export raw PII for debugging only, set in `src/config.py`:
+To export raw PII for debugging only:
 
 ```python
+# src/config.py
 EXPORT_PII = True
 ```
 
-**Never enable this in production exports.**
+Never enable in production.
 
 ---
 
@@ -146,32 +213,38 @@ EXPORT_PII = True
 
 The extract layer uses a `DataSource` abstract interface (`extract/xml_reader.py`):
 
-- **`LocalFileSource`** — reads from `source_data/{issuer_id}/` (current default)
-- **`SFTPFileSource`** — stub documented for future implementation
+- **`LocalFileSource`** — reads from `source_data/{issuer}/{year}/{month}/` (current default)
+- **`SFTPFileSource`** — documented extension point for future remote ingestion
 
-Downstream transform, validate, load, and dashboard stages depend only on parsed data — **not** on how files are retrieved. Adding SFTP later requires only a new `DataSource` implementation and a one-line change in `main.py`.
+Downstream stages depend only on `Partition` objects and parsed data — not on how files are retrieved.
 
 ---
 
 ## SQLite Tables
 
-Each issuer database (`issuer_{issuer_id}.db`) contains:
+### Monthly partition DB (`issuer_{issuer}_{year}_{month}.db`)
 
 | Table | Description |
 |-------|-------------|
-| `issuer_enrollees` | Cleaned enrollee records (one row per member) |
-| `issuer_kpis` | Scalar KPI metrics with load timestamp |
+| `issuer_enrollees` | Cleaned enrollee records for that month |
+| `issuer_kpis` | Scalar KPI metrics |
 | `validation_results` | Schema and data-quality check outcomes |
+
+### Rollup DB (`issuer_{issuer}_all_periods.db`)
+
+| Table | Description |
+|-------|-------------|
+| `issuer_enrollees_all_periods` | All months combined |
+| `issuer_kpis_all_periods` | Rollup KPI metrics |
+| `validation_results_all_periods` | Rollup validation outcomes |
 
 ### Example SQL Queries
 
-Open the database:
-
 ```bash
-sqlite3 assets/64357/sqlite/issuer_64357.db
+sqlite3 assets/64357/2026/02/sqlite/issuer_64357_2026_02.db
 ```
 
-**Count total enrollees:**
+**Count total enrollees (monthly):**
 
 ```sql
 SELECT COUNT(*) AS total_enrollees
@@ -181,9 +254,7 @@ FROM issuer_enrollees;
 **Count subscribers and dependents:**
 
 ```sql
-SELECT
-    subscriber_flag,
-    COUNT(*) AS member_count
+SELECT subscriber_flag, COUNT(*) AS member_count
 FROM issuer_enrollees
 GROUP BY subscriber_flag;
 ```
@@ -191,114 +262,96 @@ GROUP BY subscriber_flag;
 **Premium by rating area:**
 
 ```sql
-SELECT
-    rating_area,
-    SUM(total_premium_amt) AS total_premium,
-    COUNT(*) AS member_count
+SELECT rating_area, SUM(total_premium_amt) AS total_premium
 FROM issuer_enrollees
 GROUP BY rating_area
 ORDER BY total_premium DESC;
 ```
 
-**Duplicate member check:**
+**Duplicate member check (monthly):**
 
 ```sql
-SELECT
-    issuer_id,
-    exchg_indiv_identifier,
-    COUNT(*) AS occurrence_count
+SELECT exchg_indiv_identifier, COUNT(*) AS occurrence_count
 FROM issuer_enrollees
-GROUP BY issuer_id, exchg_indiv_identifier
-HAVING COUNT(*) > 1
-ORDER BY occurrence_count DESC;
+GROUP BY exchg_indiv_identifier
+HAVING COUNT(*) > 1;
+```
+
+**Monthly premium trend (rollup DB):**
+
+```sql
+SELECT source_period, SUM(total_premium_amt) AS monthly_premium, COUNT(*) AS members
+FROM issuer_enrollees_all_periods
+GROUP BY source_period
+ORDER BY source_period;
 ```
 
 **Unique policies by file:**
 
 ```sql
-SELECT
-    source_file,
-    COUNT(DISTINCT exchg_assigned_policy_id) AS unique_policies,
-    COUNT(*) AS total_rows
+SELECT source_file,
+       COUNT(DISTINCT exchg_assigned_policy_id) AS unique_policies,
+       COUNT(*) AS total_rows
 FROM issuer_enrollees
-GROUP BY source_file
-ORDER BY source_file;
-```
-
-**Monthly premium trend:**
-
-```sql
-SELECT
-    SUBSTR(benefit_effective_begin_date, 1, 7) AS effective_month,
-    SUM(total_premium_amt) AS monthly_premium,
-    COUNT(*) AS member_count
-FROM issuer_enrollees
-WHERE benefit_effective_begin_date IS NOT NULL
-  AND benefit_effective_begin_date != ''
-GROUP BY effective_month
-ORDER BY effective_month;
+GROUP BY source_file;
 ```
 
 ---
 
-## Validation Checks
+## Validation Checks (per partition)
 
-Per-issuer validation includes:
-
-- Required columns exist
-- Required ID fields not null (`issuer_id`, `exchg_indiv_identifier`, `exchg_assigned_policy_id`)
-- Duplicate checks (within file and across files)
-- QTYt consistency vs enrollee counts per enrollment segment
-- `subscriber_flag` values are `Y` or `N`
-- Insurance type codes tracked dynamically from data
-- Premium fields numeric; `total_premium_amt` non-negative
-- `benefit_effective_begin_date` not null
-- `source_exchg_id` presence check
+- Required columns exist (including partition columns)
+- Required ID fields not null
+- Duplicate checks within file and within month
+- QTYt consistency vs enrollee counts
+- Subscriber flag values (`Y` / `N`)
+- Insurance type codes tracked dynamically
+- Premium fields numeric and non-negative
+- Benefit effective date not null
+- Source exchange ID presence
 - Missingness percentage by column
-- Row counts, unique policy count, and unique member count by file
+- Row counts, unique policies, and unique members by file
 
-Results appear in Excel validation reports, CSV exports, SQLite `validation_results`, and the dashboard validation summary chart.
-
----
-
-## KPIs Generated
-
-- Total files, enrollments, enrollees, subscribers, dependents
-- Unique policies, members, households
-- Duplicate member and policy-member counts
-- Total/average premium and individual responsibility amounts
-- Breakdowns by subscriber flag, relationship, event type/reason, maintenance type, insurance type, rating area, effective month
-- Premium by rating area and effective month
-- File count trend and enrollee count by file
+Results are exported to Excel, JSON, SQLite, and the dashboard.
 
 ---
 
-## Dashboard
+## KPIs (per partition)
 
-Open the generated HTML file in any browser:
+- `total_files_processed`, `total_enrollment_records`, `total_enrollees`
+- `total_subscribers`, `total_dependents`
+- `unique_policies`, `unique_members`, `unique_households`
+- `duplicate_member_count`, `duplicate_policy_member_count`
+- `total_premium_amount`, `average_premium_amount`
+- Breakdowns by file, rating area, effective month, insurance type, etc.
 
+Rollup KPIs add cross-period breakdowns (`member_count_by_source_period`, `premium_by_source_period`).
+
+---
+
+## Dashboards
+
+**Monthly:** `assets/{issuer}/{year}/{month}/dashboards/issuer_{issuer}_{year}_{month}_dashboard.html`
+
+Title shows issuer, year, and month clearly.
+
+**Rollup:** `assets/{issuer}/rollups/dashboards/issuer_{issuer}_all_periods_dashboard.html`
+
+Shows trends across months (enrollees and premium by `source_period`).
+
+Open in any browser:
+
+```bash
+open assets/64357/2026/02/dashboards/issuer_64357_2026_02_dashboard.html
 ```
-assets/64357/dashboards/issuer_64357_dashboard.html
-```
-
-Includes:
-
-- KPI summary table
-- Enrollees by source file
-- Subscribers vs dependents (pie)
-- Premium by rating area
-- Members by effective month
-- Validation issue summary
-- Missingness by column (top 15)
-- Duplicate count indicators
 
 ---
 
 ## Error Handling
 
-- Malformed XML files are logged and **skipped**; remaining files continue processing
-- Issuer-level failures are logged with stack traces; other issuers still process
-- All stages emit structured log messages to stdout
+- Malformed XML files are logged and skipped; remaining files continue
+- Partition-level failures do not stop other partitions
+- Issuer rollup runs after all monthly partitions for that issuer complete successfully
 
 ---
 

@@ -10,6 +10,8 @@ import pandas as pd
 
 from config import REQUIRED_ID_FIELDS, VALID_SUBSCRIBER_FLAGS
 from utils.logger import get_logger
+from utils.partition import Partition
+from validate.schema_validator import _partition_context, _partition_label
 
 logger = get_logger(__name__)
 
@@ -22,43 +24,49 @@ class DataQualityValidator:
     dashboards can display consistent validation issue summaries.
     """
 
-    def validate(self, df: pd.DataFrame, issuer_id: str) -> list[dict]:
+    def validate(
+        self,
+        df: pd.DataFrame,
+        issuer_id: str,
+        partition: Partition | None = None,
+    ) -> list[dict]:
         """
         Execute all data-quality checks and profiling metrics.
 
         Args:
-            df: Cleaned enrollee DataFrame for one issuer.
+            df: Cleaned enrollee DataFrame for one partition or rollup.
             issuer_id: Issuer identifier.
+            partition: Optional monthly partition; ``None`` indicates rollup.
 
         Returns:
             Combined list of validation result dictionaries.
         """
         results: list[dict] = []
+        ctx = _partition_context(issuer_id, partition)
 
         if df.empty:
             results.append(self._result(
-                issuer_id, "data_profile", "dataset_not_empty", "FAIL",
+                ctx, "data_profile", "dataset_not_empty", "FAIL",
                 "No enrollee records found", "", 0,
             ))
             return results
 
-        results.extend(self._check_required_ids(df, issuer_id))
-        results.extend(self._check_duplicates(df, issuer_id))
-        results.extend(self._check_qty_consistency(df, issuer_id))
-        results.extend(self._check_subscriber_flags(df, issuer_id))
-        results.extend(self._check_insurance_types(df, issuer_id))
-        results.extend(self._check_premium_fields(df, issuer_id))
-        results.extend(self._check_benefit_effective_date(df, issuer_id))
-        results.extend(self._check_source_exchg_id(df, issuer_id))
-        results.extend(self._profile_missingness(df, issuer_id))
-        results.extend(self._profile_file_counts(df, issuer_id))
+        results.extend(self._check_required_ids(df, ctx))
+        results.extend(self._check_duplicates(df, ctx, partition))
+        results.extend(self._check_qty_consistency(df, ctx))
+        results.extend(self._check_subscriber_flags(df, ctx))
+        results.extend(self._check_insurance_types(df, ctx))
+        results.extend(self._check_premium_fields(df, ctx))
+        results.extend(self._check_benefit_effective_date(df, ctx))
+        results.extend(self._check_source_exchg_id(df, ctx))
+        results.extend(self._profile_missingness(df, ctx))
+        results.extend(self._profile_file_counts(df, ctx))
 
         fail_count = sum(1 for r in results if r["status"] == "FAIL")
         warn_count = sum(1 for r in results if r["status"] == "WARN")
         logger.info(
-            "Data quality validation for issuer %s: %d PASS/WARN/FAIL checks "
-            "(%d FAIL, %d WARN)",
-            issuer_id,
+            "Data quality validation for %s: %d checks (%d FAIL, %d WARN)",
+            _partition_label(partition, issuer_id),
             len(results),
             fail_count,
             warn_count,
@@ -117,7 +125,7 @@ class DataQualityValidator:
         return profile.sort_values("file_date")
 
     def _check_required_ids(
-        self, df: pd.DataFrame, issuer_id: str
+        self, df: pd.DataFrame, ctx: dict[str, str]
     ) -> list[dict]:
         """Verify required ID fields are not null or empty."""
         results = []
@@ -128,46 +136,55 @@ class DataQualityValidator:
             count = int(null_mask.sum())
             status = "PASS" if count == 0 else "FAIL"
             results.append(self._result(
-                issuer_id, "data_quality", f"required_id_{field}", status,
+                ctx, "data_quality", f"required_id_{field}", status,
                 f"{count} null/empty value(s) in {field}",
                 f"Total rows: {len(df)}", count,
             ))
         return results
 
     def _check_duplicates(
-        self, df: pd.DataFrame, issuer_id: str
+        self,
+        df: pd.DataFrame,
+        ctx: dict[str, str],
+        partition: Partition | None,
     ) -> list[dict]:
-        """Check duplicate enrollees within files and across all files."""
+        """Check duplicate enrollees within files and within the partition scope."""
         results = []
+        scope = "partition" if partition else "all periods"
 
-        # Within-file duplicates: issuer + file + member
         key_file = ["issuer_id", "source_file", "exchg_indiv_identifier"]
         if all(c in df.columns for c in key_file):
             dup_file = df.duplicated(subset=key_file, keep=False)
             count = int(dup_file.sum())
             results.append(self._result(
-                issuer_id, "data_quality", "duplicate_within_file", 
+                ctx, "data_quality", "duplicate_within_file",
                 "FAIL" if count > 0 else "PASS",
-                f"{count} duplicate row(s) on issuer+file+member",
+                f"{count} duplicate row(s) on issuer+file+member within {scope}",
                 "", count,
             ))
 
-        # Cross-file duplicates: issuer + member
-        key_cross = ["issuer_id", "exchg_indiv_identifier"]
-        if all(c in df.columns for c in key_cross):
-            dup_cross = df.duplicated(subset=key_cross, keep=False)
-            count = int(dup_cross.sum())
+        key_scope = ["issuer_id", "exchg_indiv_identifier"]
+        if partition is not None:
+            key_scope = ["issuer_id", "source_period", "exchg_indiv_identifier"]
+        if all(c in df.columns for c in key_scope):
+            dup_scope = df.duplicated(subset=key_scope, keep=False)
+            count = int(dup_scope.sum())
             status = "WARN" if count > 0 else "PASS"
+            label = (
+                "duplicate_within_month"
+                if partition
+                else "duplicate_across_all_periods"
+            )
             results.append(self._result(
-                issuer_id, "data_quality", "duplicate_across_files", status,
-                f"{count} row(s) with duplicate issuer+member across files",
-                "Expected for maintenance updates; review if unexpected", count,
+                ctx, "data_quality", label, status,
+                f"{count} row(s) with duplicate member keys within {scope}",
+                "Review if unexpected for maintenance updates", count,
             ))
 
         return results
 
     def _check_qty_consistency(
-        self, df: pd.DataFrame, issuer_id: str
+        self, df: pd.DataFrame, ctx: dict[str, str]
     ) -> list[dict]:
         """
         Compare QTYt header values against actual enrollee counts per enrollment.
@@ -192,7 +209,7 @@ class DataQualityValidator:
 
         count = len(mismatches)
         results.append(self._result(
-            issuer_id, "data_quality", "qtyt_consistency",
+            ctx, "data_quality", "qtyt_consistency",
             "WARN" if count > 0 else "PASS",
             f"{count} enrollment segment(s) with QTYt mismatch",
             "; ".join(mismatches[:10]) + ("..." if count > 10 else ""),
@@ -201,7 +218,7 @@ class DataQualityValidator:
         return results
 
     def _check_subscriber_flags(
-        self, df: pd.DataFrame, issuer_id: str
+        self, df: pd.DataFrame, ctx: dict[str, str]
     ) -> list[dict]:
         """Ensure subscriber_flag is Y or N when present."""
         if "subscriber_flag" not in df.columns:
@@ -211,14 +228,14 @@ class DataQualityValidator:
         ].notna() & (df["subscriber_flag"].astype(str).str.strip() != "")
         count = int(invalid.sum())
         return [self._result(
-            issuer_id, "data_quality", "subscriber_flag_valid",
+            ctx, "data_quality", "subscriber_flag_valid",
             "FAIL" if count > 0 else "PASS",
             f"{count} invalid subscriber_flag value(s)",
             f"Expected: {VALID_SUBSCRIBER_FLAGS}", count,
         )]
 
     def _check_insurance_types(
-        self, df: pd.DataFrame, issuer_id: str
+        self, df: pd.DataFrame, ctx: dict[str, str]
     ) -> list[dict]:
         """
         Track insurance type codes dynamically (informational PASS).
@@ -231,13 +248,13 @@ class DataQualityValidator:
         types = types[types.astype(str).str.strip() != ""]
         unique_types = sorted(types.unique().tolist())
         return [self._result(
-            issuer_id, "data_profile", "insurance_type_codes_tracked", "PASS",
+            ctx, "data_profile", "insurance_type_codes_tracked", "PASS",
             f"{len(unique_types)} distinct insurance type code(s) found",
             ", ".join(unique_types), len(unique_types),
         )]
 
     def _check_premium_fields(
-        self, df: pd.DataFrame, issuer_id: str
+        self, df: pd.DataFrame, ctx: dict[str, str]
     ) -> list[dict]:
         """Validate premium fields are numeric and non-negative where applicable."""
         results = []
@@ -253,7 +270,7 @@ class DataQualityValidator:
             non_numeric = df[col].notna() & pd.to_numeric(df[col], errors="coerce").isna()
             count = int(non_numeric.sum())
             results.append(self._result(
-                issuer_id, "data_quality", f"{col}_numeric",
+                ctx, "data_quality", f"{col}_numeric",
                 "FAIL" if count > 0 else "PASS",
                 f"{count} non-numeric value(s) in {col}", "", count,
             ))
@@ -262,7 +279,7 @@ class DataQualityValidator:
             negative = df["total_premium_amt"].notna() & (df["total_premium_amt"] < 0)
             count = int(negative.sum())
             results.append(self._result(
-                issuer_id, "data_quality", "total_premium_amt_non_negative",
+                ctx, "data_quality", "total_premium_amt_non_negative",
                 "FAIL" if count > 0 else "PASS",
                 f"{count} negative total_premium_amt value(s)", "", count,
             ))
@@ -270,7 +287,7 @@ class DataQualityValidator:
         return results
 
     def _check_benefit_effective_date(
-        self, df: pd.DataFrame, issuer_id: str
+        self, df: pd.DataFrame, ctx: dict[str, str]
     ) -> list[dict]:
         """Flag null benefit_effective_begin_date values."""
         if "benefit_effective_begin_date" not in df.columns:
@@ -280,13 +297,13 @@ class DataQualityValidator:
         )
         count = int(null_mask.sum())
         return [self._result(
-            issuer_id, "data_quality", "benefit_effective_begin_date_not_null",
+            ctx, "data_quality", "benefit_effective_begin_date_not_null",
             "FAIL" if count > 0 else "PASS",
             f"{count} null benefit_effective_begin_date value(s)", "", count,
         )]
 
     def _check_source_exchg_id(
-        self, df: pd.DataFrame, issuer_id: str
+        self, df: pd.DataFrame, ctx: dict[str, str]
     ) -> list[dict]:
         """Warn when source_exchg_id is missing on rows that should have it."""
         if "source_exchg_id" not in df.columns:
@@ -296,20 +313,20 @@ class DataQualityValidator:
         )
         count = int(null_mask.sum())
         return [self._result(
-            issuer_id, "data_quality", "source_exchg_id_present",
+            ctx, "data_quality", "source_exchg_id_present",
             "WARN" if count > 0 else "PASS",
             f"{count} missing source_exchg_id value(s)",
             "Field should be present when available in source XML", count,
         )]
 
     def _profile_missingness(
-        self, df: pd.DataFrame, issuer_id: str
+        self, df: pd.DataFrame, ctx: dict[str, str]
     ) -> list[dict]:
         """Emit informational missingness summary for columns exceeding 50%."""
         miss_df = self.build_missingness_df(df)
         high_miss = miss_df[miss_df["missing_pct"] > 50]
         return [self._result(
-            issuer_id, "data_profile", "high_missingness_columns",
+            ctx, "data_profile", "high_missingness_columns",
             "WARN" if len(high_miss) > 0 else "PASS",
             f"{len(high_miss)} column(s) with >50% missingness",
             ", ".join(
@@ -319,7 +336,7 @@ class DataQualityValidator:
         )]
 
     def _profile_file_counts(
-        self, df: pd.DataFrame, issuer_id: str
+        self, df: pd.DataFrame, ctx: dict[str, str]
     ) -> list[dict]:
         """Emit per-file row count summary as informational PASS."""
         profile = self.build_file_profile_df(df)
@@ -330,13 +347,13 @@ class DataQualityValidator:
             for _, r in profile.iterrows()
         )
         return [self._result(
-            issuer_id, "data_profile", "row_counts_by_file", "PASS",
+            ctx, "data_profile", "row_counts_by_file", "PASS",
             f"{len(profile)} file(s) profiled", summary[:500], len(profile),
         )]
 
     @staticmethod
     def _result(
-        issuer_id: str,
+        ctx: dict[str, str],
         category: str,
         check_name: str,
         status: str,
@@ -344,9 +361,9 @@ class DataQualityValidator:
         details: str,
         affected_count: int,
     ) -> dict:
-        """Build a standardized validation result record."""
+        """Build a standardized validation result record with partition context."""
         return {
-            "issuer_id": issuer_id,
+            **ctx,
             "check_category": category,
             "check_name": check_name,
             "status": status,
