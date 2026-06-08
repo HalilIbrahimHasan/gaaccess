@@ -1,7 +1,7 @@
 """
 Cleaned XML exporter — serializes enrollee DataFrame back to XML.
 
-Provides a human-readable consolidated XML output per issuer for systems
+Provides a human-readable consolidated XML output per partition for systems
 that prefer XML over flat-file or database consumption.
 """
 
@@ -24,25 +24,28 @@ class XmlExporter:
     """
 
     def export_enrollees(
-        self, df: pd.DataFrame, issuer_id: str, output_dir: Path
+        self, df: pd.DataFrame, output_stem: str, output_dir: Path
     ) -> Path:
         """
-        Write cleaned enrollees to ``cleaned_enrollees_{issuer_id}.xml``.
+        Write cleaned enrollees to ``cleaned_enrollees_{output_stem}.xml``.
 
         Args:
             df: Cleaned enrollee DataFrame.
-            issuer_id: Issuer identifier.
-            output_dir: Target ``assets/{issuer_id}/cleaned_xml`` directory.
+            output_stem: Filename stem for this partition.
+            output_dir: Target cleaned_xml directory.
 
         Returns:
             Path to the written XML file.
         """
         output_dir.mkdir(parents=True, exist_ok=True)
-        path = output_dir / f"cleaned_enrollees_{issuer_id}.xml"
+        path = output_dir / f"cleaned_enrollees_{output_stem}.xml"
 
+        issuer_id = str(df["issuer_id"].iloc[0]) if len(df) > 0 else output_stem.split("_")[0]
         root = ET.Element("enrollments")
         root.set("issuer_id", issuer_id)
         root.set("record_count", str(len(df)))
+        if "source_period" in df.columns and len(df) > 0:
+            root.set("source_period", str(df["source_period"].iloc[0]))
 
         for _, row in df.iterrows():
             enrollee_el = ET.SubElement(root, "enrollee")

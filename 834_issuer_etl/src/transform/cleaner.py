@@ -18,6 +18,7 @@ from config import (
 )
 from utils.file_utils import parse_file_date_from_filename
 from utils.logger import get_logger
+from utils.partition import Partition
 
 logger = get_logger(__name__)
 
@@ -32,7 +33,9 @@ class DataCleaner:
     column names, types, and safe (non-PII) values by default.
     """
 
-    def clean(self, df: pd.DataFrame) -> pd.DataFrame:
+    def clean(
+        self, df: pd.DataFrame, partition: Partition | None = None
+    ) -> pd.DataFrame:
         """
         Run the full cleaning pipeline on a raw parsed DataFrame.
 
@@ -41,22 +44,23 @@ class DataCleaner:
 
         Args:
             df: Raw DataFrame from ``Xml834Parser``.
+            partition: Optional issuer/year/month context for partition columns.
 
         Returns:
             Cleaned DataFrame ready for validation and export.
         """
         if df.empty:
             logger.warning("Received empty DataFrame — returning as-is with schema")
-            return self._ensure_schema(df)
+            return self._ensure_schema(df, partition)
 
         cleaned = df.copy()
 
         cleaned = self._strip_strings(cleaned)
         cleaned = self._convert_dates(cleaned)
         cleaned = self._convert_numerics(cleaned)
-        cleaned = self._add_metadata(cleaned)
+        cleaned = self._add_metadata(cleaned, partition)
         cleaned = self._mask_pii(cleaned)
-        cleaned = self._ensure_schema(cleaned)
+        cleaned = self._ensure_schema(cleaned, partition)
 
         logger.info("Cleaned %d enrollee row(s)", len(cleaned))
         return cleaned
@@ -95,14 +99,22 @@ class DataCleaner:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         return df
 
-    def _add_metadata(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _add_metadata(
+        self, df: pd.DataFrame, partition: Partition | None = None
+    ) -> pd.DataFrame:
         """
-        Add ``load_timestamp``, ``file_date``, and ensure ``issuer_id`` / ``source_file``.
+        Add partition columns, ``load_timestamp``, ``file_date``, and IDs.
 
-        ``file_date`` prefers ``gs04`` (already converted) and falls back to
-        the timestamp embedded in the source filename.
+        When a ``Partition`` is provided, ``source_year``, ``source_month``,
+        ``source_period``, and ``issuer_id`` are stamped on every row.
         """
         df["load_timestamp"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        if partition is not None:
+            df["issuer_id"] = partition.issuer_id
+            df["source_year"] = partition.year
+            df["source_month"] = partition.month
+            df["source_period"] = partition.source_period
 
         if "file_date" not in df.columns:
             df["file_date"] = ""
@@ -147,7 +159,9 @@ class DataCleaner:
                 df[col] = _MASK_VALUE
         return df
 
-    def _ensure_schema(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _ensure_schema(
+        self, df: pd.DataFrame, partition: Partition | None = None
+    ) -> pd.DataFrame:
         """
         Add missing required columns and order columns per config schema.
 

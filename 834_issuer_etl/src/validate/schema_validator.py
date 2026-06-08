@@ -9,6 +9,7 @@ import pandas as pd
 
 from config import REQUIRED_COLUMNS
 from utils.logger import get_logger
+from utils.partition import Partition
 
 logger = get_logger(__name__)
 
@@ -21,13 +22,19 @@ class SchemaValidator:
     SQLite persistence, and the dashboard issue summary.
     """
 
-    def validate(self, df: pd.DataFrame, issuer_id: str) -> list[dict]:
+    def validate(
+        self,
+        df: pd.DataFrame,
+        issuer_id: str,
+        partition: Partition | None = None,
+    ) -> list[dict]:
         """
         Check presence of all required columns.
 
         Args:
             df: Cleaned enrollee DataFrame.
             issuer_id: Issuer being validated (for report context).
+            partition: Optional issuer/year/month partition for result labeling.
 
         Returns:
             List of validation result dicts with ``check``, ``status``,
@@ -35,10 +42,11 @@ class SchemaValidator:
         """
         results: list[dict] = []
         missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+        ctx = _partition_context(issuer_id, partition)
 
         if missing:
             results.append({
-                "issuer_id": issuer_id,
+                **ctx,
                 "check_category": "schema",
                 "check_name": "required_columns_exist",
                 "status": "FAIL",
@@ -47,13 +55,13 @@ class SchemaValidator:
                 "affected_count": len(missing),
             })
             logger.error(
-                "Schema validation FAILED for issuer %s — missing: %s",
-                issuer_id,
+                "Schema validation FAILED for %s — missing: %s",
+                _partition_label(partition, issuer_id),
                 missing,
             )
         else:
             results.append({
-                "issuer_id": issuer_id,
+                **ctx,
                 "check_category": "schema",
                 "check_name": "required_columns_exist",
                 "status": "PASS",
@@ -61,6 +69,35 @@ class SchemaValidator:
                 "details": "",
                 "affected_count": 0,
             })
-            logger.info("Schema validation PASSED for issuer %s", issuer_id)
+            logger.info(
+                "Schema validation PASSED for %s",
+                _partition_label(partition, issuer_id),
+            )
 
         return results
+
+
+def _partition_context(
+    issuer_id: str, partition: Partition | None
+) -> dict[str, str]:
+    """Build partition metadata fields for validation result records."""
+    if partition is None:
+        return {
+            "issuer_id": issuer_id,
+            "source_year": "",
+            "source_month": "",
+            "source_period": "all_periods",
+        }
+    return {
+        "issuer_id": partition.issuer_id,
+        "source_year": partition.year,
+        "source_month": partition.month,
+        "source_period": partition.source_period,
+    }
+
+
+def _partition_label(partition: Partition | None, issuer_id: str) -> str:
+    """Return a log-friendly partition label."""
+    if partition is None:
+        return f"issuer {issuer_id} (rollup)"
+    return f"{partition.period_key}"
