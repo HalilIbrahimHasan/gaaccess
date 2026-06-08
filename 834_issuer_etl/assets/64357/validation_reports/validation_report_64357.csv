@@ -6,7 +6,7 @@ issuer_id,check_category,check_name,status,message,details,affected_count
 64357,data_quality,duplicate_within_file,PASS,0 duplicate row(s) on issuer+file+member,,0
 64357,data_quality,duplicate_across_files,PASS,0 row(s) with duplicate issuer+member across files,Expected for maintenance updates; review if unexpected,0
 64357,data_quality,qtyt_consistency,PASS,0 enrollment segment(s) with QTYt mismatch,,0
-64357,data_quality,subscriber_flag_valid,PASS,0 invalid subscriber_flag value(s),"Expected: {'Y', 'N'}",0
+64357,data_quality,subscriber_flag_valid,PASS,0 invalid subscriber_flag value(s),"Expected: {'N', 'Y'}",0
 64357,data_profile,insurance_type_codes_tracked,PASS,1 distinct insurance type code(s) found,DEN,1
 64357,data_quality,total_premium_amt_numeric,PASS,0 non-numeric value(s) in total_premium_amt,,0
 64357,data_quality,health_coverage_premium_amt_numeric,PASS,0 non-numeric value(s) in health_coverage_premium_amt,,0
