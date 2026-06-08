@@ -1,16 +1,22 @@
 """
 Central configuration for the 834 Issuer ETL framework.
 
-This module defines paths, column schemas, PII policy, and validation rules
-so that all pipeline stages share a single source of truth.
+Paths are resolved from this file's location (``834_issuer_etl/src/config.py``),
+not from the terminal's current working directory. Use ``configure_paths()`` to
+override roots at runtime (e.g. ``--source-root`` on the CLI).
 """
 
 from pathlib import Path
 
+LOG_FORMAT: str = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+LOG_LEVEL: str = "INFO"
+
 # ---------------------------------------------------------------------------
-# Project paths (resolved relative to the 834_issuer_etl package root)
+# Project paths — anchored to package root (834_issuer_etl/), not CWD
+# config.py lives in src/ → parents[1] == 834_issuer_etl/
 # ---------------------------------------------------------------------------
-PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
+_SRC_DIR: Path = Path(__file__).resolve().parent
+PROJECT_ROOT: Path = _SRC_DIR.parent
 SOURCE_DATA_DIR: Path = PROJECT_ROOT / "source_data"
 ASSETS_DIR: Path = PROJECT_ROOT / "assets"
 
@@ -34,6 +40,9 @@ PII_COLUMNS: list[str] = [
 REQUIRED_COLUMNS: list[str] = [
     "source_file",
     "issuer_id",
+    "source_year",
+    "source_month",
+    "source_period",
     "isa09",
     "isa10",
     "isa13",
@@ -83,14 +92,12 @@ REQUIRED_COLUMNS: list[str] = [
     "file_date",
 ]
 
-# ID fields that must not be null for a valid enrollee record
 REQUIRED_ID_FIELDS: list[str] = [
     "issuer_id",
     "exchg_indiv_identifier",
     "exchg_assigned_policy_id",
 ]
 
-# Date columns stored as YYYYMMDD in source XML, converted during cleaning
 DATE_COLUMNS: list[str] = [
     "member_maint_effective_date",
     "member_birth_date",
@@ -99,7 +106,6 @@ DATE_COLUMNS: list[str] = [
     "file_date",
 ]
 
-# Numeric / amount columns converted to float during cleaning
 NUMERIC_COLUMNS: list[str] = [
     "qtyn",
     "qtyy",
@@ -110,17 +116,76 @@ NUMERIC_COLUMNS: list[str] = [
     "total_premium_amt",
 ]
 
-# Valid subscriber flag values
 VALID_SUBSCRIBER_FLAGS: set[str] = {"Y", "N"}
-
-# Default issuer used in examples / CLI help text only — not hardcoded in logic
 DEFAULT_ISSUER_EXAMPLE: str = "64357"
 
-# SQLite table names
 TABLE_ENROLLEES: str = "issuer_enrollees"
 TABLE_KPIS: str = "issuer_kpis"
 TABLE_VALIDATION: str = "validation_results"
+TABLE_ENROLLEES_ROLLUP: str = "issuer_enrollees_all_periods"
+TABLE_KPIS_ROLLUP: str = "issuer_kpis_all_periods"
+TABLE_VALIDATION_ROLLUP: str = "validation_results_all_periods"
 
-# Logging
-LOG_FORMAT: str = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-LOG_LEVEL: str = "INFO"
+
+def configure_paths(
+    source_root: Path | str | None = None,
+    assets_root: Path | str | None = None,
+) -> None:
+    """
+    Override source/assets roots at runtime (e.g. from ``--source-root`` CLI).
+
+    When ``source_root`` ends with ``source_data``, ``PROJECT_ROOT`` is set to
+    its parent so assets default to ``{project}/assets``.
+
+    Args:
+        source_root: Absolute or relative path to the source_data directory.
+        assets_root: Optional override for the assets output directory.
+    """
+    global PROJECT_ROOT, SOURCE_DATA_DIR, ASSETS_DIR
+
+    if source_root is not None:
+        resolved = Path(source_root).resolve()
+        SOURCE_DATA_DIR = resolved
+        if resolved.name == "source_data":
+            PROJECT_ROOT = resolved.parent
+        else:
+            PROJECT_ROOT = resolved
+
+    if assets_root is not None:
+        ASSETS_DIR = Path(assets_root).resolve()
+    elif source_root is not None:
+        ASSETS_DIR = PROJECT_ROOT / "assets"
+
+
+def log_path_configuration() -> None:
+    """
+    Log resolved paths and source-root contents before partition discovery.
+
+    Helps diagnose "0 partitions found" when the terminal CWD differs from
+    the ``834_issuer_etl`` package root.
+    """
+    import os
+
+    from utils.logger import get_logger
+
+    log = get_logger(__name__)
+    cwd = os.getcwd()
+    log.info("Current working directory : %s", cwd)
+    log.info("Resolved project root     : %s", PROJECT_ROOT)
+    log.info("Resolved source root      : %s", SOURCE_DATA_DIR)
+    log.info("Resolved assets root      : %s", ASSETS_DIR)
+    log.info("Source root exists        : %s", SOURCE_DATA_DIR.exists())
+
+    if not SOURCE_DATA_DIR.exists():
+        log.info("Immediate folders under source root: (directory missing)")
+        return
+
+    folders = sorted(
+        p.name
+        for p in SOURCE_DATA_DIR.iterdir()
+        if p.is_dir() and not p.name.startswith(".")
+    )
+    log.info(
+        "Immediate folders under source root: %s",
+        folders if folders else "(none)",
+    )

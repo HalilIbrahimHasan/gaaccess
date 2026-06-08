@@ -1,25 +1,27 @@
 """
 834 Issuer ETL — main orchestrator.
 
-Runs the full extract → transform → validate → load → dashboard pipeline
-for all issuers discovered under ``source_data/``, or a single issuer when
-``--issuer`` is specified.
+Discovers every ``source_data/{issuer}/{year}/{month}/`` partition and runs
+the full ETL independently. Paths are resolved from the package root, not CWD.
 
 Usage:
     python src/main.py
     python src/main.py --issuer 64357
+    python src/main.py --issuer 64357 --year 2026 --month 02
+    python src/main.py --source-root "/path/to/834_issuer_etl/source_data"
 """
 
 import argparse
+import json
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
 
-# Ensure src/ is on the path when running as a script
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import DEFAULT_ISSUER_EXAMPLE
+from config import DEFAULT_ISSUER_EXAMPLE, configure_paths, log_path_configuration
 from dashboard.plotly_dashboard import PlotlyDashboard
 from extract.xml_reader import LocalFileSource, XmlReader
 from load.excel_exporter import ExcelExporter
@@ -28,25 +30,50 @@ from load.xml_exporter import XmlExporter
 from transform.cleaner import DataCleaner
 from transform.kpi_builder import KpiBuilder
 from transform.xml_parser import Xml834Parser
-from utils.file_utils import ensure_issuer_asset_dirs
 from utils.logger import get_logger
+from utils.partition import (
+    SourcePartition,
+    discover_partitions,
+    ensure_partition_asset_dirs,
+    ensure_rollup_asset_dirs,
+    monthly_output_stem,
+    rollup_output_stem,
+)
 from validate.data_quality_validator import DataQualityValidator
 from validate.schema_validator import SchemaValidator
 
 logger = get_logger(__name__)
 
 
+@dataclass
+class PartitionRunResult:
+    """Outcome of processing a single issuer/year/month partition."""
+
+    partition: SourcePartition
+    status: str
+    output_path: Path | None = None
+    enrollee_count: int = 0
+    error: str | None = None
+
+
+@dataclass
+class PipelineSummary:
+    """Aggregated run statistics printed at the end of execution."""
+
+    discovered: int = 0
+    processed: int = 0
+    skipped: int = 0
+    failed: int = 0
+    results: list[PartitionRunResult] = field(default_factory=list)
+    rollup_issuers: list[str] = field(default_factory=list)
+    failed_rollups: list[str] = field(default_factory=list)
+
+
 class IssuerEtlPipeline:
-    """
-    End-to-end ETL pipeline for a single or multiple 834 XML issuers.
+    """End-to-end ETL pipeline driven by ``discover_partitions()``."""
 
-    Coordinates all stages while isolating failures at the file level so one
-    malformed XML does not halt processing of remaining files.
-    """
-
-    def __init__(self) -> None:
-        """Initialize pipeline components (stateless — safe to reuse)."""
-        self.reader = XmlReader(source=LocalFileSource())
+    def __init__(self, source: LocalFileSource | None = None) -> None:
+        self.reader = XmlReader(source=source or LocalFileSource())
         self.parser = Xml834Parser()
         self.cleaner = DataCleaner()
         self.kpi_builder = KpiBuilder()
@@ -57,57 +84,85 @@ class IssuerEtlPipeline:
         self.sqlite_loader = SqliteLoader()
         self.dashboard = PlotlyDashboard()
 
-    def run(self, issuer_id: str | None = None) -> None:
-        """
-        Execute the pipeline for one or all issuers.
-
-        Args:
-            issuer_id: Optional single issuer to process; ``None`` runs all.
-        """
-        issuer_ids = (
-            [issuer_id]
-            if issuer_id
-            else self.reader.discover_issuers()
+    def run(
+        self,
+        issuer_id: str | None = None,
+        year: str | None = None,
+        month: str | None = None,
+    ) -> PipelineSummary:
+        partitions = discover_partitions(
+            issuer_id=issuer_id, year=year, month=month
         )
+        summary = PipelineSummary(discovered=len(partitions))
 
-        if not issuer_ids:
+        if not partitions:
             logger.error(
-                "No issuer folders found under source_data/. "
-                "Add folders like source_data/64357/ with XML files."
+                "No valid partitions found. Expected structure: "
+                "source_data/{issuer_id}/{year}/{month}/*.xml"
             )
+            self._print_summary(summary)
             sys.exit(1)
 
-        for iid in issuer_ids:
-            logger.info("=" * 60)
-            logger.info("Processing issuer: %s", iid)
-            logger.info("=" * 60)
+        issuer_monthly_dfs: dict[str, list[pd.DataFrame]] = {}
+
+        for partition in partitions:
+            logger.info(
+                "Processing issuer=%s year=%s month=%s files=%d path=%s",
+                partition.issuer_id,
+                partition.year,
+                partition.month,
+                partition.file_count,
+                partition.input_path,
+            )
             try:
-                self._process_issuer(iid)
+                cleaned_df, run_result = self._process_partition(partition)
+                summary.results.append(run_result)
+                if run_result.status == "processed":
+                    summary.processed += 1
+                    issuer_monthly_dfs.setdefault(partition.issuer_id, []).append(
+                        cleaned_df
+                    )
+                elif run_result.status == "skipped":
+                    summary.skipped += 1
+                else:
+                    summary.failed += 1
             except Exception as exc:
+                summary.failed += 1
                 logger.error(
-                    "Issuer %s failed with unexpected error: %s", iid, exc,
+                    "Partition %s failed: %s",
+                    partition.period_key,
+                    exc,
                     exc_info=True,
                 )
+                summary.results.append(
+                    PartitionRunResult(
+                        partition=partition,
+                        status="failed",
+                        error=str(exc),
+                    )
+                )
 
-    def _process_issuer(self, issuer_id: str) -> None:
-        """
-        Run extract through dashboard for a single issuer.
+        for iid, dfs in issuer_monthly_dfs.items():
+            if not dfs:
+                continue
+            try:
+                self._process_rollup(iid, dfs)
+                summary.rollup_issuers.append(iid)
+            except Exception as exc:
+                summary.failed_rollups.append(iid)
+                logger.error("Rollup for issuer %s failed: %s", iid, exc, exc_info=True)
 
-        Args:
-            issuer_id: Issuer folder name (e.g. ``64357``).
-        """
-        asset_dirs = ensure_issuer_asset_dirs(issuer_id)
-        records = self.reader.get_file_records(issuer_id)
+        self._print_summary(summary)
+        return summary
 
-        if not records:
-            logger.warning("No XML files found for issuer %s — skipping", issuer_id)
-            return
+    def _process_partition(
+        self, partition: SourcePartition
+    ) -> tuple[pd.DataFrame | None, PartitionRunResult]:
+        asset_dirs = ensure_partition_asset_dirs(partition)
+        output_stem = monthly_output_stem(partition)
+        records = self.reader.get_file_records(partition)
 
-        # --- Extract & Transform ---
         all_rows: list[dict] = []
-        files_processed = 0
-        files_failed = 0
-
         for record in records:
             try:
                 xml_bytes = self.reader.read_xml_content(record)
@@ -117,107 +172,161 @@ class IssuerEtlPipeline:
                     issuer_id=record.issuer_id,
                 )
                 all_rows.extend(rows)
-                files_processed += 1
             except Exception as exc:
-                files_failed += 1
-                logger.error(
-                    "Failed to parse %s: %s — continuing with remaining files",
-                    record.source_file,
-                    exc,
-                )
+                logger.error("Failed to parse %s: %s", record.source_file, exc)
 
-        logger.info(
-            "Issuer %s: %d file(s) OK, %d file(s) failed",
-            issuer_id,
-            files_processed,
-            files_failed,
+        if not all_rows:
+            return None, PartitionRunResult(
+                partition=partition,
+                status="skipped",
+                output_path=partition.output_path,
+            )
+
+        cleaned_df = self.cleaner.clean(pd.DataFrame(all_rows), partition=partition)
+        validation_df = self.dq_validator.results_to_dataframe(
+            self.schema_validator.validate(cleaned_df, partition.issuer_id)
+            + self.dq_validator.validate(cleaned_df, partition.issuer_id)
         )
-
-        raw_df = pd.DataFrame(all_rows)
-        cleaned_df = self.cleaner.clean(raw_df)
-
-        # --- Validate ---
-        schema_results = self.schema_validator.validate(cleaned_df, issuer_id)
-        dq_results = self.dq_validator.validate(cleaned_df, issuer_id)
-        validation_results = schema_results + dq_results
-        validation_df = self.dq_validator.results_to_dataframe(validation_results)
         missingness_df = self.dq_validator.build_missingness_df(cleaned_df)
         file_profile_df = self.dq_validator.build_file_profile_df(cleaned_df)
-
-        # --- KPIs ---
-        kpis = self.kpi_builder.build_kpis(cleaned_df, issuer_id)
+        kpis = self.kpi_builder.build_kpis(cleaned_df, partition.issuer_id)
         kpi_summary_df = self.kpi_builder.kpis_to_summary_df(kpis)
 
-        # --- Load / Export ---
-        self.excel_exporter.export_enrollees(
-            cleaned_df, issuer_id, asset_dirs["excel"]
+        self._export_partition_outputs(
+            cleaned_df, kpis, kpi_summary_df, validation_df,
+            missingness_df, file_profile_df, output_stem, asset_dirs, partition,
         )
+
+        return cleaned_df, PartitionRunResult(
+            partition=partition,
+            status="processed",
+            output_path=partition.output_path,
+            enrollee_count=len(cleaned_df),
+        )
+
+    def _process_rollup(self, issuer_id: str, monthly_dfs: list[pd.DataFrame]) -> None:
+        combined_df = pd.concat(monthly_dfs, ignore_index=True)
+        asset_dirs = ensure_rollup_asset_dirs(issuer_id)
+        output_stem = rollup_output_stem(issuer_id)
+        validation_df = self.dq_validator.results_to_dataframe(
+            self.schema_validator.validate(combined_df, issuer_id)
+            + self.dq_validator.validate(combined_df, issuer_id)
+        )
+        missingness_df = self.dq_validator.build_missingness_df(combined_df)
+        file_profile_df = self.dq_validator.build_file_profile_df(combined_df)
+        kpis = self.kpi_builder.build_kpis(combined_df, issuer_id)
+        kpi_summary_df = self.kpi_builder.kpis_to_summary_df(kpis)
+
+        self.excel_exporter.export_enrollees(combined_df, output_stem, asset_dirs["excel"])
         self.excel_exporter.export_kpis(
-            kpis, kpi_summary_df, issuer_id, asset_dirs["excel"]
+            kpis, kpi_summary_df, output_stem, asset_dirs["excel"], is_rollup=True
         )
         self.excel_exporter.export_validation_report(
-            validation_df,
-            missingness_df,
-            file_profile_df,
-            issuer_id,
-            asset_dirs["excel"],
-        )
-        self.xml_exporter.export_enrollees(
-            cleaned_df, issuer_id, asset_dirs["cleaned_xml"]
+            validation_df, missingness_df, file_profile_df,
+            output_stem, asset_dirs["excel"],
         )
         self.sqlite_loader.load(
-            cleaned_df,
-            kpi_summary_df,
-            validation_df,
-            issuer_id,
-            asset_dirs["sqlite"],
+            combined_df, kpi_summary_df, validation_df,
+            output_stem, asset_dirs["sqlite"], rollup=True,
         )
         self.dashboard.generate(
-            kpis,
-            kpi_summary_df,
-            validation_df,
-            missingness_df,
-            issuer_id,
-            asset_dirs["dashboards"],
+            kpis, kpi_summary_df, validation_df, missingness_df,
+            output_stem, asset_dirs["dashboards"],
+            title=f"Issuer {issuer_id} — All Periods Rollup Dashboard",
+            is_rollup=True,
+        )
+        json_path = asset_dirs["validation_reports"] / f"validation_report_{output_stem}.json"
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(
+            json.dumps(validation_df.to_dict(orient="records"), indent=2),
+            encoding="utf-8",
         )
 
-        # Persist validation report copy
-        validation_path = (
-            asset_dirs["validation_reports"] / f"validation_report_{issuer_id}.csv"
+    def _export_partition_outputs(
+        self, cleaned_df, kpis, kpi_summary_df, validation_df,
+        missingness_df, file_profile_df, output_stem, asset_dirs, partition,
+    ) -> None:
+        self.excel_exporter.export_enrollees(cleaned_df, output_stem, asset_dirs["excel"])
+        self.excel_exporter.export_kpis(
+            kpis, kpi_summary_df, output_stem, asset_dirs["excel"]
         )
-        validation_df.to_csv(validation_path, index=False)
+        self.excel_exporter.export_validation_report(
+            validation_df, missingness_df, file_profile_df,
+            output_stem, asset_dirs["excel"],
+        )
+        self.xml_exporter.export_enrollees(cleaned_df, output_stem, asset_dirs["cleaned_xml"])
+        self.sqlite_loader.load(
+            cleaned_df, kpi_summary_df, validation_df,
+            output_stem, asset_dirs["sqlite"], rollup=False,
+        )
+        self.dashboard.generate(
+            kpis, kpi_summary_df, validation_df, missingness_df,
+            output_stem, asset_dirs["dashboards"],
+            title=f"Issuer {partition.issuer_id} — {partition.year}/{partition.month} Dashboard",
+            is_rollup=False,
+        )
+        json_path = asset_dirs["validation_reports"] / f"validation_report_{output_stem}.json"
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(
+            json.dumps(validation_df.to_dict(orient="records"), indent=2),
+            encoding="utf-8",
+        )
 
-        logger.info("Issuer %s processing complete.", issuer_id)
-        logger.info("  Excel:      %s", asset_dirs["excel"])
-        logger.info("  XML:        %s", asset_dirs["cleaned_xml"])
-        logger.info("  SQLite:     %s", asset_dirs["sqlite"])
-        logger.info("  Dashboard:  %s", asset_dirs["dashboards"])
+    @staticmethod
+    def _print_summary(summary: PipelineSummary) -> None:
+        logger.info("=" * 60)
+        logger.info("PROCESSING SUMMARY")
+        logger.info("=" * 60)
+        logger.info("Total partitions discovered : %d", summary.discovered)
+        logger.info("Total partitions processed  : %d", summary.processed)
+        logger.info("Total partitions skipped    : %d", summary.skipped)
+        logger.info("Total partitions failed     : %d", summary.failed)
+        if summary.rollup_issuers:
+            logger.info("Rollups created for issuers : %s", ", ".join(summary.rollup_issuers))
+        if summary.failed_rollups:
+            logger.info("Rollups failed for issuers  : %s", ", ".join(summary.failed_rollups))
+        for result in summary.results:
+            p = result.partition
+            if result.status == "processed":
+                logger.info(
+                    "  [OK]   issuer=%s year=%s month=%s enrollees=%d → %s",
+                    p.issuer_id, p.year, p.month, result.enrollee_count, result.output_path,
+                )
+            elif result.status == "skipped":
+                logger.info("  [SKIP] issuer=%s year=%s month=%s", p.issuer_id, p.year, p.month)
+            else:
+                logger.info(
+                    "  [FAIL] issuer=%s year=%s month=%s — %s",
+                    p.issuer_id, p.year, p.month, result.error or "unknown",
+                )
+        logger.info("=" * 60)
 
 
 def parse_args() -> argparse.Namespace:
-    """
-    Parse CLI arguments for optional single-issuer processing.
-
-    Returns:
-        Parsed namespace with optional ``issuer`` attribute.
-    """
-    parser = argparse.ArgumentParser(
-        description="834 XML Issuer ETL Framework",
-    )
+    parser = argparse.ArgumentParser(description="834 XML Issuer ETL Framework")
+    parser.add_argument("--issuer", type=str, default=None)
+    parser.add_argument("--year", type=str, default=None)
+    parser.add_argument("--month", type=str, default=None)
     parser.add_argument(
-        "--issuer",
+        "--source-root",
         type=str,
         default=None,
-        help=f"Process a single issuer only (e.g. {DEFAULT_ISSUER_EXAMPLE})",
+        help="Override source_data directory (absolute or relative path)",
     )
     return parser.parse_args()
 
 
 def main() -> None:
-    """CLI entry point."""
     args = parse_args()
-    pipeline = IssuerEtlPipeline()
-    pipeline.run(issuer_id=args.issuer)
+    if args.source_root:
+        configure_paths(source_root=args.source_root)
+    log_path_configuration()
+
+    source = LocalFileSource()
+    pipeline = IssuerEtlPipeline(source=source)
+    summary = pipeline.run(issuer_id=args.issuer, year=args.year, month=args.month)
+    if summary.failed > 0 or summary.failed_rollups:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

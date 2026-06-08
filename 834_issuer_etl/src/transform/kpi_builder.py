@@ -82,6 +82,13 @@ class KpiBuilder:
         kpis["premium_by_effective_month"] = self._premium_by_effective_month(df)
         kpis["file_count_trend"] = self._file_count_trend(df)
         kpis["enrollee_count_by_file"] = self._count_by(df, "source_file")
+        if "source_period" in df.columns:
+            kpis["member_count_by_source_period"] = self._count_by(
+                df, "source_period"
+            )
+            kpis["premium_by_source_period"] = self._sum_by(
+                df, "source_period", "total_premium_amt"
+            )
 
         logger.info(
             "Built KPIs for issuer %s: %d enrollees, %d files",
@@ -268,4 +275,6 @@ class KpiBuilder:
             "premium_by_effective_month": empty_df,
             "file_count_trend": empty_df,
             "enrollee_count_by_file": empty_df,
+            "member_count_by_source_period": empty_df,
+            "premium_by_source_period": empty_df,
         }

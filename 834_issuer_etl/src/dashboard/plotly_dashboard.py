@@ -31,25 +31,30 @@ class PlotlyDashboard:
         kpi_summary_df: pd.DataFrame,
         validation_df: pd.DataFrame,
         missingness_df: pd.DataFrame,
-        issuer_id: str,
+        output_stem: str,
         output_dir: Path,
+        *,
+        title: str,
+        is_rollup: bool = False,
     ) -> Path:
         """
-        Generate ``issuer_{issuer_id}_dashboard.html``.
+        Generate ``issuer_{output_stem}_dashboard.html``.
 
         Args:
             kpis: Full KPI dict from ``KpiBuilder``.
             kpi_summary_df: Scalar KPI summary table.
             validation_df: Validation check results.
             missingness_df: Column missingness profile.
-            issuer_id: Issuer identifier.
-            output_dir: Target ``assets/{issuer_id}/dashboards`` directory.
+            output_stem: Filename stem (e.g. ``64357_2026_02``).
+            output_dir: Target dashboards directory.
+            title: Dashboard title shown at top of page.
+            is_rollup: When True, favor cross-period trend charts.
 
         Returns:
             Path to the generated HTML dashboard.
         """
         output_dir.mkdir(parents=True, exist_ok=True)
-        path = output_dir / f"issuer_{issuer_id}_dashboard.html"
+        path = output_dir / f"issuer_{output_stem}_dashboard.html"
 
         fig = make_subplots(
             rows=4,
@@ -75,16 +80,22 @@ class PlotlyDashboard:
         )
 
         self._add_kpi_table(fig, kpi_summary_df, row=1, col=1)
-        self._add_enrollees_by_file(fig, kpis, row=1, col=2)
+        if is_rollup:
+            self._add_enrollees_by_period(fig, kpis, row=1, col=2)
+        else:
+            self._add_enrollees_by_file(fig, kpis, row=1, col=2)
         self._add_subscriber_pie(fig, kpis, row=2, col=1)
         self._add_premium_by_rating(fig, kpis, row=2, col=2)
-        self._add_effective_month(fig, kpis, row=3, col=1)
+        if is_rollup:
+            self._add_premium_by_period(fig, kpis, row=3, col=1)
+        else:
+            self._add_effective_month(fig, kpis, row=3, col=1)
         self._add_validation_summary(fig, validation_df, row=3, col=2)
         self._add_missingness(fig, missingness_df, row=4, col=1)
         self._add_duplicate_indicator(fig, kpis, row=4, col=2)
 
         fig.update_layout(
-            title_text=f"Issuer {issuer_id} — 834 Enrollment ETL Dashboard",
+            title_text=title,
             height=1600,
             showlegend=False,
             template="plotly_white",
@@ -114,6 +125,33 @@ class PlotlyDashboard:
             ),
             row=row,
             col=col,
+        )
+
+    def _add_enrollees_by_period(
+        self, fig: go.Figure, kpis: dict[str, Any], row: int, col: int
+    ) -> None:
+        """Bar chart of enrollee counts per source period (rollup)."""
+        df = kpis.get("member_count_by_source_period", pd.DataFrame())
+        if df.empty:
+            return
+        col_name = "source_period" if "source_period" in df.columns else df.columns[0]
+        fig.add_trace(
+            go.Bar(x=df[col_name], y=df["count"], marker_color="#2E75B6"),
+            row=row, col=col,
+        )
+
+    def _add_premium_by_period(
+        self, fig: go.Figure, kpis: dict[str, Any], row: int, col: int
+    ) -> None:
+        """Bar chart of premium by source period (rollup)."""
+        df = kpis.get("premium_by_source_period", pd.DataFrame())
+        if df.empty:
+            return
+        value_col = [c for c in df.columns if c.startswith("total_")][0]
+        col_name = "source_period" if "source_period" in df.columns else df.columns[0]
+        fig.add_trace(
+            go.Bar(x=df[col_name], y=df[value_col], marker_color="#C55A11"),
+            row=row, col=col,
         )
 
     def _add_enrollees_by_file(
