@@ -161,8 +161,7 @@ def log_path_configuration() -> None:
     """
     Log resolved paths and source-root contents before partition discovery.
 
-    Helps diagnose "0 partitions found" when the terminal CWD differs from
-    the ``834_issuer_etl`` package root.
+    Paths are anchored to this file's location, not the terminal CWD.
     """
     import os
 
@@ -170,22 +169,37 @@ def log_path_configuration() -> None:
 
     log = get_logger(__name__)
     cwd = os.getcwd()
+    alt_source = PROJECT_ROOT.parent / "source_data"
+
     log.info("Current working directory : %s", cwd)
     log.info("PROJECT_ROOT            : %s", PROJECT_ROOT)
     log.info("SOURCE_ROOT             : %s", SOURCE_DATA_DIR)
     log.info("ASSETS_ROOT             : %s", ASSETS_DIR)
     log.info("SOURCE_ROOT exists      : %s", SOURCE_DATA_DIR.exists())
+    if alt_source.resolve() != SOURCE_DATA_DIR.resolve():
+        log.info(
+            "ALT_SOURCE_ROOT         : %s (exists=%s)",
+            alt_source,
+            alt_source.exists(),
+        )
 
-    if not SOURCE_DATA_DIR.exists():
-        log.info("Issuer folders found    : (source root missing)")
+    scan_roots = [SOURCE_DATA_DIR]
+    if alt_source.resolve() != SOURCE_DATA_DIR.resolve():
+        scan_roots.append(alt_source)
+
+    all_issuers: set[str] = set()
+    for root in scan_roots:
+        if not root.exists():
+            continue
+        for p in root.iterdir():
+            if p.is_dir() and p.name.isdigit():
+                all_issuers.add(p.name)
+
+    if not any(r.exists() for r in scan_roots):
+        log.info("Issuer folders found    : (no source_data directory)")
         return
 
-    issuer_folders = sorted(
-        p.name
-        for p in SOURCE_DATA_DIR.iterdir()
-        if p.is_dir() and p.name.isdigit()
-    )
     log.info(
         "Issuer folders found    : %s",
-        issuer_folders if issuer_folders else "(none)",
+        sorted(all_issuers) if all_issuers else "(none)",
     )

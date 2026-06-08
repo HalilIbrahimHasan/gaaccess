@@ -4,48 +4,53 @@
 Fully folder-driven: discovers every issuer/year/month under source_data/
 automatically. Add folders and XML files, then run:
 
+    python run.py
     python src/main.py
 
 No config issuer list, no CLI filters, no manual updates for new issuers.
 """
 
-import json
+from __future__ import annotations
+
 import sys
-from dataclasses import dataclass, field
 from pathlib import Path
 
-import pandas as pd
+# Bootstrap src/ on sys.path before any local imports (works from any CWD).
+_SRC_DIR = Path(__file__).resolve().parent
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+import json  # noqa: E402
 
-from config import log_path_configuration
-from dashboard.plotly_dashboard import PlotlyDashboard
-from extract.xml_reader import LocalFileSource, XmlReader
-from load.excel_exporter import ExcelExporter
-from load.sqlite_loader import SqliteLoader
-from load.xml_exporter import XmlExporter
-from transform.cleaner import DataCleaner
-from transform.kpi_builder import KpiBuilder
-from transform.xml_parser import Xml834Parser
-from utils.logger import get_logger
-from utils.partition import (
+import pandas as pd  # noqa: E402
+from config import log_path_configuration  # noqa: E402
+from dashboard.plotly_dashboard import PlotlyDashboard  # noqa: E402
+from dataclasses import dataclass, field  # noqa: E402
+from extract.xml_reader import LocalFileSource, XmlReader  # noqa: E402
+from load.excel_exporter import ExcelExporter  # noqa: E402
+from load.sqlite_loader import SqliteLoader  # noqa: E402
+from load.xml_exporter import XmlExporter  # noqa: E402
+from transform.cleaner import DataCleaner  # noqa: E402
+from transform.kpi_builder import KpiBuilder  # noqa: E402
+from transform.xml_parser import Xml834Parser  # noqa: E402
+from utils.logger import get_logger  # noqa: E402
+from utils.partition import (  # noqa: E402
     SourcePartition,
     discover_partitions,
     ensure_partition_asset_dirs,
     ensure_rollup_asset_dirs,
+    iter_source_roots,
     monthly_output_stem,
     rollup_output_stem,
 )
-from validate.data_quality_validator import DataQualityValidator
-from validate.schema_validator import SchemaValidator
+from validate.data_quality_validator import DataQualityValidator  # noqa: E402
+from validate.schema_validator import SchemaValidator  # noqa: E402
 
 logger = get_logger(__name__)
 
 
 @dataclass
 class PartitionRunResult:
-    """Outcome of processing a single issuer/year/month partition."""
-
     partition: SourcePartition
     status: str
     output_path: Path | None = None
@@ -55,8 +60,6 @@ class PartitionRunResult:
 
 @dataclass
 class PipelineSummary:
-    """Aggregated run statistics printed at the end of execution."""
-
     discovered: int = 0
     processed: int = 0
     skipped: int = 0
@@ -67,7 +70,7 @@ class PipelineSummary:
 
 
 class IssuerEtlPipeline:
-    """End-to-end ETL pipeline — processes every discovered partition."""
+    """End-to-end ETL — processes every discovered partition."""
 
     def __init__(self, source: LocalFileSource | None = None) -> None:
         self.reader = XmlReader(source=source or LocalFileSource())
@@ -82,17 +85,17 @@ class IssuerEtlPipeline:
         self.dashboard = PlotlyDashboard()
 
     def run(self) -> PipelineSummary:
-        """Discover and process every issuer/year/month partition with XML files."""
         partitions = discover_partitions()
         summary = PipelineSummary(discovered=len(partitions))
 
         if not partitions:
+            logger.error("Nothing to process.")
             logger.error(
-                "No valid partitions found. Expected structure: "
-                "source_data/{issuer_id}/{year}/{month}/*.xml"
+                "Add XML files under: %s/{issuer_id}/{year}/{month}/*.xml",
+                iter_source_roots()[0],
             )
             self._print_summary(summary)
-            sys.exit(1)
+            return summary
 
         issuer_monthly_dfs: dict[str, list[pd.DataFrame]] = {}
 
@@ -133,7 +136,7 @@ class IssuerEtlPipeline:
                     )
                 )
 
-        for iid, dfs in issuer_monthly_dfs.items():
+        for iid, dfs in sorted(issuer_monthly_dfs.items()):
             if not dfs:
                 continue
             try:
@@ -302,10 +305,9 @@ class IssuerEtlPipeline:
 
 
 def main() -> None:
-    """CLI entry point — fully automatic partition discovery from source_data/."""
+    """CLI entry point — auto-discovers all issuers from source_data/."""
     log_path_configuration()
-    pipeline = IssuerEtlPipeline(source=LocalFileSource())
-    summary = pipeline.run()
+    summary = IssuerEtlPipeline(source=LocalFileSource()).run()
     if summary.failed > 0 or summary.failed_rollups:
         sys.exit(1)
 

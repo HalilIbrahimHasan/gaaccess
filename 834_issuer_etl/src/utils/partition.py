@@ -1,10 +1,12 @@
 """
 Partition discovery for issuer/year/month folder structure.
 
-Fully folder-driven: every numeric issuer / 4-digit year / 2-digit month folder
-with XML files under ``source_data/`` is discovered automatically. No config
-issuer list or CLI filters required.
+Fully folder-driven: walks every numeric issuer folder under source_data and
+creates a partition for each year/month folder that contains XML files.
+No config issuer list, no CLI filters, no hardcoded issuers.
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,12 +19,7 @@ logger = get_logger(__name__)
 
 @dataclass
 class SourcePartition:
-    """
-    A single issuer/year/month data partition discovered under ``source_data``.
-
-    Bundles input paths, XML file list, and resolved output path so every
-    pipeline stage processes data at the correct granularity.
-    """
+    """A single issuer/year/month data partition under ``source_data``."""
 
     issuer_id: str
     year: str
@@ -30,24 +27,21 @@ class SourcePartition:
     input_path: Path
     xml_files: list[Path] = field(default_factory=list)
     output_path: Path = field(default_factory=Path)
+    source_root: Path = field(default_factory=Path)
 
     @property
     def source_period(self) -> str:
-        """Return period label in ``YYYY-MM`` format."""
         return f"{self.year}-{self.month}"
 
     @property
     def period_key(self) -> str:
-        """Return filesystem-safe key ``{issuer_id}_{year}_{month}``."""
         return f"{self.issuer_id}_{self.year}_{self.month}"
 
     @property
     def file_count(self) -> int:
-        """Number of XML files in this partition."""
         return len(self.xml_files)
 
     def __post_init__(self) -> None:
-        """Resolve default output path when not supplied."""
         if not self.output_path or str(self.output_path) == ".":
             self.output_path = (
                 config.ASSETS_DIR / self.issuer_id / self.year / self.month
@@ -57,41 +51,188 @@ class SourcePartition:
 Partition = SourcePartition
 
 
-def discover_partitions(source_root: Path | None = None) -> list[SourcePartition]:
+def iter_source_roots(explicit_root: Path | None = None) -> list[Path]:
     """
-    Discover every valid issuer/year/month partition under ``source_data``.
+    Return all source_data directories to scan.
 
-    Walks ``{issuer_id}/{year}/{month}/*.xml`` dynamically — new issuer folders
-    are picked up automatically with no config or code changes.
-
-    Args:
-        source_root: Override source directory; defaults to ``SOURCE_DATA_DIR``.
-
-    Returns:
-        Sorted list of all ``SourcePartition`` instances with XML files.
+    Checks the project ``source_data/`` first, then a workspace-level sibling
+    ``../source_data`` if it exists (common when data is added at repo root).
     """
-    root = source_root or config.SOURCE_DATA_DIR
+    if explicit_root is not None:
+        return [explicit_root.resolve()]
+
+    roots: list[Path] = []
+    primary = config.SOURCE_DATA_DIR.resolve()
+    roots.append(primary)
+
+    alt = config.PROJECT_ROOT.parent / "source_data"
+    alt_resolved = alt.resolve()
+    if alt_resolved != primary and alt_resolved.exists():
+        roots.append(alt_resolved)
+
+    return roots
+
+
+def _normalize_year(name: str) -> str | None:
+    if name.isdigit() and len(name) == 4:
+        return name
+    return None
+
+
+def _normalize_month(name: str) -> str | None:
+    """Accept 1- or 2-digit month folders (e.g. ``2`` or ``02``) → ``02``."""
+    if not name.isdigit() or len(name) > 2:
+        return None
+    month_int = int(name)
+    if month_int < 1 or month_int > 12:
+        return None
+    return str(month_int).zfill(2)
+
+
+def _is_issuer_folder(name: str) -> bool:
+    """Issuer folders are numeric (typically 5 digits, any length accepted)."""
+    return name.isdigit() and not name.startswith(".")
+
+
+def log_source_tree_scan(source_roots: list[Path] | None = None) -> None:
+    """
+    Print a full diagnostic of every folder under source_data before processing.
+
+    Shows issuer → year → month → XML counts, plus warnings for misplaced files.
+    """
+    roots = source_roots or iter_source_roots()
+    logger.info("SOURCE TREE SCAN")
+    logger.info("-" * 60)
+
+    for root in roots:
+        logger.info("Scanning: %s (exists=%s)", root, root.exists())
+        if not root.exists():
+            continue
+
+        issuer_dirs = sorted(
+            (p for p in root.iterdir() if p.is_dir() and _is_issuer_folder(p.name)),
+            key=lambda p: p.name,
+        )
+        if not issuer_dirs:
+            logger.info("  (no numeric issuer folders)")
+            _warn_misplaced_xml(root)
+            continue
+
+        for issuer_dir in issuer_dirs:
+            logger.info("  issuer=%s", issuer_dir.name)
+            year_dirs = sorted(
+                (p for p in issuer_dir.iterdir() if p.is_dir()),
+                key=lambda p: p.name,
+            )
+            if not year_dirs:
+                direct_xml = sorted(issuer_dir.glob("*.xml"))
+                if direct_xml:
+                    logger.warning(
+                        "    MISPLACED: %d XML file(s) directly under issuer — "
+                        "move to %s/{year}/{month}/",
+                        len(direct_xml),
+                        issuer_dir.name,
+                    )
+                else:
+                    logger.info("    (no year folders)")
+                continue
+
+            for year_dir in year_dirs:
+                year = _normalize_year(year_dir.name)
+                if year is None:
+                    logger.info(
+                        "    skip folder '%s' (not a 4-digit year)",
+                        year_dir.name,
+                    )
+                    continue
+
+                logger.info("    year=%s", year)
+                month_dirs = sorted(
+                    (p for p in year_dir.iterdir() if p.is_dir()),
+                    key=lambda p: p.name,
+                )
+                year_xml = sorted(year_dir.glob("*.xml"))
+                if year_xml:
+                    logger.warning(
+                        "      MISPLACED: %d XML file(s) under year — "
+                        "move to %s/%s/{month}/",
+                        len(year_xml),
+                        issuer_dir.name,
+                        year,
+                    )
+
+                if not month_dirs:
+                    logger.info("      (no month folders)")
+                    continue
+
+                for month_dir in month_dirs:
+                    month = _normalize_month(month_dir.name)
+                    xml_files = sorted(month_dir.glob("*.xml"))
+                    if month is None:
+                        logger.info(
+                            "      skip folder '%s' (not a valid month 01-12)",
+                            month_dir.name,
+                        )
+                        continue
+                    logger.info(
+                        "      month=%s  xml_files=%d  path=%s",
+                        month,
+                        len(xml_files),
+                        month_dir,
+                    )
+
+    logger.info("-" * 60)
+
+
+def _warn_misplaced_xml(root: Path) -> None:
+    """Warn about XML files sitting at issuer or year level instead of month."""
+    if not root.exists():
+        return
+    for issuer_dir in root.iterdir():
+        if not issuer_dir.is_dir() or not _is_issuer_folder(issuer_dir.name):
+            continue
+        direct = sorted(issuer_dir.glob("*.xml"))
+        if direct:
+            logger.warning(
+                "MISPLACED XML at %s — need source_data/%s/{year}/{month}/*.xml",
+                issuer_dir,
+                issuer_dir.name,
+            )
+        for year_dir in issuer_dir.iterdir():
+            if not year_dir.is_dir():
+                continue
+            year_xml = sorted(year_dir.glob("*.xml"))
+            if year_xml:
+                logger.warning(
+                    "MISPLACED XML at %s — need source_data/.../%s/{month}/*.xml",
+                    year_dir,
+                    year_dir.name,
+                )
+
+
+def _discover_in_root(root: Path) -> list[SourcePartition]:
+    """Discover partitions inside a single source_data root."""
     partitions: list[SourcePartition] = []
 
     if not root.exists():
-        logger.warning("SOURCE_ROOT does not exist: %s", root)
-        logger.info("Discovered partitions:")
         return partitions
 
     for issuer_dir in sorted(root.iterdir(), key=lambda p: p.name):
-        if not issuer_dir.is_dir() or not issuer_dir.name.isdigit():
+        if not issuer_dir.is_dir() or not _is_issuer_folder(issuer_dir.name):
             continue
 
         for year_dir in sorted(issuer_dir.iterdir(), key=lambda p: p.name):
             if not year_dir.is_dir():
                 continue
-            if not year_dir.name.isdigit() or len(year_dir.name) != 4:
+            year = _normalize_year(year_dir.name)
+            if year is None:
                 continue
 
             for month_dir in sorted(year_dir.iterdir(), key=lambda p: p.name):
                 if not month_dir.is_dir():
                     continue
-                if not month_dir.name.isdigit() or len(month_dir.name) != 2:
+                month = _normalize_month(month_dir.name)
+                if month is None:
                     continue
 
                 xml_files = sorted(month_dir.glob("*.xml"))
@@ -101,30 +242,64 @@ def discover_partitions(source_root: Path | None = None) -> list[SourcePartition
                 partitions.append(
                     SourcePartition(
                         issuer_id=issuer_dir.name,
-                        year=year_dir.name,
-                        month=month_dir.name,
+                        year=year,
+                        month=month,
                         input_path=month_dir,
                         xml_files=xml_files,
                         output_path=(
-                            config.ASSETS_DIR
-                            / issuer_dir.name
-                            / year_dir.name
-                            / month_dir.name
+                            config.ASSETS_DIR / issuer_dir.name / year / month
                         ),
+                        source_root=root,
                     )
                 )
 
-    logger.info("Discovered partitions:")
+    return partitions
+
+
+def discover_partitions(source_root: Path | None = None) -> list[SourcePartition]:
+    """
+    Discover every valid issuer/year/month partition across all source roots.
+
+    Deduplicates by (issuer_id, year, month); project source_data wins on conflict.
+    """
+    roots = iter_source_roots(source_root)
+    seen: set[tuple[str, str, str]] = set()
+    partitions: list[SourcePartition] = []
+
+    log_source_tree_scan(roots)
+
+    for root in roots:
+        for part in _discover_in_root(root):
+            key = (part.issuer_id, part.year, part.month)
+            if key in seen:
+                logger.warning(
+                    "Duplicate partition %s — already found, skipping %s",
+                    part.period_key,
+                    root,
+                )
+                continue
+            seen.add(key)
+            partitions.append(part)
+
+    partitions.sort(key=lambda p: (p.issuer_id, p.year, p.month))
+
+    logger.info("Discovered partitions: %d", len(partitions))
     for p in partitions:
         logger.info(
-            "  issuer=%s, year=%s, month=%s, files=%d",
+            "  issuer=%s, year=%s, month=%s, files=%d, root=%s",
             p.issuer_id,
             p.year,
             p.month,
             p.file_count,
+            p.source_root,
         )
     if not partitions:
-        logger.info("  (none — add source_data/{issuer}/{year}/{month}/*.xml)")
+        logger.warning(
+            "No partitions found. Required layout: "
+            "source_data/{issuer_id}/{year}/{month}/*.xml "
+            "(issuer= numeric, year=4 digits, month=01-12)"
+        )
+        _warn_misplaced_xml(roots[0] if roots else config.SOURCE_DATA_DIR)
 
     return partitions
 
@@ -161,10 +336,8 @@ def ensure_rollup_asset_dirs(issuer_id: str) -> dict[str, Path]:
 
 
 def monthly_output_stem(partition: SourcePartition) -> str:
-    """Return filename stem ``{issuer_id}_{year}_{month}``."""
     return partition.period_key
 
 
 def rollup_output_stem(issuer_id: str) -> str:
-    """Return filename stem ``{issuer_id}_all_periods``."""
     return f"{issuer_id}_all_periods"
