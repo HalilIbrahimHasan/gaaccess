@@ -1,8 +1,11 @@
 """
 Partition discovery for issuer/year/month folder structure.
 
-``discover_partitions()`` is the source of truth for dynamic ETL execution.
-It always reads ``SOURCE_DATA_DIR`` from config (code-anchored, not CWD).
+Discovery runs in two steps:
+1. ``discover_all_partitions()`` — find every valid partition (no CLI filters).
+2. ``filter_partitions()`` — apply optional --issuer / --year / --month filters.
+
+``log_source_tree_diagnostic()`` prints the full folder tree before filtering.
 """
 
 from dataclasses import dataclass, field
@@ -56,27 +59,114 @@ class SourcePartition:
 Partition = SourcePartition
 
 
-def discover_partitions(
-    source_root: Path | None = None,
-    issuer_id: str | None = None,
-    year: str | None = None,
-    month: str | None = None,
-) -> list[SourcePartition]:
+def log_source_tree_diagnostic(source_root: Path | None = None) -> None:
     """
-    Recursively discover all issuer/year/month folders containing XML files.
+    Print a full diagnostic walk of ``source_data`` before any CLI filtering.
 
-    This function is the source of truth for dynamic ETL execution. A valid
-    partition requires numeric issuer_id, 4-digit year, 2-digit month (01-12),
-    and at least one ``*.xml`` file in the month folder.
+    Shows issuer/year/month folders, XML counts, and warnings for XML files
+    placed at the wrong directory level.
+    """
+    root = source_root or config.SOURCE_DATA_DIR
+    logger.info("=" * 60)
+    logger.info("SOURCE TREE DIAGNOSTIC (before filters)")
+    logger.info("=" * 60)
+    logger.info("SOURCE_ROOT path          : %s", root)
+    logger.info("SOURCE_ROOT exists      : %s", root.exists())
 
-    Args:
-        source_root: Override source directory; defaults to ``SOURCE_DATA_DIR``.
-        issuer_id: Optional filter — process only this issuer.
-        year: Optional filter — process only this year.
-        month: Optional filter — process only this month.
+    if not root.exists():
+        logger.info("Issuer folders          : (source root missing)")
+        logger.info("=" * 60)
+        return
+
+    issuer_dirs = sorted(
+        (p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")),
+        key=lambda p: p.name,
+    )
+    issuer_names = [p.name for p in issuer_dirs]
+    logger.info("Issuer folders found    : %s", issuer_names if issuer_names else "(none)")
+
+    for issuer_dir in issuer_dirs:
+        if not issuer_dir.name.isdigit():
+            loose_xml = sorted(issuer_dir.glob("*.xml"))
+            logger.info(
+                "  issuer=%s (SKIPPED — not numeric)%s",
+                issuer_dir.name,
+                f" — {len(loose_xml)} XML at issuer level" if loose_xml else "",
+            )
+            continue
+
+        loose_xml = sorted(issuer_dir.glob("*.xml"))
+        if loose_xml:
+            logger.warning(
+                "  issuer=%s — %d XML file(s) at WRONG level "
+                "(expected source_data/%s/{year}/{month}/, not directly under issuer)",
+                issuer_dir.name,
+                len(loose_xml),
+                issuer_dir.name,
+            )
+
+        year_dirs = sorted(
+            (p for p in issuer_dir.iterdir() if p.is_dir() and not p.name.startswith(".")),
+            key=lambda p: p.name,
+        )
+        if not year_dirs:
+            logger.info("  issuer=%s — no year subfolders", issuer_dir.name)
+            continue
+
+        for year_dir in year_dirs:
+            if not _is_valid_year(year_dir.name):
+                loose_xml = sorted(year_dir.glob("*.xml"))
+                logger.info(
+                    "    year=%s (SKIPPED — not 4-digit year)%s",
+                    year_dir.name,
+                    f" — {len(loose_xml)} XML at year level" if loose_xml else "",
+                )
+                continue
+
+            month_dirs = sorted(
+                (p for p in year_dir.iterdir() if p.is_dir() and not p.name.startswith(".")),
+                key=lambda p: p.name,
+            )
+            if not month_dirs:
+                logger.info("    issuer=%s year=%s — no month subfolders", issuer_dir.name, year_dir.name)
+                continue
+
+            for month_dir in month_dirs:
+                normalized_month = _normalize_month(month_dir.name)
+                xml_files = sorted(month_dir.glob("*.xml"))
+                if normalized_month is None:
+                    logger.info(
+                        "      month=%s (SKIPPED — invalid month name) xml=%d",
+                        month_dir.name,
+                        len(xml_files),
+                    )
+                else:
+                    status = "VALID" if xml_files else "EMPTY (no XML)"
+                    logger.info(
+                        "      issuer=%s year=%s month=%s [%s] xml=%d path=%s",
+                        issuer_dir.name,
+                        year_dir.name,
+                        normalized_month,
+                        status,
+                        len(xml_files),
+                        month_dir,
+                    )
+
+    logger.info("=" * 60)
+
+
+def discover_all_partitions(source_root: Path | None = None) -> list[SourcePartition]:
+    """
+    Discover every valid issuer/year/month partition — no CLI filters applied.
+
+    A valid partition requires:
+    * numeric issuer_id folder
+    * 4-digit year folder
+    * month folder (01-12, accepts 1 or 2 digit names normalized to 02)
+    * at least one ``*.xml`` in the month folder
 
     Returns:
-        Sorted list of ``SourcePartition`` instances.
+        Sorted list of all ``SourcePartition`` instances under ``source_root``.
     """
     root = source_root or config.SOURCE_DATA_DIR
     if not root.exists():
@@ -85,52 +175,108 @@ def discover_partitions(
 
     partitions: list[SourcePartition] = []
 
-    for issuer_dir in sorted(root.iterdir(), key=lambda p: p.name):
-        if not issuer_dir.is_dir() or not issuer_dir.name.isdigit():
-            continue
-        if issuer_id and issuer_dir.name != issuer_id:
-            continue
-
-        for year_dir in sorted(issuer_dir.iterdir(), key=lambda p: p.name):
-            if not year_dir.is_dir():
-                continue
-            if not year_dir.name.isdigit() or len(year_dir.name) != 4:
-                continue
-            if year and year_dir.name != year:
-                continue
-
-            for month_dir in sorted(year_dir.iterdir(), key=lambda p: p.name):
-                if not month_dir.is_dir():
+    for issuer_dir in sorted(
+        (p for p in root.iterdir() if p.is_dir() and p.name.isdigit()),
+        key=lambda p: p.name,
+    ):
+        for year_dir in sorted(
+            (p for p in issuer_dir.iterdir() if p.is_dir() and _is_valid_year(p.name)),
+            key=lambda p: p.name,
+        ):
+            for month_dir in sorted(
+                (p for p in year_dir.iterdir() if p.is_dir()),
+                key=lambda p: p.name,
+            ):
+                month = _normalize_month(month_dir.name)
+                if month is None:
                     continue
-                if not month_dir.name.isdigit() or len(month_dir.name) != 2:
-                    continue
-                if month and month_dir.name != month.zfill(2):
-                    continue
-                if not _is_valid_month(month_dir.name):
-                    continue
-
                 xml_files = sorted(month_dir.glob("*.xml"))
                 if not xml_files:
                     continue
-
                 partitions.append(
                     SourcePartition(
                         issuer_id=issuer_dir.name,
                         year=year_dir.name,
-                        month=month_dir.name,
+                        month=month,
                         input_path=month_dir,
                         xml_files=xml_files,
                         output_path=(
                             config.ASSETS_DIR
                             / issuer_dir.name
                             / year_dir.name
-                            / month_dir.name
+                            / month
                         ),
                     )
                 )
 
-    logger.info("Found %d source partition(s).", len(partitions))
+    logger.info(
+        "Discovered %d raw partition(s) (before CLI filters).", len(partitions)
+    )
+    for p in partitions:
+        logger.info(
+            "  raw partition: issuer=%s year=%s month=%s files=%d",
+            p.issuer_id, p.year, p.month, p.file_count,
+        )
     return partitions
+
+
+def filter_partitions(
+    partitions: list[SourcePartition],
+    issuer_ids: list[str] | None = None,
+) -> list[SourcePartition]:
+    """
+    Keep only partitions whose issuer is in ``issuer_ids``.
+
+    When ``issuer_ids`` is empty or None, returns an empty list (nothing runs).
+    """
+    if not issuer_ids:
+        logger.warning(
+            "PROCESS_ISSUERS is empty — no issuers selected. "
+            "Edit PROCESS_ISSUERS in src/config.py to add issuer IDs."
+        )
+        return []
+
+    allowed = {iid.strip() for iid in issuer_ids if iid.strip()}
+    filtered = [p for p in partitions if p.issuer_id in allowed]
+    logger.info(
+        "PROCESS_ISSUERS filter %s → %d partition(s)",
+        sorted(allowed),
+        len(filtered),
+    )
+
+    found_issuers = {p.issuer_id for p in filtered}
+    for iid in sorted(allowed):
+        if iid not in found_issuers:
+            logger.warning(
+                "Issuer %s is in PROCESS_ISSUERS but has no valid "
+                "source_data/%s/{year}/{month}/*.xml partitions",
+                iid,
+                iid,
+            )
+
+    skipped = {p.issuer_id for p in partitions} - allowed
+    if skipped:
+        logger.info(
+            "Skipped issuer(s) not in PROCESS_ISSUERS: %s",
+            sorted(skipped),
+        )
+
+    return filtered
+
+
+def discover_partitions(source_root: Path | None = None) -> list[SourcePartition]:
+    """
+    Discover partitions in two steps: find all raw, then keep PROCESS_ISSUERS only.
+
+    Calls ``log_source_tree_diagnostic()`` first so the console always shows
+    the full folder tree before issuer filtering occurs.
+    """
+    root = source_root or config.SOURCE_DATA_DIR
+    log_source_tree_diagnostic(root)
+    all_partitions = discover_all_partitions(root)
+    filtered = filter_partitions(all_partitions, config.PROCESS_ISSUERS)
+    logger.info("Final partition count to process: %d", len(filtered))
+    return filtered
 
 
 def ensure_partition_asset_dirs(partition: SourcePartition) -> dict[str, Path]:
@@ -174,6 +320,25 @@ def rollup_output_stem(issuer_id: str) -> str:
     return f"{issuer_id}_all_periods"
 
 
+def _is_valid_year(name: str) -> bool:
+    """Return True when folder name is a four-digit year."""
+    return len(name) == 4 and name.isdigit()
+
+
+def _normalize_month(name: str) -> str | None:
+    """
+    Normalize month folder name to two digits (01-12).
+
+    Accepts ``2``, ``02``, ``12`` etc. Returns None for invalid values.
+    """
+    if not name.isdigit():
+        return None
+    value = int(name)
+    if value < 1 or value > 12:
+        return None
+    return str(value).zfill(2)
+
+
 def _is_valid_month(name: str) -> bool:
-    """Return True when folder name is a valid two-digit month (01-12)."""
-    return len(name) == 2 and name.isdigit() and 1 <= int(name) <= 12
+    """Return True when folder name is a valid month (01-12)."""
+    return _normalize_month(name) is not None

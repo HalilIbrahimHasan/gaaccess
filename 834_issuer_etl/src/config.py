@@ -21,6 +21,16 @@ SOURCE_DATA_DIR: Path = PROJECT_ROOT / "source_data"
 ASSETS_DIR: Path = PROJECT_ROOT / "assets"
 
 # ---------------------------------------------------------------------------
+# Which issuers to process — edit ONLY this list, then run: python src/main.py
+# All year/month partitions for each listed issuer are processed automatically.
+# Issuers not in this list are ignored even if folders exist under source_data/.
+# ---------------------------------------------------------------------------
+PROCESS_ISSUERS: list[str] = [
+    "54372",
+    "64357",
+]
+
+# ---------------------------------------------------------------------------
 # PII handling — default is safe; set EXPORT_PII=True only for debugging
 # ---------------------------------------------------------------------------
 EXPORT_PII: bool = False

@@ -1,17 +1,14 @@
 """
 834 Issuer ETL — main orchestrator.
 
-Discovers every ``source_data/{issuer}/{year}/{month}/`` partition and runs
-the full ETL independently. Paths are resolved from the package root, not CWD.
+Which issuers to run is controlled by PROCESS_ISSUERS in src/config.py.
+Just edit that list and run:
 
-Usage:
     python src/main.py
-    python src/main.py --issuer 64357
-    python src/main.py --issuer 64357 --year 2026 --month 02
-    python src/main.py --source-root "/path/to/834_issuer_etl/source_data"
+
+No CLI flags needed. All year/month partitions for each listed issuer are processed.
 """
 
-import argparse
 import json
 import sys
 from dataclasses import dataclass, field
@@ -21,7 +18,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import DEFAULT_ISSUER_EXAMPLE, configure_paths, log_path_configuration
+from config import PROCESS_ISSUERS, log_path_configuration
 from dashboard.plotly_dashboard import PlotlyDashboard
 from extract.xml_reader import LocalFileSource, XmlReader
 from load.excel_exporter import ExcelExporter
@@ -70,7 +67,7 @@ class PipelineSummary:
 
 
 class IssuerEtlPipeline:
-    """End-to-end ETL pipeline driven by ``discover_partitions()``."""
+    """End-to-end ETL pipeline driven by PROCESS_ISSUERS in config."""
 
     def __init__(self, source: LocalFileSource | None = None) -> None:
         self.reader = XmlReader(source=source or LocalFileSource())
@@ -84,20 +81,15 @@ class IssuerEtlPipeline:
         self.sqlite_loader = SqliteLoader()
         self.dashboard = PlotlyDashboard()
 
-    def run(
-        self,
-        issuer_id: str | None = None,
-        year: str | None = None,
-        month: str | None = None,
-    ) -> PipelineSummary:
-        partitions = discover_partitions(
-            issuer_id=issuer_id, year=year, month=month
-        )
+    def run(self) -> PipelineSummary:
+        """Execute the pipeline for every partition matching PROCESS_ISSUERS."""
+        partitions = discover_partitions()
         summary = PipelineSummary(discovered=len(partitions))
 
         if not partitions:
             logger.error(
-                "No valid partitions found. Expected structure: "
+                "No valid partitions to process. "
+                "Check PROCESS_ISSUERS in src/config.py and ensure folders exist: "
                 "source_data/{issuer_id}/{year}/{month}/*.xml"
             )
             self._print_summary(summary)
@@ -277,6 +269,7 @@ class IssuerEtlPipeline:
         logger.info("=" * 60)
         logger.info("PROCESSING SUMMARY")
         logger.info("=" * 60)
+        logger.info("PROCESS_ISSUERS            : %s", PROCESS_ISSUERS)
         logger.info("Total partitions discovered : %d", summary.discovered)
         logger.info("Total partitions processed  : %d", summary.processed)
         logger.info("Total partitions skipped    : %d", summary.skipped)
@@ -302,29 +295,16 @@ class IssuerEtlPipeline:
         logger.info("=" * 60)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="834 XML Issuer ETL Framework")
-    parser.add_argument("--issuer", type=str, default=None)
-    parser.add_argument("--year", type=str, default=None)
-    parser.add_argument("--month", type=str, default=None)
-    parser.add_argument(
-        "--source-root",
-        type=str,
-        default=None,
-        help="Override source_data directory (absolute or relative path)",
-    )
-    return parser.parse_args()
-
-
 def main() -> None:
-    args = parse_args()
-    if args.source_root:
-        configure_paths(source_root=args.source_root)
+    """CLI entry point — issuer selection is in config.PROCESS_ISSUERS only."""
+    logger.info("=" * 60)
+    logger.info("PROCESS_ISSUERS (from config.py): %s", PROCESS_ISSUERS)
+    logger.info("=" * 60)
+
     log_path_configuration()
 
-    source = LocalFileSource()
-    pipeline = IssuerEtlPipeline(source=source)
-    summary = pipeline.run(issuer_id=args.issuer, year=args.year, month=args.month)
+    pipeline = IssuerEtlPipeline(source=LocalFileSource())
+    summary = pipeline.run()
     if summary.failed > 0 or summary.failed_rollups:
         sys.exit(1)
 
