@@ -12,7 +12,7 @@ from pathlib import Path
 
 from config import SOURCE_DATA_DIR
 from utils.logger import get_logger
-from utils.partition import Partition, discover_partitions
+from utils.partition import SourcePartition
 
 logger = get_logger(__name__)
 
@@ -31,7 +31,7 @@ class DataSource(ABC):
         issuer_id: str | None = None,
         year: str | None = None,
         month: str | None = None,
-    ) -> list[Partition]:
+    ) -> list[SourcePartition]:
         """Return all partitions matching optional issuer/year/month filters."""
 
     @abstractmethod
@@ -60,8 +60,10 @@ class LocalFileSource(DataSource):
         issuer_id: str | None = None,
         year: str | None = None,
         month: str | None = None,
-    ) -> list[Partition]:
+    ) -> list[SourcePartition]:
         """Discover local issuer/year/month partitions under ``source_dir``."""
+        from utils.partition import discover_partitions
+
         return discover_partitions(
             source_root=self.source_dir,
             issuer_id=issuer_id,
@@ -121,13 +123,13 @@ class XmlReader:
         issuer_id: str | None = None,
         year: str | None = None,
         month: str | None = None,
-    ) -> list[Partition]:
+    ) -> list[SourcePartition]:
         """Return partitions available from the configured source."""
         return self.source.discover_partitions(
             issuer_id=issuer_id, year=year, month=month
         )
 
-    def get_file_records(self, partition: Partition) -> list[XmlFileRecord]:
+    def get_file_records(self, partition: SourcePartition) -> list[XmlFileRecord]:
         """
         Build ``XmlFileRecord`` entries for all XML files in a partition.
 

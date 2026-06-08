@@ -1,9 +1,9 @@
 """
 Partition discovery for issuer/year/month folder structure.
 
-Scans ``source_data/{issuer_id}/{year}/{month}/`` and returns ``Partition``
-objects that carry both input paths and matching output paths so every
-pipeline stage can process data at the correct granularity.
+``discover_partitions()`` is the single source of truth for dynamic ETL
+execution. It recursively walks ``source_data/{issuer}/{year}/{month}/`` and
+returns one ``SourcePartition`` per folder that contains XML files.
 """
 
 from dataclasses import dataclass, field
@@ -16,12 +16,12 @@ logger = get_logger(__name__)
 
 
 @dataclass
-class Partition:
+class SourcePartition:
     """
-    A single issuer/year/month data partition.
+    A single issuer/year/month data partition discovered under ``source_data``.
 
-    Bundles discovery metadata and resolved paths so extract, transform,
-    validate, and load stages share one partition contract.
+    Bundles input paths, XML file list, and resolved output path so every
+    pipeline stage processes data at the correct granularity.
     """
 
     issuer_id: str
@@ -41,10 +41,21 @@ class Partition:
         """Return filesystem-safe key ``{issuer_id}_{year}_{month}``."""
         return f"{self.issuer_id}_{self.year}_{self.month}"
 
+    @property
+    def file_count(self) -> int:
+        """Number of XML files in this partition."""
+        return len(self.xml_files)
+
     def __post_init__(self) -> None:
         """Resolve default output path when not supplied."""
         if not self.output_path or str(self.output_path) == ".":
-            self.output_path = ASSETS_DIR / self.issuer_id / self.year / self.month
+            self.output_path = (
+                ASSETS_DIR / self.issuer_id / self.year / self.month
+            )
+
+
+# Backward-compatible alias used across pipeline modules
+Partition = SourcePartition
 
 
 def discover_partitions(
@@ -52,61 +63,78 @@ def discover_partitions(
     issuer_id: str | None = None,
     year: str | None = None,
     month: str | None = None,
-) -> list[Partition]:
+) -> list[SourcePartition]:
     """
-    Discover all issuer/year/month partitions under ``source_data``.
+    Recursively discover all issuer/year/month folders containing XML files.
 
-    Walks ``source_root/{issuer_id}/{year}/{month}/`` and collects XML files
-    in each month folder. Optional filters narrow discovery for CLI usage.
+    This function is the source of truth for dynamic ETL execution. A valid
+    partition requires:
+
+    * ``issuer_id`` folder is numeric
+    * ``year`` folder is exactly 4 digits
+    * ``month`` folder is exactly 2 digits (01-12)
+    * month folder contains at least one ``*.xml`` file
 
     Args:
         source_root: Root input directory; defaults to ``SOURCE_DATA_DIR``.
-        issuer_id: Process only this issuer when set.
-        year: Process only this year when set (requires issuer context).
-        month: Process only this month when set (requires issuer + year).
+        issuer_id: Optional filter — process only this issuer.
+        year: Optional filter — process only this year (use with issuer).
+        month: Optional filter — process only this month (use with issuer+year).
 
     Returns:
-        Sorted list of ``Partition`` instances with populated ``xml_files``.
+        Sorted list of ``SourcePartition`` instances.
     """
     root = source_root or SOURCE_DATA_DIR
     if not root.exists():
         logger.warning("Source data directory does not exist: %s", root)
         return []
 
-    issuer_dirs = _list_issuer_dirs(root, issuer_id)
-    partitions: list[Partition] = []
+    partitions: list[SourcePartition] = []
 
-    for issuer_dir in issuer_dirs:
-        year_dirs = _list_year_dirs(issuer_dir, year)
-        for year_dir in year_dirs:
-            month_dirs = _list_month_dirs(year_dir, month)
-            for month_dir in month_dirs:
+    for issuer_dir in sorted(root.iterdir(), key=lambda p: p.name):
+        if not issuer_dir.is_dir() or not issuer_dir.name.isdigit():
+            continue
+        if issuer_id and issuer_dir.name != issuer_id:
+            continue
+
+        for year_dir in sorted(issuer_dir.iterdir(), key=lambda p: p.name):
+            if not year_dir.is_dir():
+                continue
+            if not year_dir.name.isdigit() or len(year_dir.name) != 4:
+                continue
+            if year and year_dir.name != year:
+                continue
+
+            for month_dir in sorted(year_dir.iterdir(), key=lambda p: p.name):
+                if not month_dir.is_dir():
+                    continue
+                if not month_dir.name.isdigit() or len(month_dir.name) != 2:
+                    continue
+                if month and month_dir.name != month.zfill(2):
+                    continue
+                if not _is_valid_month(month_dir.name):
+                    continue
+
                 xml_files = sorted(month_dir.glob("*.xml"))
                 if not xml_files:
-                    logger.debug(
-                        "Skipping empty partition (no XML): %s", month_dir
-                    )
                     continue
-                partition = Partition(
-                    issuer_id=issuer_dir.name,
-                    year=year_dir.name,
-                    month=month_dir.name,
-                    input_path=month_dir,
-                    xml_files=xml_files,
-                    output_path=ASSETS_DIR / issuer_dir.name / year_dir.name / month_dir.name,
-                )
-                partitions.append(partition)
 
-    partitions.sort(key=lambda p: (p.issuer_id, p.year, p.month))
-    logger.info(
-        "Discovered %d partition(s)%s",
-        len(partitions),
-        _filter_label(issuer_id, year, month),
-    )
+                partitions.append(
+                    SourcePartition(
+                        issuer_id=issuer_dir.name,
+                        year=year_dir.name,
+                        month=month_dir.name,
+                        input_path=month_dir,
+                        xml_files=xml_files,
+                        output_path=ASSETS_DIR / issuer_dir.name / year_dir.name / month_dir.name,
+                    )
+                )
+
+    logger.info("Found %d source partition(s).", len(partitions))
     return partitions
 
 
-def ensure_partition_asset_dirs(partition: Partition) -> dict[str, Path]:
+def ensure_partition_asset_dirs(partition: SourcePartition) -> dict[str, Path]:
     """
     Create monthly output directories for a partition.
 
@@ -149,13 +177,14 @@ def ensure_rollup_asset_dirs(issuer_id: str) -> dict[str, Path]:
         "excel": base / "excel",
         "sqlite": base / "sqlite",
         "dashboards": base / "dashboards",
+        "validation_reports": base / "validation_reports",
     }
     for path in dirs.values():
         path.mkdir(parents=True, exist_ok=True)
     return dirs
 
 
-def monthly_output_stem(partition: Partition) -> str:
+def monthly_output_stem(partition: SourcePartition) -> str:
     """Return filename stem ``{issuer_id}_{year}_{month}`` for monthly outputs."""
     return partition.period_key
 
@@ -165,56 +194,6 @@ def rollup_output_stem(issuer_id: str) -> str:
     return f"{issuer_id}_all_periods"
 
 
-def _list_issuer_dirs(root: Path, issuer_id: str | None) -> list[Path]:
-    """Return issuer directories, optionally filtered to one issuer."""
-    if issuer_id:
-        path = root / issuer_id
-        return [path] if path.is_dir() else []
-    return sorted(
-        d for d in root.iterdir() if d.is_dir() and d.name.isdigit()
-    )
-
-
-def _list_year_dirs(issuer_dir: Path, year: str | None) -> list[Path]:
-    """Return year directories under an issuer, optionally filtered."""
-    if year:
-        path = issuer_dir / year
-        return [path] if path.is_dir() and _is_year(path.name) else []
-    return sorted(
-        d for d in issuer_dir.iterdir() if d.is_dir() and _is_year(d.name)
-    )
-
-
-def _list_month_dirs(year_dir: Path, month: str | None) -> list[Path]:
-    """Return month directories under a year, optionally filtered."""
-    if month:
-        normalized = month.zfill(2)
-        path = year_dir / normalized
-        return [path] if path.is_dir() and _is_month(path.name) else []
-    return sorted(
-        d for d in year_dir.iterdir() if d.is_dir() and _is_month(d.name)
-    )
-
-
-def _is_year(name: str) -> bool:
-    """Return True when folder name is a four-digit year."""
-    return len(name) == 4 and name.isdigit()
-
-
-def _is_month(name: str) -> bool:
-    """Return True when folder name is a valid month (01-12)."""
+def _is_valid_month(name: str) -> bool:
+    """Return True when folder name is a valid two-digit month (01-12)."""
     return len(name) == 2 and name.isdigit() and 1 <= int(name) <= 12
-
-
-def _filter_label(
-    issuer_id: str | None, year: str | None, month: str | None
-) -> str:
-    """Build a human-readable filter description for logging."""
-    parts = []
-    if issuer_id:
-        parts.append(f" issuer={issuer_id}")
-    if year:
-        parts.append(f" year={year}")
-    if month:
-        parts.append(f" month={month.zfill(2)}")
-    return f" ({','.join(parts).strip()})" if parts else ""

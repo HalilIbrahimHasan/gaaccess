@@ -1,26 +1,28 @@
 """
 834 Issuer ETL — main orchestrator.
 
-Runs the full extract → transform → validate → load → dashboard pipeline
-for all issuer/year/month partitions discovered under ``source_data/``.
+Discovers every ``source_data/{issuer}/{year}/{month}/`` partition and runs
+the full ETL pipeline independently for each. After all monthly partitions for
+an issuer complete, builds issuer-level rollup outputs.
 
 Usage:
     python src/main.py
-    python src/main.py --issuer 64357
-    python src/main.py --issuer 64357 --year 2026
+    python src/main.py --issuer 13535
+    python src/main.py --issuer 15105 --year 2026
     python src/main.py --issuer 64357 --year 2026 --month 02
 """
 
 import argparse
 import json
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import DEFAULT_ISSUER_EXAMPLE
+from config import DEFAULT_ISSUER_EXAMPLE, SOURCE_DATA_DIR
 from dashboard.plotly_dashboard import PlotlyDashboard
 from extract.xml_reader import LocalFileSource, XmlReader
 from load.excel_exporter import ExcelExporter
@@ -31,7 +33,8 @@ from transform.kpi_builder import KpiBuilder
 from transform.xml_parser import Xml834Parser
 from utils.logger import get_logger
 from utils.partition import (
-    Partition,
+    SourcePartition,
+    discover_partitions,
     ensure_partition_asset_dirs,
     ensure_rollup_asset_dirs,
     monthly_output_stem,
@@ -43,12 +46,36 @@ from validate.schema_validator import SchemaValidator
 logger = get_logger(__name__)
 
 
+@dataclass
+class PartitionRunResult:
+    """Outcome of processing a single issuer/year/month partition."""
+
+    partition: SourcePartition
+    status: str  # processed | skipped | failed
+    output_path: Path | None = None
+    enrollee_count: int = 0
+    error: str | None = None
+
+
+@dataclass
+class PipelineSummary:
+    """Aggregated run statistics printed at the end of execution."""
+
+    discovered: int = 0
+    processed: int = 0
+    skipped: int = 0
+    failed: int = 0
+    results: list[PartitionRunResult] = field(default_factory=list)
+    rollup_issuers: list[str] = field(default_factory=list)
+    failed_rollups: list[str] = field(default_factory=list)
+
+
 class IssuerEtlPipeline:
     """
-    End-to-end ETL pipeline for partitioned 834 XML issuer enrollment data.
+    End-to-end ETL pipeline driven by ``discover_partitions()``.
 
-    Processes each issuer/year/month partition independently, then builds
-    optional issuer-level rollup outputs across all processed months.
+    Each valid issuer/year/month folder is processed independently. Issuer
+    rollups are built after all monthly partitions for that issuer succeed.
     """
 
     def __init__(self) -> None:
@@ -69,67 +96,104 @@ class IssuerEtlPipeline:
         issuer_id: str | None = None,
         year: str | None = None,
         month: str | None = None,
-    ) -> None:
+    ) -> PipelineSummary:
         """
-        Execute the pipeline for matching partitions and issuer rollups.
+        Execute the pipeline for every matching partition, then issuer rollups.
 
         Args:
             issuer_id: Optional issuer filter.
             year: Optional year filter (typically used with issuer).
             month: Optional month filter (typically used with issuer + year).
+
+        Returns:
+            ``PipelineSummary`` with counts and per-partition outcomes.
         """
-        partitions = self.reader.discover_partitions(
-            issuer_id=issuer_id, year=year, month=month
+        partitions = discover_partitions(
+            source_root=SOURCE_DATA_DIR,
+            issuer_id=issuer_id,
+            year=year,
+            month=month,
         )
+
+        summary = PipelineSummary(discovered=len(partitions))
 
         if not partitions:
             logger.error(
-                "No partitions found. Expected structure: "
-                "source_data/{issuer_id}/{year}/{month}/*.xml"
+                "No partitions found under %s. Expected structure: "
+                "source_data/{issuer_id}/{year}/{month}/*.xml",
+                SOURCE_DATA_DIR,
             )
+            self._print_summary(summary)
             sys.exit(1)
 
         issuer_monthly_dfs: dict[str, list[pd.DataFrame]] = {}
 
         for partition in partitions:
-            logger.info("=" * 60)
             logger.info(
-                "Processing partition: %s / %s / %s",
+                "Processing issuer=%s year=%s month=%s files=%d path=%s",
                 partition.issuer_id,
                 partition.year,
                 partition.month,
+                partition.file_count,
+                partition.input_path,
             )
-            logger.info("=" * 60)
             try:
-                cleaned_df = self._process_partition(partition)
-                if cleaned_df is not None and not cleaned_df.empty:
+                cleaned_df, run_result = self._process_partition(partition)
+                summary.results.append(run_result)
+
+                if run_result.status == "processed":
+                    summary.processed += 1
                     issuer_monthly_dfs.setdefault(partition.issuer_id, []).append(
                         cleaned_df
                     )
+                elif run_result.status == "skipped":
+                    summary.skipped += 1
+                else:
+                    summary.failed += 1
+
             except Exception as exc:
+                summary.failed += 1
+                error_msg = str(exc)
                 logger.error(
-                    "Partition %s failed: %s", partition.period_key, exc,
+                    "Partition %s failed: %s",
+                    partition.period_key,
+                    error_msg,
                     exc_info=True,
+                )
+                summary.results.append(
+                    PartitionRunResult(
+                        partition=partition,
+                        status="failed",
+                        error=error_msg,
+                    )
                 )
 
         for iid, dfs in issuer_monthly_dfs.items():
-            if len(dfs) >= 1:
-                try:
-                    self._process_rollup(iid, dfs)
-                except Exception as exc:
-                    logger.error(
-                        "Rollup for issuer %s failed: %s", iid, exc, exc_info=True
-                    )
+            if not dfs:
+                continue
+            try:
+                self._process_rollup(iid, dfs)
+                summary.rollup_issuers.append(iid)
+            except Exception as exc:
+                summary.failed_rollups.append(iid)
+                logger.error(
+                    "Rollup for issuer %s failed: %s", iid, exc, exc_info=True
+                )
 
-    def _process_partition(self, partition: Partition) -> pd.DataFrame | None:
+        self._print_summary(summary)
+        return summary
+
+    def _process_partition(
+        self, partition: SourcePartition
+    ) -> tuple[pd.DataFrame | None, PartitionRunResult]:
         """
-        Run extract through dashboard for a single issuer/year/month partition.
+        Run the full ETL for one issuer/year/month partition.
 
         Args:
-            partition: Discovered partition with input XML files and output path.
+            partition: Discovered partition with XML files and output path.
 
         Returns:
-            Cleaned enrollee DataFrame, or ``None`` when no data was parsed.
+            Tuple of (cleaned DataFrame or None, run result metadata).
         """
         asset_dirs = ensure_partition_asset_dirs(partition)
         output_stem = monthly_output_stem(partition)
@@ -158,15 +222,22 @@ class IssuerEtlPipeline:
                 )
 
         logger.info(
-            "Partition %s: %d file(s) OK, %d file(s) failed",
+            "Partition %s: %d file(s) parsed, %d file(s) failed",
             partition.period_key,
             files_processed,
             files_failed,
         )
 
         if not all_rows:
-            logger.warning("No enrollee rows for partition %s", partition.period_key)
-            return None
+            logger.warning(
+                "Skipping partition %s — no enrollee rows parsed",
+                partition.period_key,
+            )
+            return None, PartitionRunResult(
+                partition=partition,
+                status="skipped",
+                output_path=partition.output_path,
+            )
 
         raw_df = pd.DataFrame(all_rows)
         cleaned_df = self.cleaner.clean(raw_df, partition=partition)
@@ -197,8 +268,19 @@ class IssuerEtlPipeline:
             partition=partition,
         )
 
-        logger.info("Partition %s complete.", partition.period_key)
-        return cleaned_df
+        logger.info(
+            "Completed partition %s — %d enrollees → %s",
+            partition.period_key,
+            len(cleaned_df),
+            partition.output_path,
+        )
+
+        return cleaned_df, PartitionRunResult(
+            partition=partition,
+            status="processed",
+            output_path=partition.output_path,
+            enrollee_count=len(cleaned_df),
+        )
 
     def _process_rollup(
         self, issuer_id: str, monthly_dfs: list[pd.DataFrame]
@@ -208,11 +290,13 @@ class IssuerEtlPipeline:
 
         Args:
             issuer_id: Issuer identifier.
-            monthly_dfs: List of cleaned monthly DataFrames for this issuer.
+            monthly_dfs: Cleaned monthly DataFrames for this issuer.
         """
-        logger.info("=" * 60)
-        logger.info("Building rollup for issuer: %s (%d month(s))", issuer_id, len(monthly_dfs))
-        logger.info("=" * 60)
+        logger.info(
+            "Building rollup for issuer=%s across %d month(s)",
+            issuer_id,
+            len(monthly_dfs),
+        )
 
         combined_df = pd.concat(monthly_dfs, ignore_index=True)
         asset_dirs = ensure_rollup_asset_dirs(issuer_id)
@@ -238,6 +322,13 @@ class IssuerEtlPipeline:
         self.excel_exporter.export_kpis(
             kpis, kpi_summary_df, output_stem, asset_dirs["excel"], is_rollup=True
         )
+        self.excel_exporter.export_validation_report(
+            validation_df,
+            missingness_df,
+            file_profile_df,
+            output_stem,
+            asset_dirs["excel"],
+        )
         self.sqlite_loader.load(
             combined_df,
             kpi_summary_df,
@@ -257,10 +348,15 @@ class IssuerEtlPipeline:
             is_rollup=True,
         )
 
-        logger.info("Rollup for issuer %s complete.", issuer_id)
-        logger.info("  Excel:     %s", asset_dirs["excel"])
-        logger.info("  SQLite:    %s", asset_dirs["sqlite"])
-        logger.info("  Dashboard: %s", asset_dirs["dashboards"])
+        json_path = (
+            asset_dirs["validation_reports"]
+            / f"validation_report_{output_stem}.json"
+        )
+        self._write_validation_json(validation_df, json_path)
+
+        logger.info(
+            "Rollup complete for issuer=%s → %s", issuer_id, asset_dirs["base"]
+        )
 
     def _export_partition_outputs(
         self,
@@ -273,7 +369,7 @@ class IssuerEtlPipeline:
         file_profile_df: pd.DataFrame,
         output_stem: str,
         asset_dirs: dict[str, Path],
-        partition: Partition,
+        partition: SourcePartition,
     ) -> None:
         """Write all monthly export artifacts for one partition."""
         self.excel_exporter.export_enrollees(
@@ -325,9 +421,69 @@ class IssuerEtlPipeline:
         validation_df: pd.DataFrame, path: Path
     ) -> None:
         """Persist validation results as JSON for programmatic consumption."""
-        records = validation_df.to_dict(orient="records") if not validation_df.empty else []
+        records = (
+            validation_df.to_dict(orient="records")
+            if not validation_df.empty
+            else []
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(records, indent=2), encoding="utf-8")
         logger.info("Exported validation JSON: %s", path)
+
+    @staticmethod
+    def _print_summary(summary: PipelineSummary) -> None:
+        """Print end-of-run processing summary to the log."""
+        logger.info("=" * 60)
+        logger.info("PROCESSING SUMMARY")
+        logger.info("=" * 60)
+        logger.info("Total partitions discovered : %d", summary.discovered)
+        logger.info("Total partitions processed  : %d", summary.processed)
+        logger.info("Total partitions skipped    : %d", summary.skipped)
+        logger.info("Total partitions failed     : %d", summary.failed)
+
+        if summary.rollup_issuers:
+            logger.info(
+                "Rollups created for issuers : %s",
+                ", ".join(summary.rollup_issuers),
+            )
+        if summary.failed_rollups:
+            logger.info(
+                "Rollups failed for issuers  : %s",
+                ", ".join(summary.failed_rollups),
+            )
+
+        if summary.results:
+            logger.info("-" * 60)
+            logger.info("Partition outputs:")
+            for result in summary.results:
+                p = result.partition
+                if result.status == "processed":
+                    logger.info(
+                        "  [OK]   issuer=%s year=%s month=%s "
+                        "enrollees=%d → %s",
+                        p.issuer_id,
+                        p.year,
+                        p.month,
+                        result.enrollee_count,
+                        result.output_path,
+                    )
+                elif result.status == "skipped":
+                    logger.info(
+                        "  [SKIP] issuer=%s year=%s month=%s — no data",
+                        p.issuer_id,
+                        p.year,
+                        p.month,
+                    )
+                else:
+                    logger.info(
+                        "  [FAIL] issuer=%s year=%s month=%s — %s",
+                        p.issuer_id,
+                        p.year,
+                        p.month,
+                        result.error or "unknown error",
+                    )
+
+        logger.info("=" * 60)
 
 
 def parse_args() -> argparse.Namespace:
@@ -360,7 +516,13 @@ def main() -> None:
     """CLI entry point."""
     args = parse_args()
     pipeline = IssuerEtlPipeline()
-    pipeline.run(issuer_id=args.issuer, year=args.year, month=args.month)
+    summary = pipeline.run(
+        issuer_id=args.issuer,
+        year=args.year,
+        month=args.month,
+    )
+    if summary.failed > 0 or summary.failed_rollups:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
