@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from config.config import settings  # noqa: E402
+from config.config import env_diagnostics, settings  # noqa: E402
 from pipeline.orchestrator import Pipeline  # noqa: E402
 from utils.logger import get_logger  # noqa: E402
 
@@ -45,6 +45,14 @@ def main() -> None:
     if args.no_clean:
         settings.clean_on_start = False
 
+    env_info = env_diagnostics()
+    logger.info("ENV FILE     : %s", env_info["env_file"])
+    logger.info("ENV EXISTS   : %s", env_info["env_file_exists"])
+    logger.info("ENV LOADED   : %s", env_info["env_loaded"])
+    logger.info(
+        "PROCESSING_MODE (raw): %s",
+        env_info["processing_mode_raw"] if env_info["processing_mode_raw"] else "(not set — default local)",
+    )
     logger.info("PROJECT_ROOT : %s", settings.project_root)
     logger.info("SOURCE_DATA  : %s", settings.source_data_path)
     logger.info("ASSETS       : %s", settings.assets_path)

@@ -11,7 +11,19 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(PROJECT_ROOT / ".env")
+ENV_FILE = PROJECT_ROOT / ".env"
+# override=True: project .env wins over pre-set shell variables (e.g. PROCESSING_MODE=local)
+ENV_LOADED = load_dotenv(ENV_FILE, override=True)
+
+
+def env_diagnostics() -> dict[str, str | bool | None]:
+    """Return which .env path was used and whether PROCESSING_MODE was read."""
+    return {
+        "env_file": str(ENV_FILE),
+        "env_file_exists": ENV_FILE.is_file(),
+        "env_loaded": ENV_LOADED,
+        "processing_mode_raw": os.getenv("PROCESSING_MODE"),
+    }
 
 
 def _path(key: str, default: str) -> Path:
