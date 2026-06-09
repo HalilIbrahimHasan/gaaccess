@@ -1,3 +1,39 @@
-from config.config import settings
+"""Application configuration — re-exports for src/ legacy modules."""
 
-__all__ = ["settings"]
+from config.config import (
+    DATE_COLUMNS,
+    EXPORT_PII,
+    LOG_FORMAT,
+    LOG_LEVEL,
+    NUMERIC_COLUMNS,
+    PII_COLUMNS,
+    REQUIRED_COLUMNS,
+    REQUIRED_ID_FIELDS,
+    TABLE_ENROLLEES,
+    TABLE_ENROLLEES_ROLLUP,
+    TABLE_KPIS,
+    TABLE_KPIS_ROLLUP,
+    TABLE_VALIDATION,
+    TABLE_VALIDATION_ROLLUP,
+    VALID_SUBSCRIBER_FLAGS,
+    settings,
+)
+
+__all__ = [
+    "settings",
+    "LOG_FORMAT",
+    "LOG_LEVEL",
+    "EXPORT_PII",
+    "PII_COLUMNS",
+    "REQUIRED_COLUMNS",
+    "REQUIRED_ID_FIELDS",
+    "DATE_COLUMNS",
+    "NUMERIC_COLUMNS",
+    "VALID_SUBSCRIBER_FLAGS",
+    "TABLE_ENROLLEES",
+    "TABLE_KPIS",
+    "TABLE_VALIDATION",
+    "TABLE_ENROLLEES_ROLLUP",
+    "TABLE_KPIS_ROLLUP",
+    "TABLE_VALIDATION_ROLLUP",
+]

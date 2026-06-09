@@ -30,7 +30,8 @@ def _normalize_year(name: str) -> str | None:
 
 
 def _issuer_ok(name: str) -> bool:
-    return bool(name) and not name.startswith(".") and name not in {"__pycache__"}
+    """Issuer folders must be exactly 5 digits."""
+    return name.isdigit() and len(name) == 5 and not name.startswith(".")
 
 
 def discover_source_files(

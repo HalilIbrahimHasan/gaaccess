@@ -33,10 +33,13 @@ class Settings:
         default_factory=lambda: _path("EXTRACTED_PATH", "extracted")
     )
     database_path: Path = field(
-        default_factory=lambda: _path("DATABASE_PATH", "database/issuer_834.db")
+        default_factory=lambda: _path("DATABASE_PATH", "data/issuer_834.db")
     )
     reports_path: Path = field(
         default_factory=lambda: _path("REPORTS_PATH", "reports")
+    )
+    assets_path: Path = field(
+        default_factory=lambda: _path("ASSETS_PATH", "assets")
     )
     logs_path: Path = field(
         default_factory=lambda: _path("LOGS_PATH", "logs")
@@ -55,6 +58,9 @@ class Settings:
     )
     cancellation_window_days: int = field(
         default_factory=lambda: int(os.getenv("CANCELLATION_WINDOW_DAYS", "90"))
+    )
+    clean_on_start: bool = field(
+        default_factory=lambda: os.getenv("CLEAN_ON_START", "true").lower() == "true"
     )
     ftp_host: str = field(default_factory=lambda: os.getenv("FTP_HOST", ""))
     ftp_port: int = field(default_factory=lambda: int(os.getenv("FTP_PORT", "21")))
@@ -106,8 +112,42 @@ class Settings:
             self.logs_path,
             self.reports_path / "validation",
             self.reports_path / "kpi",
+            self.assets_path,
         ):
             p.mkdir(parents=True, exist_ok=True)
 
+
+# Legacy constants used by src/ exporters and validators
+LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+LOG_LEVEL = "INFO"
+EXPORT_PII = False
+PII_COLUMNS = [
+    "member_ssn", "member_primary_phone_no", "member_preferred_email",
+    "member_first_name", "member_last_name", "member_full_address",
+]
+REQUIRED_COLUMNS = [
+    "source_file", "issuer_id", "source_year", "source_month", "source_period",
+    "subscriber_flag", "relationship_code", "event_type_code", "event_reason_code",
+    "exchg_subscriber_identifier", "exchg_assigned_policy_id", "exchg_indiv_identifier",
+    "member_maint_effective_date", "maintenance_type_code", "insurance_type_code",
+    "benefit_effective_begin_date", "household_or_employee_case_id",
+    "health_coverage_policy_no", "aptc_amt", "total_indiv_responsibility_amt",
+    "total_premium_amt", "additional_maint_reason_code", "load_timestamp",
+]
+REQUIRED_ID_FIELDS = ["issuer_id", "exchg_indiv_identifier", "exchg_assigned_policy_id"]
+DATE_COLUMNS = [
+    "member_maint_effective_date", "member_birth_date",
+    "benefit_effective_begin_date", "file_date",
+]
+NUMERIC_COLUMNS = [
+    "aptc_amt", "total_indiv_responsibility_amt", "total_premium_amt",
+]
+VALID_SUBSCRIBER_FLAGS = {"Y", "N"}
+TABLE_ENROLLEES = "issuer_enrollees"
+TABLE_KPIS = "issuer_kpis"
+TABLE_VALIDATION = "validation_results"
+TABLE_ENROLLEES_ROLLUP = "issuer_enrollees_all_periods"
+TABLE_KPIS_ROLLUP = "issuer_kpis_all_periods"
+TABLE_VALIDATION_ROLLUP = "validation_results_all_periods"
 
 settings = Settings()

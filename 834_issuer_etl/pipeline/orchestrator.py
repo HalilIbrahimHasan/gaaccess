@@ -16,7 +16,9 @@ from parsers.parser_834 import Parser834
 from reconciliation.cancellation_window import apply_cancellation_window
 from reconciliation.premium_validation import apply_premium_validation
 from reconciliation.user_fee_calculation import apply_user_fees
+from pipeline.assets_exporter import export_assets
 from reporting.report_runner import run_kpi_reports
+from utils.cleanup import clean_workspace
 from utils.logger import get_logger
 from validation.load_validation import run_load_validation
 
@@ -34,6 +36,9 @@ def get_connector() -> SourceConnector:
 
 class Pipeline:
     def __init__(self) -> None:
+        if settings.clean_on_start:
+            clean_workspace(clear_source=False)
+
         settings.ensure_dirs()
         self.db = Database()
         self.db.init_schema()
@@ -99,11 +104,17 @@ class Pipeline:
     def report(self, issuer: str | None = None) -> None:
         run_kpi_reports(self.db, issuer)
 
+    def export_assets(self, issuer: str | None = None) -> dict[str, int]:
+        return export_assets(self.db.conn, issuer or settings.issuer_filter)
+
     def run_full(self, issuer: str | None = None) -> dict:
         stats = self.ingest_and_load()
         self.reconcile()
         self.validate(issuer or settings.issuer_filter)
         self.report(issuer or settings.issuer_filter)
+        asset_stats = self.export_assets(issuer or settings.issuer_filter)
+        stats["asset_partitions"] = asset_stats["partitions"]
+        stats["asset_rollups"] = asset_stats["rollups"]
         return stats
 
     def close(self) -> None:

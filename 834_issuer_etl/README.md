@@ -127,19 +127,33 @@ Rules:
 ## Run Commands
 
 ```bash
-# Full pipeline (ingest → validate → reconcile → report)
+# Full pipeline — processes all issuers in source_data/
 python main.py
 
-# Filter by issuer / year / month
-python main.py --issuer Sigma
+# Filter by 5-digit issuer / year / month
 python main.py --issuer 86637 --year 2026 --month 02
 
 # Validation only
-python run_validation.py --issuer Sigma
+python run_validation.py --issuer 86637
 
 # KPI reports only (uses existing database)
-python run_kpi_reports.py --issuer Sigma
+python run_kpi_reports.py --issuer 86637
 ```
+
+### Clean Start (every run by default)
+
+Each run wipes `data/`, `reports/`, `extracted/`, `logs/`, and `assets/` before processing — **only current source_data is reflected in outputs**.
+
+Set `CLEAN_ON_START=false` in `.env` or pass `--no-clean` to keep previous outputs.
+
+### Output Locations
+
+| Output | Path |
+|--------|------|
+| Staging DB | `data/issuer_834.db` |
+| Excel/KPI reports | `reports/validation/`, `reports/kpi/` |
+| Per-partition assets | `assets/{issuer}/{year}/{month}/excel`, `cleaned_xml`, `sqlite`, `dashboards` |
+| Issuer rollups | `assets/{issuer}/rollups/` |
 
 ## Database Tables
 

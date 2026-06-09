@@ -2,9 +2,10 @@
 """
 834 Issuer ETL — full local pipeline.
 
+Processes real issuer data from source_data/{issuer}/{year}/{month}/*.xml
+
 Examples:
     python main.py
-    python main.py --issuer Sigma
     python main.py --issuer 86637 --year 2026 --month 02
 """
 
@@ -27,21 +28,30 @@ logger = get_logger(__name__)
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="834 XML ETL — full pipeline")
-    p.add_argument("--issuer", help="Filter by issuer folder name")
+    p.add_argument("--issuer", help="Filter by 5-digit issuer folder")
     p.add_argument("--year", help="Filter by 4-digit year")
     p.add_argument("--month", help="Filter by month (1-12 or 01-12)")
+    p.add_argument(
+        "--no-clean",
+        action="store_true",
+        help="Keep previous run outputs (not recommended)",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     settings.apply_cli_filters(args.issuer, args.year, args.month)
-    settings.ensure_dirs()
+    if args.no_clean:
+        settings.clean_on_start = False
 
     logger.info("PROJECT_ROOT : %s", settings.project_root)
     logger.info("SOURCE_DATA  : %s", settings.source_data_path)
+    logger.info("ASSETS       : %s", settings.assets_path)
     logger.info("DATABASE     : %s", settings.database_path)
+    logger.info("REPORTS      : %s", settings.reports_path)
     logger.info("MODE         : %s", settings.processing_mode)
+    logger.info("CLEAN START  : %s", settings.clean_on_start)
     if settings.issuer_filter:
         logger.info("ISSUER FILTER: %s", settings.issuer_filter)
 
@@ -50,12 +60,15 @@ def main() -> None:
         stats = pipeline.run_full(settings.issuer_filter)
         logger.info("=" * 60)
         logger.info("PIPELINE COMPLETE")
-        logger.info("Files discovered : %d", stats["files_discovered"])
-        logger.info("Files processed  : %d", stats["files_processed"])
-        logger.info("Files skipped    : %d", stats["files_skipped"])
-        logger.info("Files failed     : %d", stats["files_failed"])
-        logger.info("Records loaded   : %d", stats["records_loaded"])
-        logger.info("Reports          : %s", settings.reports_path)
+        logger.info("Files discovered    : %d", stats["files_discovered"])
+        logger.info("Files processed     : %d", stats["files_processed"])
+        logger.info("Files skipped       : %d", stats["files_skipped"])
+        logger.info("Files failed        : %d", stats["files_failed"])
+        logger.info("Records loaded      : %d", stats["records_loaded"])
+        logger.info("Asset partitions    : %d", stats.get("asset_partitions", 0))
+        logger.info("Asset rollups       : %d", stats.get("asset_rollups", 0))
+        logger.info("Reports             : %s", settings.reports_path)
+        logger.info("Assets              : %s", settings.assets_path)
         logger.info("=" * 60)
     finally:
         pipeline.close()

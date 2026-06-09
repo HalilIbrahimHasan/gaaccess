@@ -27,7 +27,7 @@ build/
 834_issuer_etl/assets/
 834_issuer_etl/reports/
 834_issuer_etl/extracted/
-834_issuer_etl/database/
+834_issuer_etl/data/
 834_issuer_etl/logs/
 **/assets/**
 
