@@ -1,6 +1,10 @@
 # Instructions / internal notes
 ins.md
 
+# Secrets — never commit
+.env
+834_issuer_etl/.env
+
 # Python
 __pycache__/
 *.py[cod]
