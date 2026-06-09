@@ -23,7 +23,7 @@ class SFTPSourceConnector(SourceConnector):
     def sync(self) -> list[SourceFile]:
         if not settings.sftp_host or not settings.sftp_user:
             logger.error(
-                "SFTP credentials missing. Set SFTP_HOST, SFTP_USER, SFTP_PASSWORD in .env"
+                "SFTP credentials missing. Set SFTP_HOST, SFTP_USERNAME, SFTP_PASSWORD in .env"
             )
             logger.info("Falling back to local source_data scan.")
             return LocalSourceConnector().sync()

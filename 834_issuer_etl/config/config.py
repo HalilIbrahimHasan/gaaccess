@@ -64,14 +64,18 @@ class Settings:
     )
     ftp_host: str = field(default_factory=lambda: os.getenv("FTP_HOST", ""))
     ftp_port: int = field(default_factory=lambda: int(os.getenv("FTP_PORT", "21")))
-    ftp_user: str = field(default_factory=lambda: os.getenv("FTP_USER", ""))
+    ftp_user: str = field(
+        default_factory=lambda: os.getenv("FTP_USERNAME") or os.getenv("FTP_USER", "")
+    )
     ftp_password: str = field(default_factory=lambda: os.getenv("FTP_PASSWORD", ""))
     ftp_remote_path: str = field(
         default_factory=lambda: os.getenv("FTP_REMOTE_PATH", "/")
     )
     sftp_host: str = field(default_factory=lambda: os.getenv("SFTP_HOST", ""))
     sftp_port: int = field(default_factory=lambda: int(os.getenv("SFTP_PORT", "22")))
-    sftp_user: str = field(default_factory=lambda: os.getenv("SFTP_USER", ""))
+    sftp_user: str = field(
+        default_factory=lambda: os.getenv("SFTP_USERNAME") or os.getenv("SFTP_USER", "")
+    )
     sftp_password: str = field(
         default_factory=lambda: os.getenv("SFTP_PASSWORD", "")
     )
