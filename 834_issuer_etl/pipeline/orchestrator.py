@@ -13,7 +13,7 @@ from database.db import Database
 from database.loaders import DataLoader
 from ingestion.xml_reader import read_xml_bytes
 from parsers.parser_834 import Parser834
-from reconciliation.cancellation_window import apply_cancellation_window
+from reconciliation.business_rules import apply_business_rules
 from reconciliation.premium_validation import apply_premium_validation
 from reconciliation.user_fee_calculation import apply_user_fees
 from pipeline.assets_exporter import export_assets
@@ -96,7 +96,7 @@ class Pipeline:
         logger.info("Running reconciliation rules...")
         apply_premium_validation(self.db)
         apply_user_fees(self.db)
-        apply_cancellation_window(self.db)
+        apply_business_rules(self.db)
 
     def validate(self, issuer: str | None = None) -> None:
         run_load_validation(self.db, issuer)

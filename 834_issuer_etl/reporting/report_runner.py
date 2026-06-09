@@ -10,6 +10,7 @@ from reconciliation.cancellation_analysis import (
     repeated_cancel_report,
 )
 from reconciliation.cancellation_window import cancellation_window_summary
+from reconciliation.policy_lifecycle import refund_eligibility_detail
 from reconciliation.policy_lifecycle import (
     household_member_counts,
     issuer_kpi_summary,
@@ -64,8 +65,9 @@ def run_kpi_reports(db: Database, issuer: str | None = None) -> None:
         out / "rolling_3_month_kpi_summary.xlsx", "rolling_3mo",
     )
     write_excel(
-        refund_user_fee_report(db, issuer),
+        refund_eligibility_detail(db, issuer),
         out / "refund_eligibility_report.xlsx", "refund_eligibility",
+        extra_sheets={"refund_summary": refund_user_fee_report(db, issuer)},
     )
     write_excel(
         household_member_counts(db, issuer),
