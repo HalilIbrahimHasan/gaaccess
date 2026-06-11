@@ -1,14 +1,19 @@
 """
-SFTP ingestion — download 834 XML from remote day/batch folders.
+SFTP ingestion — download 834 XML from remote folders at any depth.
 
-Remote layout:
-    SFTP_ROOT/{issuer}/{year}/{month}/{day}/{batch_folder}/files
+Remote start path per partition:
+    SFTP_ROOT/{issuer}/{year}/{month}
+
+Then recursively walks all subfolders (unlimited depth).
 
 Local layout (unchanged):
     source_data/{issuer}/{year}/{month}/*.xml
 
-Only downloads: from_{issuer}_GA_834_INDV_*.xml.gz
-Skips: tracking, edi, dtl, summary, report, log, to_* files
+Valid files:
+    from_{issuer}_GA_834_INDV_*.xml
+    from_{issuer}_GA_834_INDV_*.xml.gz
+
+Skips: .edi, .edi.gz, .edi.bad, .edi.good, tracking, report, summary, log, to_*
 """
 
 from __future__ import annotations
@@ -17,7 +22,8 @@ import gzip
 from pathlib import Path
 
 from config.config import settings
-from ingestion.sftp_file_classifier import is_valid_834_gz, local_xml_name_from_gz
+from ingestion.sftp_file_classifier import local_xml_name_from_remote
+from ingestion.sftp_tree_walk import walk_partition_month
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -35,12 +41,6 @@ def _month_ok(name: str) -> bool:
     if not name.isdigit() or len(name) > 2:
         return False
     return 1 <= int(name) <= 12
-
-
-def _day_ok(name: str) -> bool:
-    if not name.isdigit() or len(name) > 2:
-        return False
-    return 1 <= int(name) <= 31
 
 
 def _normalize_month(name: str) -> str:
@@ -90,7 +90,6 @@ def list_remote_partitions(
                 month_norm = _normalize_month(month)
                 if month_filter and month_norm != str(month_filter).zfill(2):
                     continue
-                # Keep remote folder name as-is (may be "2" or "02"); normalize for local path
                 partitions.append((issuer, year, month))
 
     logger.info("SFTP partitions to sync: %d", len(partitions))
@@ -99,34 +98,28 @@ def list_remote_partitions(
     return partitions
 
 
-def _list_dirs(sftp, path: str) -> list[str]:
+def _download_remote_file(
+    sftp,
+    remote_file: str,
+    filename: str,
+    local_path: Path,
+) -> bool:
     try:
-        attrs = sftp.listdir_attr(path)
-        return sorted(
-            a.filename for a in attrs
-            if not a.filename.startswith(".") and _is_dir(sftp, f"{path}/{a.filename}")
+        with sftp.open(remote_file, "rb") as remote_f:
+            raw = remote_f.read()
+        if filename.lower().endswith(".xml.gz"):
+            xml_bytes = gzip.decompress(raw)
+        else:
+            xml_bytes = raw
+        local_path.write_bytes(xml_bytes)
+        logger.info(
+            "SFTP downloaded: %s → %s (%d bytes)",
+            remote_file, local_path, len(xml_bytes),
         )
-    except OSError:
-        return []
-
-
-def _is_dir(sftp, path: str) -> bool:
-    import stat
-    try:
-        return stat.S_ISDIR(sftp.stat(path).st_mode)
-    except OSError:
+        return True
+    except Exception as exc:
+        logger.error("Failed to download %s: %s", remote_file, exc)
         return False
-
-
-def _list_files(sftp, path: str) -> list[str]:
-    try:
-        attrs = sftp.listdir_attr(path)
-        return sorted(
-            a.filename for a in attrs
-            if not a.filename.startswith(".") and not _is_dir(sftp, f"{path}/{a.filename}")
-        )
-    except OSError:
-        return []
 
 
 def download_partition(
@@ -138,7 +131,7 @@ def download_partition(
     local_root: Path,
 ) -> list[Path]:
     """
-    Download all valid .xml.gz files from remote day/batch folders.
+    Recursively download all valid .xml and .xml.gz files under the month folder.
 
     Flattens into source_data/{issuer}/{year}/{month}/*.xml
     """
@@ -146,44 +139,24 @@ def download_partition(
     local_month = local_root / issuer / year / _normalize_month(month)
     local_month.mkdir(parents=True, exist_ok=True)
 
+    walk = walk_partition_month(sftp, month_path, issuer)
     downloaded: list[Path] = []
-    day_dirs = _list_dirs(sftp, month_path)
 
-    if not day_dirs:
-        logger.warning("No day folders under %s", month_path)
-        return downloaded
+    logger.info(
+        "Partition %s/%s/%s recursive scan: folders=%d max_depth=%d valid_xml=%d valid_gz=%d",
+        issuer, year, month,
+        walk.folders_scanned_count,
+        walk.max_depth_scanned,
+        walk.total_valid_xml,
+        walk.total_valid_xml_gz,
+    )
 
-    for day in day_dirs:
-        if not _day_ok(day):
-            logger.debug("Skip non-day folder: %s", day)
-            continue
-        day_path = f"{month_path}/{day}"
-        batch_dirs = _list_dirs(sftp, day_path)
-
-        for batch in batch_dirs:
-            batch_path = f"{day_path}/{batch}"
-            files = _list_files(sftp, batch_path)
-
-            for filename in files:
-                if not is_valid_834_gz(issuer, filename):
-                    continue
-
-                remote_file = f"{batch_path}/{filename}"
-                local_xml_name = local_xml_name_from_gz(filename)
-                local_path = local_month / local_xml_name
-
-                try:
-                    with sftp.open(remote_file, "rb") as remote_f:
-                        compressed = remote_f.read()
-                    xml_bytes = gzip.decompress(compressed)
-                    local_path.write_bytes(xml_bytes)
-                    downloaded.append(local_path)
-                    logger.info(
-                        "SFTP downloaded: %s → %s (%d bytes)",
-                        remote_file, local_path, len(xml_bytes),
-                    )
-                except Exception as exc:
-                    logger.error("Failed to download %s: %s", remote_file, exc)
+    for remote_file in walk.all_valid_remote_paths:
+        filename = remote_file.rsplit("/", 1)[-1]
+        local_xml_name = local_xml_name_from_remote(filename)
+        local_path = local_month / local_xml_name
+        if _download_remote_file(sftp, remote_file, filename, local_path):
+            downloaded.append(local_path)
 
     logger.info(
         "Partition %s/%s/%s: %d XML file(s) saved to %s",
