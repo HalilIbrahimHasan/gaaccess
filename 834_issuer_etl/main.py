@@ -59,9 +59,26 @@ def main() -> None:
     logger.info("DATABASE     : %s", settings.database_path)
     logger.info("REPORTS      : %s", settings.reports_path)
     logger.info("MODE         : %s", settings.processing_mode)
+    logger.info("SFTP AUDIT   : %s", settings.sftp_audit_only)
+    if settings.sftp_audit_only:
+        logger.info("AUDIT MONTHS : %s", ", ".join(settings.sftp_audit_months()))
     logger.info("CLEAN START  : %s", settings.clean_on_start)
     if settings.issuer_filter:
         logger.info("ISSUER FILTER: %s", settings.issuer_filter)
+
+    if settings.sftp_audit_only:
+        if settings.processing_mode != "sftp":
+            logger.error("SFTP_AUDIT_ONLY requires PROCESSING_MODE=sftp")
+            sys.exit(1)
+        settings.ensure_dirs()
+        from connectors.sftp_connector import SFTPSourceConnector  # noqa: E402
+
+        SFTPSourceConnector().sync()
+        logger.info("=" * 60)
+        logger.info("SFTP AUDIT COMPLETE (no download, no parser, no reconciliation)")
+        logger.info("Report: %s", settings.reports_path / "sftp_audit_03_04_05_06.csv")
+        logger.info("=" * 60)
+        return
 
     pipeline = Pipeline()
     try:

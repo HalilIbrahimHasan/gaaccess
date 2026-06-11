@@ -13,29 +13,14 @@ Skips: tracking, edi, dtl, summary, report, log, to_* files
 
 from __future__ import annotations
 
-import fnmatch
 import gzip
-import re
 from pathlib import Path
 
 from config.config import settings
+from ingestion.sftp_file_classifier import is_valid_834_gz, local_xml_name_from_gz
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-SKIP_PATTERN = re.compile(
-    r"tracking|edi|dtl|summary|report|log|^to_",
-    re.IGNORECASE,
-)
-
-
-def is_valid_834_gz(issuer: str, filename: str) -> bool:
-    """Return True if file matches from_{issuer}_GA_834_INDV_*.xml.gz and is not skipped."""
-    if SKIP_PATTERN.search(filename):
-        logger.debug("Skip excluded file: %s", filename)
-        return False
-    pattern = f"from_{issuer}_GA_834_INDV_*.xml.gz"
-    return fnmatch.fnmatch(filename, pattern)
 
 
 def _issuer_ok(name: str) -> bool:
@@ -184,7 +169,7 @@ def download_partition(
                     continue
 
                 remote_file = f"{batch_path}/{filename}"
-                local_xml_name = filename[:-3] if filename.endswith(".gz") else filename
+                local_xml_name = local_xml_name_from_gz(filename)
                 local_path = local_month / local_xml_name
 
                 try:
