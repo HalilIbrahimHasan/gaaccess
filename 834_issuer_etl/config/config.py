@@ -97,16 +97,12 @@ class Settings:
     sftp_audit_only: bool = field(
         default_factory=lambda: os.getenv("SFTP_AUDIT_ONLY", "false").lower() == "true"
     )
-
-    def sftp_audit_months(self) -> list[str]:
-        """Months to include in SFTP audit (default Mar–Jun)."""
-        raw = os.getenv("SFTP_AUDIT_MONTHS", "03,04,05,06")
-        months: list[str] = []
-        for part in raw.split(","):
-            part = part.strip()
-            if part.isdigit():
-                months.append(str(int(part)).zfill(2))
-        return months or ["03", "04", "05", "06"]
+    force_download: bool = field(
+        default_factory=lambda: os.getenv("FORCE_DOWNLOAD", "false").lower() == "true"
+    )
+    keep_compressed: bool = field(
+        default_factory=lambda: os.getenv("KEEP_COMPRESSED", "false").lower() == "true"
+    )
 
     def reference_row_counts(self) -> dict[str, int]:
         raw = os.getenv("REFERENCE_ROW_COUNTS", "")

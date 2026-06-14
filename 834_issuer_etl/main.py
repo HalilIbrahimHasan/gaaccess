@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.config import env_diagnostics, settings  # noqa: E402
+from ingestion.sftp_filters import filters_from_settings, format_filter_display  # noqa: E402
 from pipeline.orchestrator import Pipeline  # noqa: E402
 from utils.logger import get_logger  # noqa: E402
 
@@ -60,11 +61,12 @@ def main() -> None:
     logger.info("REPORTS      : %s", settings.reports_path)
     logger.info("MODE         : %s", settings.processing_mode)
     logger.info("SFTP AUDIT   : %s", settings.sftp_audit_only)
-    if settings.sftp_audit_only:
-        logger.info("AUDIT MONTHS : %s", ", ".join(settings.sftp_audit_months()))
+    issuer_allow, year_allow, month_allow = filters_from_settings(settings)
+    logger.info("Effective filters:")
+    logger.info("  issuers=%s", format_filter_display(issuer_allow))
+    logger.info("  years=%s", format_filter_display(year_allow))
+    logger.info("  months=%s", format_filter_display(month_allow))
     logger.info("CLEAN START  : %s", settings.clean_on_start)
-    if settings.issuer_filter:
-        logger.info("ISSUER FILTER: %s", settings.issuer_filter)
 
     if settings.sftp_audit_only:
         if settings.processing_mode != "sftp":
@@ -76,7 +78,8 @@ def main() -> None:
         SFTPSourceConnector().sync()
         logger.info("=" * 60)
         logger.info("SFTP AUDIT COMPLETE (no download, no parser, no reconciliation)")
-        logger.info("Report: %s", settings.reports_path / "sftp_audit_03_04_05_06.csv")
+        logger.info("Summary CSV : %s", settings.reports_path / "sftp_ingestion_summary.csv")
+        logger.info("Summary XLSX: %s", settings.reports_path / "sftp_ingestion_summary.xlsx")
         logger.info("=" * 60)
         return
 

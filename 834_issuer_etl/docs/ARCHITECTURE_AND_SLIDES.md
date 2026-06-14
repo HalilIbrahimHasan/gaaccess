@@ -1,6 +1,97 @@
 # 834 Issuer ETL Framework
 ## Architecture Diagram & KPI / Validation Reference
 
+> **View diagrams (recommended):** Open **`docs/project_diagram.html`** in Chrome, Edge, or Firefox (double-click the file).
+> Markdown preview in VS Code/Cursor often does **not** render Mermaid unless you install a Mermaid extension.
+
+---
+
+# MASTER — Whole Project Diagram
+
+**Easiest:** open [project_diagram.html](project_diagram.html) in your browser.
+
+Simplified Mermaid (compatible syntax):
+
+```mermaid
+flowchart TB
+    subgraph ext [External]
+        SFTP[SFTP Server]
+        ENV[.env]
+    end
+    subgraph entry [Entry]
+        MAIN[main.py]
+    end
+    subgraph sftp_layer [SFTP]
+        WALK[tree_walk]
+        DOWN[ingestion]
+        AUDIT[audit CSV]
+    end
+    subgraph input [source_data]
+        SD[flat monthly xml]
+    end
+    subgraph pipe [Pipeline]
+        S1[ingest] --> S2[reconcile] --> S3[validate] --> S4[report] --> S5[assets]
+    end
+    subgraph out [Outputs]
+        DB[(SQLite)]
+        RPT[reports]
+        AST[assets]
+    end
+    ENV --> MAIN --> pipe
+    SFTP --> DOWN --> SD
+    SFTP --> AUDIT --> RPT
+    SD --> S1 --> DB
+    S2 --> DB
+    S3 --> RPT
+    S5 --> AST
+```
+
+## Project directory map
+
+```
+834_issuer_etl/
+├── main.py                    ← RUN THIS (full pipeline)
+├── run.py                     ← alias for main.py
+├── run_validation.py          ← validation only
+├── run_kpi_reports.py         ← KPI reports only
+├── .env / .env.example        ← credentials + mode + filters
+├── requirements.txt           ← pandas, lxml, paramiko, plotly, …
+│
+├── config/config.py           ← settings from .env
+├── connectors/                ← local | sftp | ftp
+├── ingestion/                 ← file_discovery, SFTP walk/audit/download
+├── parsers/parser_834.py      ← 834 XML → records
+├── database/                  ← schema, db, loaders
+├── validation/                ← count, column, load checks
+├── reconciliation/            ← premiums, fees, 90-day rules, KPIs
+├── reporting/                 ← Excel/CSV report writers
+├── pipeline/
+│   ├── orchestrator.py        ← full pipeline coordinator
+│   └── assets_exporter.py     ← bridges DB → assets/
+│
+├── source_data/               ← INPUT (flat monthly XML)
+├── data/issuer_834.db         ← staging SQLite
+├── reports/                   ← validation + kpi + sftp_audit CSVs
+├── assets/                    ← per-partition + rollup exports
+├── extracted/ logs/           ← working dirs
+│
+├── docs/ARCHITECTURE_AND_SLIDES.md
+└── src/                       ← LEGACY (do not use for production runs)
+```
+
+## Data flow summary
+
+| Step | From | To | Module |
+|------|------|-----|--------|
+| 0 | SFTP remote `**` | `source_data/{i}/{y}/{m}/` | `sftp_ingestion` + `sftp_tree_walk` |
+| 0a | SFTP remote audit | `reports/sftp_audit_*.csv` | `sftp_audit` |
+| 1 | `source_data/` | file list | `file_discovery` |
+| 2 | `.xml` bytes | staging rows | `parser_834` + `loaders` |
+| 3 | `stg_834_records` | fee/premium/rule columns | `reconciliation/*` |
+| 4 | staging DB | validation reports | `validation/*` |
+| 5 | staging DB | KPI Excel | `report_runner` |
+| 6 | staging DB | assets + dashboards | `assets_exporter` + `src/` exporters |
+
 ---
 
 # SLIDE 1 — Project Overview
@@ -11,7 +102,7 @@ Daily 834 XML enrollment pipeline for health insurance issuers.
 
 | Capability | Description |
 |------------|-------------|
-| **Ingest** | Local files today; FTP/SFTP ready for later |
+| **Ingest** | Local files, **SFTP** (recursive unlimited depth), FTP placeholder |
 | **Parse** | 834 XML → SQLite staging (full payload preserved) |
 | **Validate** | Source-to-target counts, schema, data quality |
 | **Reconcile** | Policy lifecycle, cancellations, premiums, user fees |
@@ -21,34 +112,62 @@ Daily 834 XML enrollment pipeline for health insurance issuers.
 
 ---
 
-# SLIDE 2 — Architecture Diagram
+# SLIDE 2 — Full System Architecture (Current)
 
 ```mermaid
 flowchart TB
-    subgraph INPUT["INPUT"]
-        SD["source_data/{issuer}/{year}/{month}/*.xml"]
-        ZIP[".zip archives → extracted/ (original kept)"]
+    subgraph ENV["Configuration"]
+        DOT[".env\nPROCESSING_MODE\nISSUER/YEAR/MONTH_FILTER\nSFTP_* credentials\nSFTP_AUDIT_ONLY"]
+        CFG["config/config.py"]
+        DOT --> CFG
     end
 
-    subgraph CONFIG["config/"]
-        ENV[".env — paths, filters, FTP/SFTP, user fee rate"]
-        CFG["config.py"]
+    subgraph ENTRY["Entry Points"]
+        MAIN["main.py ✓ primary"]
+        RUN["run.py → main.py"]
+        VAL["run_validation.py"]
+        KPI["run_kpi_reports.py"]
+        LEG["src/main.py — legacy, do not use"]
+    end
+
+    subgraph REMOTE["SFTP Server"]
+        ROOT["SFTP_ROOT /archive/in/good/834"]
+        DEEP["{issuer}/{year}/{month}/**/\nany depth subfolders"]
+        ROOT --> DEEP
+    end
+
+    subgraph SFTP_LAYER["SFTP Layer — ingestion/"]
+        CLASS["sftp_file_classifier.py\nvalid: from_{issuer}_GA_834_INDV_*.xml(.gz)\nskip: edi, tracking, report, …"]
+        WALK["sftp_tree_walk.py\nrecursive unlimited depth"]
+        DL["sftp_ingestion.py\ndownload + gunzip + flatten"]
+        AUD["sftp_audit.py\nscan only, no download"]
+        CLASS --> WALK
+        WALK --> DL
+        WALK --> AUD
     end
 
     subgraph CONNECTORS["connectors/"]
-        LOC["LocalSourceConnector ✓"]
+        LOC["LocalSourceConnector"]
+        SFTP["SFTPSourceConnector ✓"]
         FTP["FTPSourceConnector (placeholder)"]
-        SFTP["SFTPSourceConnector (placeholder)"]
     end
 
-    subgraph INGEST["ingestion/"]
-        DISC["file_discovery.py"]
+    subgraph LOCAL["Local Input — FLAT monthly folder"]
+        SD["source_data/{issuer}/{year}/{month}/*.xml\nNO day/batch subfolders"]
+    end
+
+    subgraph INGEST["ingestion/ — local scan"]
+        DISC["file_discovery.py\ndynamic issuer discovery"]
         ZIPH["zip_handler.py"]
         READ["xml_reader.py"]
     end
 
+    subgraph PIPE["pipeline/orchestrator.py"]
+        ORCH["ingest → parse → load → reconcile → validate → report → assets"]
+    end
+
     subgraph PARSE["parsers/"]
-        P834["parser_834.py"]
+        P834["parser_834.py — unchanged"]
     end
 
     subgraph DB["database/"]
@@ -59,39 +178,156 @@ flowchart TB
 
     subgraph RECON["reconciliation/"]
         PREM["premium_validation"]
-        FEE["user_fee_calculation"]
-        WIN["cancellation_window (90-day)"]
-        LIFE["policy_lifecycle"]
+        FEE["user_fee_calculation 3.25%"]
+        RULES["business_rules.py\n90-day cancel/term\nUNKNOWN_REVIEW on bad rows"]
+        LIFE["policy_lifecycle + rolling 3-mo KPIs"]
         CAN["cancellation_analysis"]
     end
 
     subgraph VAL["validation/"]
+        LOAD["load_validation"]
         CNT["count_validation"]
         COL["column_validation"]
-        LOAD["load_validation"]
     end
 
-    subgraph OUT["OUTPUTS"]
+    subgraph OUT["Outputs"]
         DATA["data/issuer_834.db"]
         RPT["reports/validation + reports/kpi"]
-        AST["assets/{issuer}/{year}/{month}/"]
+        AUDITCSV["reports/sftp_audit_*.csv"]
+        AST["assets/{issuer}/{year}/{month}/\nexcel, sqlite, dashboards, validation"]
         ROLL["assets/{issuer}/rollups/"]
     end
 
+    MAIN --> ORCH
+    CFG --> ORCH
+    DEEP --> SFTP
+    SFTP --> DL --> SD
+    SFTP --> AUD --> AUDITCSV
+    SFTP --> LOC
     SD --> DISC
-    ZIP --> ZIPH --> DISC
-    ENV --> CFG
-    CFG --> LOC
-    LOC --> DISC --> READ --> P834
+    LOC --> DISC
+    DISC --> ZIPH
+    DISC --> READ
+    READ --> P834
     P834 --> INV & STG
-    STG --> PREM & FEE & WIN
-    STG --> CNT & COL
+    STG --> PREM & FEE & RULES
     STG --> LIFE & CAN
+    ORCH --> LOAD & CNT & COL
+    LOAD & RECON --> RPT
     STG --> DATA
-    VAL --> RPT
-    RECON --> RPT
-    STG --> AST & ROLL
+    ORCH --> AST & ROLL
 ```
+
+---
+
+# SLIDE 2A — SFTP Remote vs Local (Flattening)
+
+Remote structure is **deeper**; local structure is **always flat** per month.
+
+```mermaid
+flowchart LR
+    subgraph REMOTE["Remote SFTP — variable depth"]
+        R0["/archive/in/good/834"]
+        R1["/{issuer}/{year}/{month}"]
+        R2["/{day}/"]
+        R3["/{batch_id}/"]
+        R4["from_{issuer}_GA_834_INDV_*.xml\nfrom_{issuer}_GA_834_INDV_*.xml.gz"]
+        R0 --> R1 --> R2 --> R3 --> R4
+    end
+
+    subgraph LOCAL["Local source_data — flat"]
+        L0["source_data/{issuer}/{year}/{month}/"]
+        L1["from_{issuer}_GA_834_INDV_....xml"]
+        L0 --> L1
+    end
+
+    R4 -->|"download .xml as-is\nor gunzip .xml.gz"| L1
+```
+
+**Example (issuer 82824, April 2026):**
+
+```
+REMOTE (depth 3):
+/archive/in/good/834/82824/2026/04/10/3709055_13201095595/from_82824_GA_834_INDV_20260410153000.xml
+
+LOCAL (flat):
+source_data/82824/2026/04/from_82824_GA_834_INDV_20260410153000.xml
+```
+
+| Rule | Detail |
+|------|--------|
+| Walk start | `SFTP_ROOT/{issuer}/{year}/{month}` |
+| Depth | Unlimited — recurse every subfolder |
+| Month folders | `3` or `03`, `10` or `010` both OK |
+| Day folders | `1` or `01` both OK |
+| Valid files | `from_{issuer}_GA_834_INDV_*.xml` **and** `*.xml.gz` |
+| Skip | `.edi`, `.edi.gz`, `.edi.bad`, `.edi.good`, tracking, report, summary, log, `to_*` |
+| Local layout | Never create day/batch folders |
+
+---
+
+# SLIDE 2B — Processing Modes
+
+```mermaid
+flowchart TD
+    START["python main.py"] --> ENV{"PROCESSING_MODE"}
+    ENV -->|local| LOCAL["LocalSourceConnector\nscan source_data/ only"]
+    ENV -->|sftp| SFTP{"SFTP_AUDIT_ONLY?"}
+    ENV -->|ftp| FTP["FTP placeholder\n→ falls back to local"]
+    SFTP -->|true| AUDIT["run_sftp_audit()\nrecursive scan\nno download\nno parser"]
+    SFTP -->|false| DOWN["ingest_from_sftp()\nrecursive download\n→ source_data/"]
+    AUDIT --> CSV["reports/sftp_audit_03_04_05_06.csv\n+ _summary.csv"]
+    DOWN --> LOC2["LocalSourceConnector.sync()"]
+    LOCAL --> PIPE["Full pipeline\nparse → reconcile → report → assets"]
+    LOC2 --> PIPE
+    AUDIT --> STOP["Exit — no pipeline"]
+```
+
+| Mode | `.env` | Behavior |
+|------|--------|----------|
+| **Local** | `PROCESSING_MODE=local` | Read existing `source_data/` only |
+| **SFTP download** | `PROCESSING_MODE=sftp`<br>`SFTP_AUDIT_ONLY=false` | SFTP → flatten → full pipeline |
+| **SFTP audit** | `PROCESSING_MODE=sftp`<br>`SFTP_AUDIT_ONLY=true` | Scan remote, CSV report, no download |
+| **FTP** | `PROCESSING_MODE=ftp` | Not implemented — uses local |
+
+**Filters (all modes):** `ISSUER_FILTER`, `YEAR_FILTER`, `MONTH_FILTER` (single issuer/month; CLI `--issuer --year --month` overrides)
+
+**Audit month allowlist:** `SFTP_AUDIT_MONTHS=03,04,05,06` (audit mode only; download uses `MONTH_FILTER`)
+
+---
+
+# SLIDE 2C — SFTP Audit Flow
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant M as main.py
+    participant S as SFTPSourceConnector
+    participant A as sftp_audit.py
+    participant W as sftp_tree_walk.py
+    participant R as SFTP Server
+    participant C as CSV reports/
+
+    U->>M: SFTP_AUDIT_ONLY=true
+    M->>S: sync()
+    S->>A: run_sftp_audit()
+    A->>R: list partitions (issuer/year/month)
+    loop each folder at any depth
+        A->>W: walk_partition_month()
+        W->>R: listdir + recurse subfolders
+        W-->>A: valid_xml, valid_gz, skipped counts, paths
+    end
+    A->>C: sftp_audit_03_04_05_06.csv
+    A->>C: sftp_audit_03_04_05_06_summary.csv
+    A-->>M: log missing = remote valid − local xml
+    Note over M: No parser, no DB, no reconciliation
+```
+
+**Summary log per issuer/month:**
+- `folders_scanned_count`, `max_depth_scanned`
+- `total_valid_xml`, `total_valid_xml_gz`
+- `local_xml_files`, `missing_difference`
+- `sample_valid_paths` (first 10 remote paths)
 
 ---
 
@@ -99,42 +335,52 @@ flowchart TB
 
 ```mermaid
 flowchart LR
+    subgraph S0["Stage 0 — optional"]
+        SFTP0["SFTP download\nrecursive flatten"]
+    end
     A["1 DISCOVER\nissuer/year/month"] --> B["2 INGEST\nread XML + zip"]
     B --> C["3 PARSE + LOAD\nSQLite staging"]
-    C --> D["4 RECONCILE\npremium, user fee, 90-day"]
+    C --> D["4 RECONCILE\npremium, user fee, 90-day rules"]
     D --> E["5 VALIDATE\ncounts, columns, schema"]
     E --> F["6 EXPORT\nreports + assets + dashboards"]
+    SFTP0 --> A
 ```
 
 | Stage | Script | What happens |
 |-------|--------|--------------|
-| Full pipeline | `python main.py` | All 6 stages |
+| Full pipeline | `python main.py` | SFTP (optional) + all 6 stages |
+| SFTP audit only | `python main.py` + `SFTP_AUDIT_ONLY=true` | Stage 0 audit only — no stages 1–6 |
 | Validation only | `python run_validation.py` | Stage 5 load validation |
 | KPI only | `python run_kpi_reports.py` | Stages 4 + 6 KPI reports |
 
-**Clean start:** Each run wipes `data/`, `reports/`, `extracted/`, `assets/` first (configurable).
+**Clean start:** Each run wipes `data/`, `reports/`, `extracted/`, `assets/` first — **never** `source_data/` (configurable via `CLEAN_ON_START`).
+
+**Do not use:** `src/main.py` (legacy monolith).
 
 ---
 
 # SLIDE 4 — Input Folder Structure
 
 ```
-source_data/
-  {5-digit-issuer}/          e.g. 86637, 89942, 83502
-    {4-digit-year}/          e.g. 2026
-      {month}/               e.g. 01, 02, 03  (1 or 2 digits OK)
-        *.xml
-        nested/subfolder/*.xml   ← supported
-        archive.zip              ← extracted, zip kept
+source_data/                          ← FLAT monthly layout (required)
+  {5-digit-issuer}/                   e.g. 86637, 82824, 45334
+    {4-digit-year}/                   e.g. 2025, 2026
+      {month}/                        e.g. 01, 10  (normalized to 2 digits)
+        from_{issuer}_GA_834_INDV_*.xml    ← SFTP lands here (flat)
+        archive.zip                   ← optional; extracted, zip kept
+        nested/subfolder/*.xml        ← local scan supports nested (legacy)
 ```
+
+**SFTP writes flat** — no `day/` or `batch/` folders locally.
 
 | Rule | Detail |
 |------|--------|
 | Issuer folder | Exactly **5 digits** |
 | Year folder | Exactly **4 digits** |
-| Month folder | **01–12** (normalized to 2 digits) |
-| No hardcoded issuers | Any folder matching rules is processed |
-| Filters | `--issuer`, `--year`, `--month` CLI optional |
+| Month folder | **01–12** (normalized to 2 digits; `10` → `10`) |
+| No hardcoded issuers | Auto-discovered from folder names |
+| Filters | `.env` or CLI `--issuer`, `--year`, `--month` |
+| SFTP remote | Any depth under `{issuer}/{year}/{month}/` |
 
 ---
 

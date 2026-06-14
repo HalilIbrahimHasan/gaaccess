@@ -6,6 +6,7 @@ from connectors.base_connector import SourceConnector, SourceFile
 from connectors.local_connector import LocalSourceConnector
 from config.config import settings
 from ingestion.sftp_audit import run_sftp_audit
+from ingestion.sftp_filters import filters_from_settings
 from ingestion.sftp_ingestion import ingest_from_sftp
 from utils.logger import get_logger
 
@@ -29,6 +30,8 @@ class SFTPSourceConnector(SourceConnector):
             logger.info("Falling back to local source_data scan.")
             return LocalSourceConnector().sync()
 
+        issuer_allow, year_allow, month_allow = filters_from_settings(settings)
+
         logger.info(
             "Connecting to SFTP %s:%d as %s (root=%s)",
             settings.sftp_host,
@@ -39,35 +42,38 @@ class SFTPSourceConnector(SourceConnector):
 
         try:
             if settings.sftp_audit_only:
-                csv_path = run_sftp_audit(
+                run_sftp_audit(
                     host=settings.sftp_host,
                     port=settings.sftp_port,
                     username=settings.sftp_user,
                     password=settings.sftp_password,
                     remote_root=settings.sftp_remote_path,
                     local_root=settings.source_data_path,
-                    issuer_filter=settings.issuer_filter,
-                    year_filter=settings.year_filter,
-                    month_allowlist=settings.sftp_audit_months(),
+                    issuer_allow=issuer_allow,
+                    year_allow=year_allow,
+                    month_allow=month_allow,
+                    reports_dir=settings.reports_path,
                 )
-                logger.info("SFTP audit report: %s (no download performed)", csv_path)
+                logger.info("SFTP audit complete (no download performed)")
                 return []
 
-            count = ingest_from_sftp(
+            count, _ = ingest_from_sftp(
                 host=settings.sftp_host,
                 port=settings.sftp_port,
                 username=settings.sftp_user,
                 password=settings.sftp_password,
                 remote_root=settings.sftp_remote_path,
                 local_root=settings.source_data_path,
-                issuer_filter=settings.issuer_filter,
-                year_filter=settings.year_filter,
-                month_filter=settings.month_filter,
+                issuer_allow=issuer_allow,
+                year_allow=year_allow,
+                month_allow=month_allow,
+                force_download=settings.force_download,
+                keep_compressed=settings.keep_compressed,
+                reports_dir=settings.reports_path,
             )
             logger.info("SFTP sync: %d XML file(s) placed in %s", count, settings.source_data_path)
         except Exception as exc:
             logger.error("SFTP ingestion failed: %s", exc, exc_info=True)
             raise
 
-        # Run existing local discovery — same path structure, no parser changes
         return LocalSourceConnector().sync()

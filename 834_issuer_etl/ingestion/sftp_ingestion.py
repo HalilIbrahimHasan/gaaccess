@@ -8,22 +8,26 @@ Then recursively walks all subfolders (unlimited depth).
 
 Local layout (unchanged):
     source_data/{issuer}/{year}/{month}/*.xml
-
-Valid files:
-    from_{issuer}_GA_834_INDV_*.xml
-    from_{issuer}_GA_834_INDV_*.xml.gz
-
-Skips: .edi, .edi.gz, .edi.bad, .edi.good, tracking, report, summary, log, to_*
 """
 
 from __future__ import annotations
 
 import gzip
+import lzma
 from pathlib import Path
+
+import paramiko
 
 from config.config import settings
 from ingestion.sftp_file_classifier import local_xml_name_from_remote
-from ingestion.sftp_tree_walk import walk_partition_month
+from ingestion.sftp_filters import log_effective_filters, partition_matches
+from ingestion.sftp_summary import (
+    PartitionSummary,
+    count_local_xmls,
+    export_summaries,
+    print_console_summary,
+)
+from ingestion.sftp_tree_walk import walk_partition
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -50,11 +54,11 @@ def _normalize_month(name: str) -> str:
 def list_remote_partitions(
     sftp,
     remote_root: str,
-    issuer_filter: str | None = None,
-    year_filter: str | None = None,
-    month_filter: str | None = None,
+    issuer_allow: set[str] | None = None,
+    year_allow: set[str] | None = None,
+    month_allow: set[str] | None = None,
 ) -> list[tuple[str, str, str]]:
-    """List (issuer, year, month) tuples present on SFTP."""
+    """List (issuer, year, month) tuples present on SFTP matching filters."""
     partitions: list[tuple[str, str, str]] = []
     root = remote_root.rstrip("/")
 
@@ -67,8 +71,6 @@ def list_remote_partitions(
     for issuer in sorted(issuer_dirs):
         if not _issuer_ok(issuer):
             continue
-        if issuer_filter and issuer != issuer_filter:
-            continue
         issuer_path = f"{root}/{issuer}"
         try:
             year_dirs = sftp.listdir(issuer_path)
@@ -76,8 +78,6 @@ def list_remote_partitions(
             continue
         for year in sorted(year_dirs):
             if not _year_ok(year):
-                continue
-            if year_filter and year != year_filter:
                 continue
             year_path = f"{issuer_path}/{year}"
             try:
@@ -88,14 +88,25 @@ def list_remote_partitions(
                 if not _month_ok(month):
                     continue
                 month_norm = _normalize_month(month)
-                if month_filter and month_norm != str(month_filter).zfill(2):
+                if not partition_matches(
+                    issuer, year, month_norm, issuer_allow, year_allow, month_allow
+                ):
                     continue
                 partitions.append((issuer, year, month))
 
-    logger.info("SFTP partitions to sync: %d", len(partitions))
+    logger.info("SFTP partitions selected: %d", len(partitions))
     for p in partitions:
-        logger.info("  remote partition: %s/%s/%s", *p)
+        logger.info("  partition: %s/%s/%s", *p)
     return partitions
+
+
+def _decompress_remote_bytes(filename: str, raw: bytes) -> bytes:
+    lower = filename.lower()
+    if lower.endswith(".xml.xz"):
+        return lzma.decompress(raw)
+    if lower.endswith(".xml.gz"):
+        return gzip.decompress(raw)
+    return raw
 
 
 def _download_remote_file(
@@ -103,22 +114,38 @@ def _download_remote_file(
     remote_file: str,
     filename: str,
     local_path: Path,
+    *,
+    keep_compressed: bool = False,
 ) -> bool:
     try:
         with sftp.open(remote_file, "rb") as remote_f:
             raw = remote_f.read()
-        if filename.lower().endswith(".xml.gz"):
-            xml_bytes = gzip.decompress(raw)
+
+        lower = filename.lower()
+        if lower.endswith((".xml.gz", ".xml.xz")):
+            xml_bytes = _decompress_remote_bytes(filename, raw)
+            local_path.write_bytes(xml_bytes)
+            logger.info(
+                "Decompressed %s → %s (%d bytes)",
+                remote_file,
+                local_path,
+                len(xml_bytes),
+            )
+            if keep_compressed:
+                compressed_path = local_path.parent / filename
+                compressed_path.write_bytes(raw)
+                logger.info("Kept compressed copy: %s", compressed_path)
         else:
-            xml_bytes = raw
-        local_path.write_bytes(xml_bytes)
-        logger.info(
-            "SFTP downloaded: %s → %s (%d bytes)",
-            remote_file, local_path, len(xml_bytes),
-        )
+            local_path.write_bytes(raw)
+            logger.info(
+                "Downloaded %s → %s (%d bytes)",
+                remote_file,
+                local_path,
+                len(raw),
+            )
         return True
     except Exception as exc:
-        logger.error("Failed to download %s: %s", remote_file, exc)
+        logger.error("Failed download/decompress %s: %s", remote_file, exc)
         return False
 
 
@@ -129,40 +156,70 @@ def download_partition(
     year: str,
     month: str,
     local_root: Path,
-) -> list[Path]:
-    """
-    Recursively download all valid .xml and .xml.gz files under the month folder.
-
-    Flattens into source_data/{issuer}/{year}/{month}/*.xml
-    """
-    month_path = f"{remote_root.rstrip('/')}/{issuer}/{year}/{month}"
-    local_month = local_root / issuer / year / _normalize_month(month)
+    *,
+    force_download: bool = False,
+    keep_compressed: bool = False,
+) -> PartitionSummary:
+    """Recursively download valid files under the month folder into flat local month dir."""
+    month_norm = _normalize_month(month)
+    local_month = local_root / issuer / year / month_norm
     local_month.mkdir(parents=True, exist_ok=True)
 
-    walk = walk_partition_month(sftp, month_path, issuer)
-    downloaded: list[Path] = []
-
-    logger.info(
-        "Partition %s/%s/%s recursive scan: folders=%d max_depth=%d valid_xml=%d valid_gz=%d",
-        issuer, year, month,
-        walk.folders_scanned_count,
-        walk.max_depth_scanned,
-        walk.total_valid_xml,
-        walk.total_valid_xml_gz,
+    walk = walk_partition(sftp, issuer, year, month, remote_root)
+    summary = PartitionSummary(
+        issuer=issuer,
+        year=year,
+        month=month_norm,
+        folders_scanned=walk.folders_scanned,
+        max_depth=walk.max_depth,
+        files_scanned=walk.files_scanned,
+        valid_xml=walk.valid_xml,
+        valid_xml_gz=walk.valid_xml_gz,
+        valid_xml_xz=walk.valid_xml_xz,
+        skipped_to_files=walk.skipped_to,
+        skipped_report_files=walk.skipped_report,
+        skipped_tracking_files=walk.skipped_tracking,
+        skipped_edi_files=walk.skipped_edi,
+        skipped_other_files=walk.skipped_other,
     )
 
-    for remote_file in walk.all_valid_remote_paths:
-        filename = remote_file.rsplit("/", 1)[-1]
-        local_xml_name = local_xml_name_from_remote(filename)
+    for entry in walk.valid_files:
+        local_xml_name = entry["local_name"]
         local_path = local_month / local_xml_name
-        if _download_remote_file(sftp, remote_file, filename, local_path):
-            downloaded.append(local_path)
+        if local_path.exists() and not force_download:
+            summary.existing += 1
+            logger.info("Skipping existing local XML: %s", local_path)
+            continue
+
+        if _download_remote_file(
+            sftp,
+            entry["remote_path"],
+            entry["filename"],
+            local_path,
+            keep_compressed=keep_compressed,
+        ):
+            summary.downloaded += 1
+        else:
+            summary.failed += 1
+
+    summary.local_xml_final_count = count_local_xmls(local_root, issuer, year, month_norm)
+    remote_names = {e["local_name"] for e in walk.valid_files}
+    local_names = {p.name for p in local_month.glob("*.xml") if p.is_file()}
+    summary.missing_count = len(remote_names - local_names)
 
     logger.info(
-        "Partition %s/%s/%s: %d XML file(s) saved to %s",
-        issuer, year, month, len(downloaded), local_month,
+        "Partition %s/%s/%s download: downloaded=%d existing=%d failed=%d "
+        "local_final=%d missing=%d",
+        issuer,
+        year,
+        month_norm,
+        summary.downloaded,
+        summary.existing,
+        summary.failed,
+        summary.local_xml_final_count,
+        summary.missing_count,
     )
-    return downloaded
+    return summary
 
 
 def ingest_from_sftp(
@@ -172,35 +229,55 @@ def ingest_from_sftp(
     password: str,
     remote_root: str,
     local_root: Path | None = None,
-    issuer_filter: str | None = None,
-    year_filter: str | None = None,
-    month_filter: str | None = None,
-) -> int:
+    issuer_allow: set[str] | None = None,
+    year_allow: set[str] | None = None,
+    month_allow: set[str] | None = None,
+    *,
+    force_download: bool = False,
+    keep_compressed: bool = False,
+    reports_dir: Path | None = None,
+) -> tuple[int, list[PartitionSummary]]:
     """
     Connect to SFTP, download valid XML files, flatten into source_data.
 
-    Returns total number of XML files downloaded.
+    Returns (total_downloaded, partition summaries).
     """
-    import paramiko
-
     local_root = local_root or settings.source_data_path
+    reports_dir = reports_dir or settings.reports_path
     local_root.mkdir(parents=True, exist_ok=True)
 
+    log_effective_filters(issuer_allow, year_allow, month_allow)
+
     transport = paramiko.Transport((host, port))
+    summaries: list[PartitionSummary] = []
+    total_downloaded = 0
+
     try:
         transport.connect(username=username, password=password)
         sftp = paramiko.SFTPClient.from_transport(transport)
 
         partitions = list_remote_partitions(
-            sftp, remote_root, issuer_filter, year_filter, month_filter,
+            sftp, remote_root, issuer_allow, year_allow, month_allow,
         )
-        total = 0
         for issuer, year, month in partitions:
-            files = download_partition(sftp, remote_root, issuer, year, month, local_root)
-            total += len(files)
+            summary = download_partition(
+                sftp,
+                remote_root,
+                issuer,
+                year,
+                month,
+                local_root,
+                force_download=force_download,
+                keep_compressed=keep_compressed,
+            )
+            summaries.append(summary)
+            total_downloaded += summary.downloaded
 
         sftp.close()
-        logger.info("SFTP ingestion complete: %d file(s) downloaded", total)
-        return total
     finally:
         transport.close()
+
+    print_console_summary(summaries)
+    export_summaries(summaries, reports_dir)
+    logger.info("SFTP ingestion complete: %d file(s) downloaded", total_downloaded)
+    return total_downloaded, summaries
