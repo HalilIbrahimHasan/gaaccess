@@ -1,5 +1,5 @@
 """
-Excel exporter — writes cleaned enrollees, KPIs, and validation reports.
+Excel exporter — writes enrollment summaries, KPIs, and validation reports.
 """
 
 from pathlib import Path
@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 
+from transform.enrollment_summary import OUTPUT_COLUMNS
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -15,9 +16,25 @@ logger = get_logger(__name__)
 class ExcelExporter:
     """Export enrollee datasets to formatted Excel workbooks."""
 
+    def export_enrollment_summary(
+        self, summary_df: pd.DataFrame, output_stem: str, output_dir: Path
+    ) -> Path:
+        """Export Hari-format enrollment summary (primary business report)."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / f"enrollment_summary_{output_stem}.xlsx"
+        export_df = summary_df[OUTPUT_COLUMNS] if not summary_df.empty else summary_df
+        export_df.to_excel(path, index=False, sheet_name="enrollment_summary")
+        csv_path = output_dir / f"enrollment_summary_{output_stem}.csv"
+        export_df.to_csv(csv_path, index=False)
+        logger.info(
+            "Exported enrollment summary to %s (%d rows)", path, len(export_df)
+        )
+        return path
+
     def export_enrollees(
         self, df: pd.DataFrame, output_stem: str, output_dir: Path
     ) -> Path:
+        """Export detailed cleaned enrollee rows (legacy detail export)."""
         output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / f"cleaned_enrollees_{output_stem}.xlsx"
         df.to_excel(path, index=False, sheet_name="enrollees")
@@ -31,6 +48,7 @@ class ExcelExporter:
         output_stem: str,
         output_dir: Path,
         *,
+        enrollment_summary_df: pd.DataFrame | None = None,
         is_rollup: bool = False,
     ) -> Path:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -54,6 +72,10 @@ class ExcelExporter:
             breakdown_sheets["premium_period"] = "premium_by_source_period"
 
         with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            if enrollment_summary_df is not None and not enrollment_summary_df.empty:
+                enrollment_summary_df[OUTPUT_COLUMNS].to_excel(
+                    writer, sheet_name="enrollment_summary", index=False
+                )
             kpi_summary_df.to_excel(writer, sheet_name="summary", index=False)
             for sheet_name, kpi_key in breakdown_sheets.items():
                 breakdown_df = kpis.get(kpi_key, pd.DataFrame())

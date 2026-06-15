@@ -122,9 +122,11 @@ DEFAULT_ISSUER_EXAMPLE: str = "64357"
 TABLE_ENROLLEES: str = "issuer_enrollees"
 TABLE_KPIS: str = "issuer_kpis"
 TABLE_VALIDATION: str = "validation_results"
+TABLE_ENROLLMENT_SUMMARY: str = "enrollment_summary"
 TABLE_ENROLLEES_ROLLUP: str = "issuer_enrollees_all_periods"
 TABLE_KPIS_ROLLUP: str = "issuer_kpis_all_periods"
 TABLE_VALIDATION_ROLLUP: str = "validation_results_all_periods"
+TABLE_ENROLLMENT_SUMMARY_ROLLUP: str = "enrollment_summary_all_periods"
 
 
 def configure_paths(

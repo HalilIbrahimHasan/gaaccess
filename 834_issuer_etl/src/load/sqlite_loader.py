@@ -1,4 +1,4 @@
-"""SQLite loader — persists enrollees, KPIs, and validation results."""
+"""SQLite loader — persists enrollees, KPIs, validation, and enrollment summaries."""
 
 import sqlite3
 from datetime import datetime
@@ -9,11 +9,14 @@ import pandas as pd
 from config import (
     TABLE_ENROLLEES,
     TABLE_ENROLLEES_ROLLUP,
+    TABLE_ENROLLMENT_SUMMARY,
+    TABLE_ENROLLMENT_SUMMARY_ROLLUP,
     TABLE_KPIS,
     TABLE_KPIS_ROLLUP,
     TABLE_VALIDATION,
     TABLE_VALIDATION_ROLLUP,
 )
+from transform.enrollment_summary import OUTPUT_COLUMNS
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -30,6 +33,7 @@ class SqliteLoader:
         output_stem: str,
         output_dir: Path,
         *,
+        enrollment_summary_df: pd.DataFrame | None = None,
         rollup: bool = False,
     ) -> Path:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -37,8 +41,18 @@ class SqliteLoader:
         enrollee_table = TABLE_ENROLLEES_ROLLUP if rollup else TABLE_ENROLLEES
         kpi_table = TABLE_KPIS_ROLLUP if rollup else TABLE_KPIS
         validation_table = TABLE_VALIDATION_ROLLUP if rollup else TABLE_VALIDATION
+        summary_table = (
+            TABLE_ENROLLMENT_SUMMARY_ROLLUP if rollup else TABLE_ENROLLMENT_SUMMARY
+        )
 
         with sqlite3.connect(db_path) as conn:
+            summary_export = (
+                enrollment_summary_df[OUTPUT_COLUMNS].copy()
+                if enrollment_summary_df is not None and not enrollment_summary_df.empty
+                else pd.DataFrame(columns=OUTPUT_COLUMNS)
+            )
+            summary_export.to_sql(summary_table, conn, if_exists="replace", index=False)
+
             export_df = df.copy()
             if not export_df.empty:
                 export_df.insert(0, "id", range(1, len(export_df) + 1))

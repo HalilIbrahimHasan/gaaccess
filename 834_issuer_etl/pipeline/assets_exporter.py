@@ -25,6 +25,7 @@ from dashboard.plotly_dashboard import PlotlyDashboard  # noqa: E402
 from load.excel_exporter import ExcelExporter  # noqa: E402
 from load.sqlite_loader import SqliteLoader  # noqa: E402
 from load.xml_exporter import XmlExporter  # noqa: E402
+from transform.enrollment_summary import build_enrollment_summary  # noqa: E402
 from transform.kpi_builder import KpiBuilder  # noqa: E402
 from validate.data_quality_validator import DataQualityValidator  # noqa: E402
 from validate.schema_validator import SchemaValidator  # noqa: E402
@@ -136,22 +137,35 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
         file_profile_df = dq_val.build_file_profile_df(part_df)
         kpis = kpi_builder.build_kpis(part_df, str(iid))
         kpi_summary_df = kpi_builder.kpis_to_summary_df(kpis)
+        enrollment_summary_df = build_enrollment_summary(part_df)
 
-        excel.export_enrollees(part_df, stem, dirs["excel"])
-        excel.export_kpis(kpis, kpi_summary_df, stem, dirs["excel"])
+        excel.export_enrollment_summary(enrollment_summary_df, stem, dirs["excel"])
+        excel.export_kpis(
+            kpis, kpi_summary_df, stem, dirs["excel"],
+            enrollment_summary_df=enrollment_summary_df,
+        )
         excel.export_validation_report(
             validation_df, missingness_df, file_profile_df, stem, dirs["excel"]
         )
         xml_exp.export_enrollees(part_df, stem, dirs["cleaned_xml"])
-        sqlite.load(part_df, kpi_summary_df, validation_df, stem, dirs["sqlite"])
+        sqlite.load(
+            part_df, kpi_summary_df, validation_df, stem, dirs["sqlite"],
+            enrollment_summary_df=enrollment_summary_df,
+        )
         dashboard.generate(
             kpis, kpi_summary_df, validation_df, missingness_df,
             stem, dirs["dashboards"],
-            title=f"Issuer {iid} — {year}/{month} Dashboard",
+            title=f"Issuer {iid} — {year}/{month} Enrollment Summary",
+            enrollment_summary_df=enrollment_summary_df,
         )
         json_path = dirs["validation_reports"] / f"validation_report_{stem}.json"
         json_path.write_text(
             json.dumps(validation_df.to_dict(orient="records"), indent=2),
+            encoding="utf-8",
+        )
+        summary_json = dirs["validation_reports"] / f"enrollment_summary_{stem}.json"
+        summary_json.write_text(
+            json.dumps(enrollment_summary_df.to_dict(orient="records"), indent=2),
             encoding="utf-8",
         )
         issuer_dfs.setdefault(str(iid), []).append(part_df)
@@ -169,15 +183,31 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
         missingness_df = dq_val.build_missingness_df(combined)
         kpis = kpi_builder.build_kpis(combined, iid)
         kpi_summary_df = kpi_builder.kpis_to_summary_df(kpis)
+        enrollment_summary_df = build_enrollment_summary(combined)
 
-        excel.export_enrollees(combined, stem, dirs["excel"])
-        excel.export_kpis(kpis, kpi_summary_df, stem, dirs["excel"], is_rollup=True)
-        sqlite.load(combined, kpi_summary_df, validation_df, stem, dirs["sqlite"], rollup=True)
+        excel.export_enrollment_summary(enrollment_summary_df, stem, dirs["excel"])
+        excel.export_kpis(
+            kpis, kpi_summary_df, stem, dirs["excel"],
+            enrollment_summary_df=enrollment_summary_df,
+            is_rollup=True,
+        )
+        sqlite.load(
+            combined, kpi_summary_df, validation_df, stem, dirs["sqlite"],
+            enrollment_summary_df=enrollment_summary_df,
+            rollup=True,
+        )
         dashboard.generate(
             kpis, kpi_summary_df, validation_df, missingness_df,
             stem, dirs["dashboards"],
-            title=f"Issuer {iid} — All Periods Rollup",
+            title=f"Issuer {iid} — All Periods Enrollment Summary",
+            enrollment_summary_df=enrollment_summary_df,
             is_rollup=True,
+        )
+        summary_json = dirs["validation_reports"] / f"enrollment_summary_{stem}.json"
+        dirs["validation_reports"].mkdir(parents=True, exist_ok=True)
+        summary_json.write_text(
+            json.dumps(enrollment_summary_df.to_dict(orient="records"), indent=2),
+            encoding="utf-8",
         )
         rollups += 1
         logger.info("Rollup assets exported: %s", iid)

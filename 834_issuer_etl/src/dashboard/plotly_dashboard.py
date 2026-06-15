@@ -1,8 +1,7 @@
 """
 Plotly dashboard generator — interactive HTML dashboards per issuer.
 
-Combines KPI summaries, enrollee distributions, premium analytics, and
-validation findings into a single self-contained HTML file.
+Primary table uses Hari-format enrollment summary columns.
 """
 
 from pathlib import Path
@@ -12,9 +11,15 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from transform.enrollment_summary import OUTPUT_COLUMNS
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+_HARI_HEADER_COLOR = "#2B2B2B"
+_HARI_CELL_COLOR = "#1A1A1A"
+_HARI_FONT_COLOR = "#FFFFFF"
+_HARI_ALT_ROW = "#242424"
 
 
 class PlotlyDashboard:
@@ -35,55 +40,47 @@ class PlotlyDashboard:
         output_dir: Path,
         *,
         title: str,
+        enrollment_summary_df: pd.DataFrame | None = None,
         is_rollup: bool = False,
     ) -> Path:
         """
         Generate ``issuer_{output_stem}_dashboard.html``.
 
-        Args:
-            kpis: Full KPI dict from ``KpiBuilder``.
-            kpi_summary_df: Scalar KPI summary table.
-            validation_df: Validation check results.
-            missingness_df: Column missingness profile.
-            output_stem: Filename stem (e.g. ``64357_2026_02``).
-            output_dir: Target dashboards directory.
-            title: Dashboard title shown at top of page.
-            is_rollup: When True, favor cross-period trend charts.
-
-        Returns:
-            Path to the generated HTML dashboard.
+        The top panel is the Hari-format enrollment summary table.
         """
         output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / f"issuer_{output_stem}_dashboard.html"
 
         fig = make_subplots(
-            rows=4,
+            rows=5,
             cols=2,
             subplot_titles=(
-                "KPI Summary",
-                "Enrollees by Source File",
+                "Enrollment Summary",
+                "",
                 "Subscribers vs Dependents",
                 "Premium by Rating Area",
                 "Members by Effective Month",
                 "Validation Issue Summary",
                 "Missingness by Column (Top 15)",
                 "Duplicate Count Summary",
+                "KPI Summary",
+                "",
             ),
             specs=[
-                [{"type": "table"}, {"type": "bar"}],
+                [{"type": "table", "colspan": 2}, None],
                 [{"type": "pie"}, {"type": "bar"}],
                 [{"type": "bar"}, {"type": "bar"}],
                 [{"type": "bar"}, {"type": "indicator"}],
+                [{"type": "table", "colspan": 2}, None],
             ],
-            vertical_spacing=0.08,
+            vertical_spacing=0.06,
             horizontal_spacing=0.06,
+            row_heights=[0.32, 0.17, 0.17, 0.17, 0.17],
         )
 
-        self._add_kpi_table(fig, kpi_summary_df, row=1, col=1)
-        if is_rollup:
-            self._add_enrollees_by_period(fig, kpis, row=1, col=2)
-        else:
-            self._add_enrollees_by_file(fig, kpis, row=1, col=2)
+        self._add_enrollment_summary_table(
+            fig, enrollment_summary_df, row=1, col=1
+        )
         self._add_subscriber_pie(fig, kpis, row=2, col=1)
         self._add_premium_by_rating(fig, kpis, row=2, col=2)
         if is_rollup:
@@ -93,17 +90,67 @@ class PlotlyDashboard:
         self._add_validation_summary(fig, validation_df, row=3, col=2)
         self._add_missingness(fig, missingness_df, row=4, col=1)
         self._add_duplicate_indicator(fig, kpis, row=4, col=2)
+        self._add_kpi_table(fig, kpi_summary_df, row=5, col=1)
 
         fig.update_layout(
             title_text=title,
-            height=1600,
+            height=2000,
             showlegend=False,
-            template="plotly_white",
+            template="plotly_dark",
+            paper_bgcolor="#121212",
+            plot_bgcolor="#121212",
         )
 
         fig.write_html(path, include_plotlyjs="cdn", full_html=True)
         logger.info("Generated dashboard: %s", path)
         return path
+
+    def _add_enrollment_summary_table(
+        self,
+        fig: go.Figure,
+        summary_df: pd.DataFrame | None,
+        row: int,
+        col: int,
+    ) -> None:
+        """Hari-format enrollment summary table with dark styling."""
+        if summary_df is None or summary_df.empty:
+            summary_df = pd.DataFrame(
+                {col_name: ["—"] for col_name in OUTPUT_COLUMNS}
+            )
+
+        display_df = summary_df[OUTPUT_COLUMNS].copy()
+        for count_col in ("Enrollment_Count", "Enrollee_Count"):
+            if count_col in display_df.columns:
+                display_df[count_col] = display_df[count_col].astype(str)
+
+        n_rows = len(display_df)
+        row_colors = [
+            _HARI_CELL_COLOR if i % 2 == 0 else _HARI_ALT_ROW
+            for i in range(n_rows)
+        ]
+
+        fig.add_trace(
+            go.Table(
+                header=dict(
+                    values=list(OUTPUT_COLUMNS),
+                    fill_color=_HARI_HEADER_COLOR,
+                    font=dict(color=_HARI_FONT_COLOR, size=12),
+                    align="left",
+                    line_color="#555555",
+                ),
+                cells=dict(
+                    values=[display_df[c].astype(str) for c in OUTPUT_COLUMNS],
+                    fill_color=[row_colors] * len(OUTPUT_COLUMNS),
+                    font=dict(color=_HARI_FONT_COLOR, size=11),
+                    align="left",
+                    line_color="#444444",
+                    height=28,
+                ),
+                columnwidth=[80, 90, 100, 90, 70, 100, 110, 100],
+            ),
+            row=row,
+            col=col,
+        )
 
     def _add_kpi_table(
         self, fig: go.Figure, kpi_df: pd.DataFrame, row: int, col: int
@@ -121,23 +168,11 @@ class PlotlyDashboard:
                 cells=dict(
                     values=[kpi_df["metric"], kpi_df["value"].astype(str)],
                     fill_color="#E9EDF4",
+                    font=dict(color="#111111"),
                 ),
             ),
             row=row,
             col=col,
-        )
-
-    def _add_enrollees_by_period(
-        self, fig: go.Figure, kpis: dict[str, Any], row: int, col: int
-    ) -> None:
-        """Bar chart of enrollee counts per source period (rollup)."""
-        df = kpis.get("member_count_by_source_period", pd.DataFrame())
-        if df.empty:
-            return
-        col_name = "source_period" if "source_period" in df.columns else df.columns[0]
-        fig.add_trace(
-            go.Bar(x=df[col_name], y=df["count"], marker_color="#2E75B6"),
-            row=row, col=col,
         )
 
     def _add_premium_by_period(
@@ -150,26 +185,8 @@ class PlotlyDashboard:
         value_col = [c for c in df.columns if c.startswith("total_")][0]
         col_name = "source_period" if "source_period" in df.columns else df.columns[0]
         fig.add_trace(
-            go.Bar(x=df[col_name], y=df[value_col], marker_color="#C55A11"),
+            go.Bar(x=df[col_name], y=df[value_col], marker_color="#2E75B6"),
             row=row, col=col,
-        )
-
-    def _add_enrollees_by_file(
-        self, fig: go.Figure, kpis: dict[str, Any], row: int, col: int
-    ) -> None:
-        """Bar chart of enrollee counts per source file."""
-        df = kpis.get("enrollee_count_by_file", pd.DataFrame())
-        if df.empty:
-            df = pd.DataFrame({"source_file": ["N/A"], "count": [0]})
-        fig.add_trace(
-            go.Bar(
-                x=df["source_file"],
-                y=df["count"],
-                marker_color="#5B9BD5",
-                name="Enrollees",
-            ),
-            row=row,
-            col=col,
         )
 
     def _add_subscriber_pie(
