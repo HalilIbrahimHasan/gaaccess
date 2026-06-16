@@ -93,6 +93,8 @@ class ExcelExporter:
         file_profile_df: pd.DataFrame,
         output_stem: str,
         output_dir: Path,
+        *,
+        enrollment_dedup_debug: dict | None = None,
     ) -> Path:
         output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / f"validation_report_{output_stem}.xlsx"
@@ -100,5 +102,9 @@ class ExcelExporter:
             validation_df.to_excel(writer, sheet_name="validation_checks", index=False)
             missingness_df.to_excel(writer, sheet_name="missingness", index=False)
             file_profile_df.to_excel(writer, sheet_name="file_profile", index=False)
+            if enrollment_dedup_debug:
+                pd.DataFrame([enrollment_dedup_debug]).to_excel(
+                    writer, sheet_name="enrollment_dedup", index=False
+                )
         logger.info("Exported validation report to %s", path)
         return path

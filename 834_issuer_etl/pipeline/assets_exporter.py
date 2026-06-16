@@ -25,7 +25,14 @@ from dashboard.plotly_dashboard import PlotlyDashboard  # noqa: E402
 from load.excel_exporter import ExcelExporter  # noqa: E402
 from load.sqlite_loader import SqliteLoader  # noqa: E402
 from load.xml_exporter import XmlExporter  # noqa: E402
-from transform.enrollment_summary import build_enrollment_summary  # noqa: E402
+from transform.enrollment_summary import (  # noqa: E402
+    build_enrollment_summary_legacy,
+    build_enrollment_summary_with_debug,
+)
+from reporting.enrollment_comparison import (  # noqa: E402
+    CHANDRA_REFERENCE_15105,
+    export_issuer_comparison,
+)
 from transform.kpi_builder import KpiBuilder  # noqa: E402
 from validate.data_quality_validator import DataQualityValidator  # noqa: E402
 from validate.schema_validator import SchemaValidator  # noqa: E402
@@ -137,7 +144,8 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
         file_profile_df = dq_val.build_file_profile_df(part_df)
         kpis = kpi_builder.build_kpis(part_df, str(iid))
         kpi_summary_df = kpi_builder.kpis_to_summary_df(kpis)
-        enrollment_summary_df = build_enrollment_summary(part_df)
+        enrollment_summary_df, dedup_debug = build_enrollment_summary_with_debug(part_df)
+        dedup_dict = dedup_debug.to_dict()
 
         excel.export_enrollment_summary(enrollment_summary_df, stem, dirs["excel"])
         excel.export_kpis(
@@ -145,7 +153,8 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
             enrollment_summary_df=enrollment_summary_df,
         )
         excel.export_validation_report(
-            validation_df, missingness_df, file_profile_df, stem, dirs["excel"]
+            validation_df, missingness_df, file_profile_df, stem, dirs["excel"],
+            enrollment_dedup_debug=dedup_dict,
         )
         xml_exp.export_enrollees(part_df, stem, dirs["cleaned_xml"])
         sqlite.load(
@@ -168,6 +177,8 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
             json.dumps(enrollment_summary_df.to_dict(orient="records"), indent=2),
             encoding="utf-8",
         )
+        dedup_json = dirs["validation_reports"] / f"enrollment_dedup_debug_{stem}.json"
+        dedup_json.write_text(json.dumps(dedup_dict, indent=2), encoding="utf-8")
         issuer_dfs.setdefault(str(iid), []).append(part_df)
         partitions += 1
         logger.info("Assets exported: %s/%s/%s", iid, year, month)
@@ -183,13 +194,20 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
         missingness_df = dq_val.build_missingness_df(combined)
         kpis = kpi_builder.build_kpis(combined, iid)
         kpi_summary_df = kpi_builder.kpis_to_summary_df(kpis)
-        enrollment_summary_df = build_enrollment_summary(combined)
+        enrollment_summary_df, dedup_debug = build_enrollment_summary_with_debug(combined)
+        dedup_dict = dedup_debug.to_dict()
+        legacy_summary_df = build_enrollment_summary_legacy(combined)
 
         excel.export_enrollment_summary(enrollment_summary_df, stem, dirs["excel"])
         excel.export_kpis(
             kpis, kpi_summary_df, stem, dirs["excel"],
             enrollment_summary_df=enrollment_summary_df,
             is_rollup=True,
+        )
+        excel.export_validation_report(
+            validation_df, missingness_df,
+            dq_val.build_file_profile_df(combined), stem, dirs["excel"],
+            enrollment_dedup_debug=dedup_dict,
         )
         sqlite.load(
             combined, kpi_summary_df, validation_df, stem, dirs["sqlite"],
@@ -209,6 +227,17 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
             json.dumps(enrollment_summary_df.to_dict(orient="records"), indent=2),
             encoding="utf-8",
         )
+        dedup_json = dirs["validation_reports"] / f"enrollment_dedup_debug_{stem}.json"
+        dedup_json.write_text(json.dumps(dedup_dict, indent=2), encoding="utf-8")
+
+        chandra_rows = CHANDRA_REFERENCE_15105 if str(iid) == "15105" else None
+        comparison_path = export_issuer_comparison(
+            legacy_summary_df,
+            enrollment_summary_df,
+            issuer_id=str(iid),
+            chandra_rows=chandra_rows,
+        )
+        logger.info("Enrollment comparison report: %s", comparison_path)
         rollups += 1
         logger.info("Rollup assets exported: %s", iid)
 

@@ -1,5 +1,5 @@
 """
-Build Hari-format enrollment summary reports.
+Build Hari-format enrollment summary reports with business-level deduplication.
 
 Output columns (fixed order):
     Coverage_Year, GAA_HIOS_ID, GAA_Load_Date, Insurance_Type,
@@ -7,6 +7,9 @@ Output columns (fixed order):
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
 
 import pandas as pd
 
@@ -25,6 +28,31 @@ OUTPUT_COLUMNS = [
     "Enrollee_Count",
 ]
 
+SUMMARY_GROUP_COLUMNS = [
+    "Coverage_Year",
+    "GAA_HIOS_ID",
+    "GAA_Load_Date",
+    "Insurance_Type",
+    "status_id",
+    "enrolleeStatus",
+]
+
+DEDUP_GROUP_COLUMNS = [
+    "GAA_HIOS_ID",
+    "source_year",
+    "source_month",
+    "Insurance_Type",
+    "enrolleeStatus",
+]
+
+DEDUPLICATION_RULE_USED = (
+    "Within each issuer/year/month/status/insurance_type group, sort by "
+    "member_maint_effective_date descending, then source_file descending; "
+    "keep the latest row per member_id; aggregate Enrollment_Count as "
+    "COUNT(DISTINCT policy_id) and Enrollee_Count as COUNT(DISTINCT member_id). "
+    "REINSTATE rows are mapped to CONFIRM before deduplication."
+)
+
 STATUS_TO_ID = {
     "CONFIRM": 1,
     "CANCEL": 2,
@@ -42,6 +70,36 @@ INSURANCE_TYPE_DISPLAY = {
 }
 
 
+@dataclass
+class EnrollmentDedupDebug:
+    """Debug metrics for enrollment summary deduplication."""
+
+    raw_row_count: int = 0
+    duplicate_row_count: int = 0
+    distinct_policy_id_count_before_dedup: int = 0
+    distinct_member_id_count_before_dedup: int = 0
+    distinct_policy_id_count_after_dedup: int = 0
+    distinct_member_id_count_after_dedup: int = 0
+    reinstate_rows_mapped_to_confirm: int = 0
+    deduplication_rule_used: str = DEDUPLICATION_RULE_USED
+    duplicate_member_examples: list[dict[str, Any]] = field(default_factory=list)
+    duplicate_policy_examples: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "raw_row_count": self.raw_row_count,
+            "duplicate_row_count": self.duplicate_row_count,
+            "distinct_policy_id_count_before_dedup": self.distinct_policy_id_count_before_dedup,
+            "distinct_member_id_count_before_dedup": self.distinct_member_id_count_before_dedup,
+            "distinct_policy_id_count_after_dedup": self.distinct_policy_id_count_after_dedup,
+            "distinct_member_id_count_after_dedup": self.distinct_member_id_count_after_dedup,
+            "reinstate_rows_mapped_to_confirm": self.reinstate_rows_mapped_to_confirm,
+            "deduplication_rule_used": self.deduplication_rule_used,
+            "duplicate_member_examples": self.duplicate_member_examples,
+            "duplicate_policy_examples": self.duplicate_policy_examples,
+        }
+
+
 def _gaa_load_date(year: str | int, month: str | int) -> str:
     """Format load date as M/D/YYYY (first day of partition month)."""
     return f"{int(month)}/1/{int(year)}"
@@ -56,8 +114,47 @@ def _insurance_type_display(code: str | None) -> str:
     return INSURANCE_TYPE_DISPLAY.get(key, "Health")
 
 
-def _resolve_enrollee_status(row: pd.Series) -> str | None:
-    """Map a row to CONFIRM, CANCEL, or TERM."""
+def _member_column(df: pd.DataFrame) -> str:
+    if "exchg_indiv_identifier" in df.columns:
+        return "exchg_indiv_identifier"
+    if "member_id" in df.columns:
+        return "member_id"
+    raise ValueError("No member identifier column found for enrollee count")
+
+
+def _policy_column(df: pd.DataFrame) -> str:
+    if "exchg_assigned_policy_id" in df.columns:
+        return "exchg_assigned_policy_id"
+    if "policy_id" in df.columns:
+        return "policy_id"
+    raise ValueError("No policy identifier column found for enrollment count")
+
+
+def _issuer_column(df: pd.DataFrame) -> str:
+    if "issuer_id" in df.columns:
+        return "issuer_id"
+    if "issuer" in df.columns:
+        return "issuer"
+    raise ValueError("No issuer column found")
+
+
+def _maint_date_column(df: pd.DataFrame) -> str:
+    for col in ("member_maint_effective_date", "benefit_effective_begin_date"):
+        if col in df.columns:
+            return col
+    return "member_maint_effective_date"
+
+
+def _source_file_column(df: pd.DataFrame) -> str:
+    if "source_file" in df.columns:
+        return "source_file"
+    if "file_name" in df.columns:
+        return "file_name"
+    return "source_file"
+
+
+def _resolve_enrollee_status_legacy(row: pd.Series) -> str | None:
+    """Legacy status mapping — REINSTATE excluded (pre-business-logic behavior)."""
     reason = str(row.get("additional_maint_reason_code") or "").strip().upper()
     if reason in STATUS_TO_ID:
         return reason
@@ -84,33 +181,49 @@ def _resolve_enrollee_status(row: pd.Series) -> str | None:
     return None
 
 
-def _member_column(df: pd.DataFrame) -> str:
-    if "exchg_indiv_identifier" in df.columns:
-        return "exchg_indiv_identifier"
-    if "member_id" in df.columns:
-        return "member_id"
-    raise ValueError("No member identifier column found for enrollee count")
+def _resolve_enrollee_status(row: pd.Series) -> str | None:
+    """Map a row to CONFIRM, CANCEL, or TERM. REINSTATE maps to CONFIRM."""
+    reason = str(row.get("additional_maint_reason_code") or "").strip().upper()
+    if reason == "REINSTATE":
+        return "CONFIRM"
+    if reason in STATUS_TO_ID:
+        return reason
+
+    txn = str(row.get("transaction_classification") or "").strip().upper()
+    if txn == "CONFIRMATION":
+        return "CONFIRM"
+    if txn == "CANCELLATION":
+        return "CANCEL"
+    if txn == "TERMINATION":
+        return "TERM"
+
+    action_desc = str(row.get("action_code_description") or "").upper()
+    action_code = str(row.get("event_type_code") or row.get("action_code") or "").upper()
+
+    for text in (reason, action_desc, action_code):
+        if "REINSTATE" in text:
+            return "CONFIRM"
+        if "CONFIRM" in text:
+            return "CONFIRM"
+        if "CANCEL" in text:
+            return "CANCEL"
+        if "TERM" in text:
+            return "TERM"
+
+    return None
 
 
-def _issuer_column(df: pd.DataFrame) -> str:
-    if "issuer_id" in df.columns:
-        return "issuer_id"
-    if "issuer" in df.columns:
-        return "issuer"
-    raise ValueError("No issuer column found")
+def _is_reinstate_row(row: pd.Series) -> bool:
+    reason = str(row.get("additional_maint_reason_code") or "").strip().upper()
+    if reason == "REINSTATE":
+        return True
+    action_desc = str(row.get("action_code_description") or "").upper()
+    return "REINSTATE" in action_desc
 
 
-def build_enrollment_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Aggregate enrollee rows into Hari-format summary grouped by
-    coverage year, issuer, load date, insurance type, and status.
-    """
-    if df.empty:
-        return pd.DataFrame(columns=OUTPUT_COLUMNS)
-
+def _prepare_work_frame(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
     issuer_col = _issuer_column(work)
-    member_col = _member_column(work)
 
     if "source_year" not in work.columns and "year" in work.columns:
         work["source_year"] = work["year"].astype(str)
@@ -128,29 +241,169 @@ def build_enrollment_summary(df: pd.DataFrame) -> pd.DataFrame:
     else:
         work["Insurance_Type"] = "Health"
 
-    work["enrolleeStatus"] = work.apply(_resolve_enrollee_status, axis=1)
+    if _source_file_column(work) not in work.columns:
+        work["source_file"] = ""
+
+    return work
+
+
+def _count_distinct(series: pd.Series) -> int:
+    return int(series.dropna().astype(str).nunique())
+
+
+def _duplicate_examples(
+    df: pd.DataFrame,
+    key_col: str,
+    *,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    if df.empty or key_col not in df.columns:
+        return []
+
+    member_col = _member_column(df)
+    policy_col = _policy_column(df)
+    file_col = _source_file_column(df)
+    maint_col = _maint_date_column(df)
+
+    dup_mask = df.duplicated(subset=[key_col], keep=False)
+    dupes = df.loc[dup_mask].copy()
+    if dupes.empty:
+        return []
+
+    examples: list[dict[str, Any]] = []
+    for key_val, grp in dupes.groupby(key_col, dropna=False):
+        if pd.isna(key_val) or str(key_val).strip() == "":
+            continue
+        examples.append(
+            {
+                key_col: str(key_val),
+                "row_count": int(len(grp)),
+                "member_ids": sorted(grp[member_col].dropna().astype(str).unique().tolist())[:5],
+                "policy_ids": sorted(grp[policy_col].dropna().astype(str).unique().tolist())[:5],
+                "source_files": sorted(grp[file_col].dropna().astype(str).unique().tolist())[:5],
+                "member_maint_dates": sorted(
+                    grp[maint_col].dropna().astype(str).unique().tolist(),
+                    reverse=True,
+                )[:5],
+            }
+        )
+        if len(examples) >= limit:
+            break
+    return examples
+
+
+def _dedupe_business_rows(work: pd.DataFrame) -> tuple[pd.DataFrame, EnrollmentDedupDebug]:
+    """Deduplicate to latest row per member within issuer/year/month/status/insurance."""
+    member_col = _member_column(work)
+    policy_col = _policy_column(work)
+    file_col = _source_file_column(work)
+    maint_col = _maint_date_column(work)
+
+    debug = EnrollmentDedupDebug(
+        raw_row_count=len(work),
+        distinct_policy_id_count_before_dedup=_count_distinct(work[policy_col]),
+        distinct_member_id_count_before_dedup=_count_distinct(work[member_col]),
+        duplicate_member_examples=_duplicate_examples(work, member_col),
+        duplicate_policy_examples=_duplicate_examples(work, policy_col),
+    )
+
+    if work.empty:
+        return work, debug
+
+    sort_cols = [maint_col, file_col]
+    for col in sort_cols:
+        if col not in work.columns:
+            work[col] = ""
+
+    sorted_work = work.sort_values(
+        by=sort_cols,
+        ascending=[False, False],
+        na_position="last",
+        kind="mergesort",
+    )
+
+    deduped = (
+        sorted_work.drop_duplicates(subset=DEDUP_GROUP_COLUMNS + [member_col], keep="first")
+        .copy()
+    )
+
+    debug.duplicate_row_count = debug.raw_row_count - len(deduped)
+    debug.distinct_policy_id_count_after_dedup = _count_distinct(deduped[policy_col])
+    debug.distinct_member_id_count_after_dedup = _count_distinct(deduped[member_col])
+    return deduped, debug
+
+
+def build_enrollment_summary_legacy(df: pd.DataFrame) -> pd.DataFrame:
+    """Previous raw-row aggregation (for comparison reports only)."""
+    if df.empty:
+        return pd.DataFrame(columns=OUTPUT_COLUMNS)
+
+    work = _prepare_work_frame(df)
+    member_col = _member_column(work)
+
+    work["enrolleeStatus"] = work.apply(_resolve_enrollee_status_legacy, axis=1)
     work = work[work["enrolleeStatus"].notna()].copy()
     if work.empty:
-        logger.warning("No CONFIRM/CANCEL/TERM rows found for enrollment summary")
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
     work["status_id"] = work["enrolleeStatus"].map(STATUS_TO_ID)
 
     grouped = (
-        work.groupby(
-            [
-                "Coverage_Year",
-                "GAA_HIOS_ID",
-                "GAA_Load_Date",
-                "Insurance_Type",
-                "status_id",
-                "enrolleeStatus",
-            ],
-            dropna=False,
-        )
+        work.groupby(SUMMARY_GROUP_COLUMNS, dropna=False)
         .agg(
             Enrollment_Count=(member_col, "count"),
             Enrollee_Count=(member_col, "nunique"),
+        )
+        .reset_index()
+    )
+
+    grouped["status_id"] = grouped["status_id"].astype(int)
+    grouped["Enrollment_Count"] = grouped["Enrollment_Count"].astype(int)
+    grouped["Enrollee_Count"] = grouped["Enrollee_Count"].astype(int)
+    return grouped[OUTPUT_COLUMNS].sort_values(
+        ["Coverage_Year", "GAA_Load_Date", "status_id"]
+    ).reset_index(drop=True)
+
+
+def build_enrollment_summary_with_debug(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, EnrollmentDedupDebug]:
+    """
+    Build business-level enrollment summary with deduplication metrics.
+
+    Enrollment_Count = COUNT(DISTINCT policy_id) after dedup.
+    Enrollee_Count = COUNT(DISTINCT member_id) after dedup.
+    """
+    empty_debug = EnrollmentDedupDebug()
+    if df.empty:
+        return pd.DataFrame(columns=OUTPUT_COLUMNS), empty_debug
+
+    work = _prepare_work_frame(df)
+    member_col = _member_column(work)
+    policy_col = _policy_column(work)
+
+    work["enrolleeStatus"] = work.apply(_resolve_enrollee_status, axis=1)
+    reinstate_mask = work.apply(_is_reinstate_row, axis=1)
+    reinstate_count = int(reinstate_mask.sum())
+
+    work = work[work["enrolleeStatus"].notna()].copy()
+    if work.empty:
+        empty_debug.reinstate_rows_mapped_to_confirm = reinstate_count
+        return pd.DataFrame(columns=OUTPUT_COLUMNS), empty_debug
+
+    work["status_id"] = work["enrolleeStatus"].map(STATUS_TO_ID)
+
+    deduped, debug = _dedupe_business_rows(work)
+    debug.reinstate_rows_mapped_to_confirm = reinstate_count
+
+    if deduped.empty:
+        return pd.DataFrame(columns=OUTPUT_COLUMNS), debug
+
+    grouped = (
+        deduped.groupby(SUMMARY_GROUP_COLUMNS, dropna=False)
+        .agg(
+            Enrollment_Count=(policy_col, lambda s: _count_distinct(s)),
+            Enrollee_Count=(member_col, lambda s: _count_distinct(s)),
         )
         .reset_index()
     )
@@ -164,8 +417,19 @@ def build_enrollment_summary(df: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
 
     logger.info(
-        "Built enrollment summary: %d row(s) for issuer(s) %s",
+        "Built business enrollment summary: %d row(s), raw=%d deduped=%d removed=%d "
+        "reinstate_mapped=%d issuer(s)=%s",
         len(result),
-        ", ".join(sorted(result["GAA_HIOS_ID"].unique())),
+        debug.raw_row_count,
+        debug.raw_row_count - debug.duplicate_row_count,
+        debug.duplicate_row_count,
+        debug.reinstate_rows_mapped_to_confirm,
+        ", ".join(sorted(result["GAA_HIOS_ID"].unique())) if not result.empty else "",
     )
-    return result
+    return result, debug
+
+
+def build_enrollment_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Build cleaned business enrollment summary for dashboards and exports."""
+    summary, _ = build_enrollment_summary_with_debug(df)
+    return summary
