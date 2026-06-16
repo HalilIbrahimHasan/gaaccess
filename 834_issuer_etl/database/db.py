@@ -26,6 +26,17 @@ class Database:
         ("withheld_user_fee", "REAL"),
         ("non_refundable_user_fee", "REAL"),
         ("refund_eligible_user_fee", "REAL"),
+        ("enrollment_action_code", "TEXT"),
+        ("enrollee_event_type_code", "TEXT"),
+        ("enrollee_event_reason_code", "TEXT"),
+        ("exchg_assigned_enrollee_id", "TEXT"),
+        ("request_submit_timestamp", "TEXT"),
+        ("issuer_subscriber_identifier", "TEXT"),
+        ("issuer_indiv_identifier", "TEXT"),
+        ("last_premium_paid_date", "TEXT"),
+        ("qtyn", "TEXT"),
+        ("qtyy", "TEXT"),
+        ("qtyt", "TEXT"),
     ]
 
     def init_schema(self) -> None:

@@ -19,7 +19,12 @@ STG_COLUMNS = [
     "benefit_end_date", "member_maint_effective_date", "total_premium_amount",
     "individual_responsibility_amount", "aptc_amount", "user_fee_amount",
     "insurance_type_code", "health_coverage_policy_no", "household_or_employee_case_id",
-    "rating_area", "source_exchg_id", "raw_xml_path", "raw_payload", "created_at",
+    "rating_area", "source_exchg_id",
+    "enrollment_action_code", "enrollee_event_type_code", "enrollee_event_reason_code",
+    "exchg_assigned_enrollee_id", "request_submit_timestamp",
+    "issuer_subscriber_identifier", "issuer_indiv_identifier", "last_premium_paid_date",
+    "qtyn", "qtyy", "qtyt",
+    "raw_xml_path", "raw_payload", "created_at",
 ]
 
 

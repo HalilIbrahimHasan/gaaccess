@@ -21,6 +21,20 @@ ACTION_DESCRIPTIONS = {
     "REINSTATE": "Reinstated",
 }
 
+# Companion Guide REF*4A — Exchange Assigned Enrollee ID (camelCase XML variants).
+ENROLLEE_ID_TAGS = (
+    "exchgAssignedEnrolleeID",
+    "exchgAssignedEnrolleeId",
+    "exchgEnrolleeIdentifier",
+    "exchgEnrolleeID",
+)
+
+REQUEST_SUBMIT_TAGS = (
+    "requestSubmitTimestamp",
+    "requestSubmitTimeStamp",
+    "requestSubmitTimeStampValue",
+)
+
 
 def _text(el: ET.Element | None) -> str | None:
     if el is None or el.text is None:
@@ -32,6 +46,32 @@ def _lookup(parent: ET.Element | None) -> str | None:
     if parent is None:
         return None
     return _text(parent.find("lookupValueCode"))
+
+
+def _first_text(parent: ET.Element | None, *tag_names: str) -> str | None:
+    """Return the first non-empty text among candidate child tag names."""
+    if parent is None:
+        return None
+    for tag in tag_names:
+        value = _text(parent.find(tag))
+        if value:
+            return value
+    return None
+
+
+def _request_submit_timestamp(reporting: ET.Element | None) -> str | None:
+    """2750 REQUEST SUBMIT TIMESTAMP — optional reporting-category field."""
+    if reporting is None:
+        return None
+    value = _first_text(reporting, *REQUEST_SUBMIT_TAGS)
+    if value:
+        return value
+    for child in reporting:
+        if "requestsubmit" in child.tag.lower():
+            found = _text(child)
+            if found:
+                return found
+    return None
 
 
 def _parse_date(raw: str | None) -> str | None:
@@ -52,6 +92,17 @@ def _float_val(raw: str | None) -> float | None:
         return None
 
 
+def _parse_enrollment_header(enrollment: ET.Element) -> dict[str, Any]:
+    """Enrollment-level fields shared across all enrollees in the segment."""
+    return {
+        "enrollment_action_code": _text(enrollment.find("actionCode")),
+        "insurer_tax_id_number": _text(enrollment.find("insurerTaxIdNumber")),
+        "qtyn": _text(enrollment.find("QTYn")),
+        "qtyy": _text(enrollment.find("QTYy")),
+        "qtyt": _text(enrollment.find("QTYt")),
+    }
+
+
 class Parser834:
     """Parse 834 enrollment XML into staging-ready record dicts."""
 
@@ -68,10 +119,7 @@ class Parser834:
         records: list[dict[str, Any]] = []
 
         for enrollment in root.findall("enrollment"):
-            header = {
-                "action_code": _text(enrollment.find("actionCode")),
-                "insurer_tax_id_number": _text(enrollment.find("insurerTaxIdNumber")),
-            }
+            header = _parse_enrollment_header(enrollment)
             for enrollee in enrollment.findall("enrollee"):
                 row = self._parse_enrollee(enrollee)
                 row.update(header)
@@ -83,6 +131,8 @@ class Parser834:
                     "raw_xml_path": file_path,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 })
+                # Backward compatibility: action_code mirrors enrollee event type only.
+                row["action_code"] = row.get("enrollee_event_type_code")
                 row["raw_payload"] = json.dumps(row, default=str)
                 records.append(row)
 
@@ -104,9 +154,11 @@ class Parser834:
 
         benefit_begin = None
         benefit_end = None
+        last_premium_paid = None
         if health is not None:
             benefit_begin = _parse_date(_text(health.find("benefitEffectiveBeginDate")))
             benefit_end = _parse_date(_text(health.find("benefitEffectiveEndDate")))
+            last_premium_paid = _text(health.find("lastPremiumPaidDate"))
 
         total_premium = _float_val(
             _text(reporting.find("totalPremiumAmt")) if reporting is not None else None
@@ -121,15 +173,30 @@ class Parser834:
         )
         user_fee = round(total_premium * 0.0325, 4) if total_premium else None
 
+        enrollee_event_type = (
+            _lookup(events.find("eventTypeLkp")) if events is not None else None
+        )
+        enrollee_event_reason = None
+        if events is not None:
+            enrollee_event_reason = _lookup(events.find("eventReasonLookUp"))
+            if enrollee_event_reason is None:
+                enrollee_event_reason = _lookup(events.find("eventReasonLookup"))
+
         return {
             "policy_id": _text(enrollee.find("exchgAssignedPolicyID")),
             "member_id": _text(enrollee.find("exchgIndivIdentifier")),
             "subscriber_id": _text(enrollee.find("exchgSubscriberIdentifier")),
+            "exchg_assigned_enrollee_id": _first_text(enrollee, *ENROLLEE_ID_TAGS),
+            "issuer_subscriber_identifier": _text(
+                enrollee.find("issuerSubscriberIdentifier")
+            ),
+            "issuer_indiv_identifier": _text(enrollee.find("issuerIndivIdentifier")),
             "member_first_name": _text(enrollee.find("memberFirstName")),
             "member_last_name": _text(enrollee.find("memberLastName")),
             "relationship": _lookup(enrollee.find("relationshipLkp")),
             "subscriber_flag": _text(enrollee.find("subscriberFlag")),
-            "action_code": _lookup(events.find("eventTypeLkp")) if events else None,
+            "enrollee_event_type_code": enrollee_event_type,
+            "enrollee_event_reason_code": enrollee_event_reason,
             "action_code_description": action_desc,
             "maintenance_type_code": (
                 _lookup(health.find("maintenanceTypeCode")) if health else None
@@ -141,6 +208,8 @@ class Parser834:
             "member_maint_effective_date": _parse_date(
                 _text(enrollee.find("memberMaintEffectiveDate"))
             ),
+            "last_premium_paid_date": last_premium_paid,
+            "request_submit_timestamp": _request_submit_timestamp(reporting),
             "total_premium_amount": total_premium,
             "individual_responsibility_amount": indiv_resp,
             "aptc_amount": aptc,

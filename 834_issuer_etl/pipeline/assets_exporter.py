@@ -29,6 +29,7 @@ from transform.enrollment_summary import (  # noqa: E402
     build_enrollment_summary_legacy,
     build_enrollment_summary_with_debug,
 )
+from transform.identifier_comparison import build_identifier_comparison  # noqa: E402
 from reporting.enrollment_comparison import (  # noqa: E402
     CHANDRA_REFERENCE_15105,
     export_issuer_comparison,
@@ -36,6 +37,15 @@ from reporting.enrollment_comparison import (  # noqa: E402
 from transform.kpi_builder import KpiBuilder  # noqa: E402
 from validate.data_quality_validator import DataQualityValidator  # noqa: E402
 from validate.schema_validator import SchemaValidator  # noqa: E402
+
+_PROJECT_ROOT = settings.project_root
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+from validation.parser_field_report import (  # noqa: E402
+    build_parser_field_report,
+    parser_field_report_to_dataframe,
+    parser_field_summary_to_dataframe,
+)
 
 
 STG_TO_LEGACY = {
@@ -50,7 +60,17 @@ STG_TO_LEGACY = {
     "insurance_type_code": "insurance_type_code",
     "benefit_effective_date": "benefit_effective_begin_date",
     "member_maint_effective_date": "member_maint_effective_date",
-    "action_code": "event_type_code",
+    "enrollee_event_type_code": "event_type_code",
+    "enrollee_event_reason_code": "event_reason_code",
+    "enrollment_action_code": "enrollment_action_code",
+    "exchg_assigned_enrollee_id": "exchg_assigned_enrollee_id",
+    "request_submit_timestamp": "request_submit_timestamp",
+    "issuer_subscriber_identifier": "issuer_subscriber_identifier",
+    "issuer_indiv_identifier": "issuer_indiv_identifier",
+    "last_premium_paid_date": "last_premium_paid_date",
+    "qtyn": "qtyn",
+    "qtyy": "qtyy",
+    "qtyt": "qtyt",
     "additional_maint_reason_code": "additional_maint_reason_code",
 }
 
@@ -89,10 +109,12 @@ def _stg_to_legacy_df(df: pd.DataFrame) -> pd.DataFrame:
         out["source_month"] = out["month"].astype(str)
     if "source_year" in out.columns and "source_month" in out.columns:
         out["source_period"] = out["source_year"] + "-" + out["source_month"]
-    for col in ("load_timestamp", "file_date", "event_reason_code", "rating_area",
+    for col in ("load_timestamp", "file_date", "rating_area",
                 "household_or_employee_case_id", "source_exchg_id"):
         if col not in out.columns:
             out[col] = None
+    if "event_type_code" not in out.columns and "action_code" in out.columns:
+        out["event_type_code"] = out["action_code"]
     return out
 
 
@@ -135,6 +157,16 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
             d.mkdir(parents=True, exist_ok=True)
         stem = f"{iid}_{year}_{month}"
         part_df = grp.copy()
+        raw_part = raw[
+            (raw["issuer"].astype(str) == str(iid))
+            & (raw["year"].astype(str) == str(year))
+            & (raw["month"].astype(str) == str(month))
+        ]
+
+        parser_field_report = build_parser_field_report(raw_part, str(iid))
+        parser_field_df = parser_field_report_to_dataframe(parser_field_report)
+        parser_field_summary_df = parser_field_summary_to_dataframe(parser_field_report)
+        id_comparison = build_identifier_comparison(part_df, str(iid))
 
         validation_df = dq_val.results_to_dataframe(
             schema_val.validate(part_df, str(iid))
@@ -155,6 +187,10 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
         excel.export_validation_report(
             validation_df, missingness_df, file_profile_df, stem, dirs["excel"],
             enrollment_dedup_debug=dedup_dict,
+            parser_field_df=parser_field_df,
+            parser_field_summary_df=parser_field_summary_df,
+            identifier_comparison_summary_df=id_comparison["summary"],
+            identifier_comparison_detail_df=id_comparison["dedup_ordering_detail"],
         )
         xml_exp.export_enrollees(part_df, stem, dirs["cleaned_xml"])
         sqlite.load(
@@ -179,6 +215,29 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
         )
         dedup_json = dirs["validation_reports"] / f"enrollment_dedup_debug_{stem}.json"
         dedup_json.write_text(json.dumps(dedup_dict, indent=2), encoding="utf-8")
+        parser_json = dirs["validation_reports"] / f"parser_field_coverage_{stem}.json"
+        parser_json.write_text(json.dumps(parser_field_report, indent=2), encoding="utf-8")
+        id_cmp_json = dirs["validation_reports"] / f"identifier_comparison_{stem}.json"
+        id_cmp_payload = {
+            "comparison_notes": id_comparison.get("comparison_notes", {}),
+            "summary": id_comparison["summary"].to_dict(orient="records")
+            if not id_comparison["summary"].empty
+            else [],
+            "dedup_ordering_detail": id_comparison["dedup_ordering_detail"].to_dict(
+                orient="records"
+            )
+            if not id_comparison["dedup_ordering_detail"].empty
+            else [],
+        }
+        id_cmp_json.write_text(json.dumps(id_cmp_payload, indent=2), encoding="utf-8")
+        id_cmp_xlsx = dirs["validation_reports"] / f"identifier_comparison_{stem}.xlsx"
+        with pd.ExcelWriter(id_cmp_xlsx, engine="openpyxl") as writer:
+            if not id_comparison["summary"].empty:
+                id_comparison["summary"].to_excel(writer, sheet_name="summary", index=False)
+            if not id_comparison["dedup_ordering_detail"].empty:
+                id_comparison["dedup_ordering_detail"].to_excel(
+                    writer, sheet_name="dedup_detail", index=False
+                )
         issuer_dfs.setdefault(str(iid), []).append(part_df)
         partitions += 1
         logger.info("Assets exported: %s/%s/%s", iid, year, month)
@@ -197,6 +256,12 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
         enrollment_summary_df, dedup_debug = build_enrollment_summary_with_debug(combined)
         dedup_dict = dedup_debug.to_dict()
         legacy_summary_df = build_enrollment_summary_legacy(combined)
+        parser_field_report = build_parser_field_report(
+            raw[raw["issuer"].astype(str) == str(iid)], str(iid)
+        )
+        parser_field_df = parser_field_report_to_dataframe(parser_field_report)
+        parser_field_summary_df = parser_field_summary_to_dataframe(parser_field_report)
+        id_comparison = build_identifier_comparison(combined, str(iid))
 
         excel.export_enrollment_summary(enrollment_summary_df, stem, dirs["excel"])
         excel.export_kpis(
@@ -208,6 +273,10 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
             validation_df, missingness_df,
             dq_val.build_file_profile_df(combined), stem, dirs["excel"],
             enrollment_dedup_debug=dedup_dict,
+            parser_field_df=parser_field_df,
+            parser_field_summary_df=parser_field_summary_df,
+            identifier_comparison_summary_df=id_comparison["summary"],
+            identifier_comparison_detail_df=id_comparison["dedup_ordering_detail"],
         )
         sqlite.load(
             combined, kpi_summary_df, validation_df, stem, dirs["sqlite"],
@@ -229,6 +298,29 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
         )
         dedup_json = dirs["validation_reports"] / f"enrollment_dedup_debug_{stem}.json"
         dedup_json.write_text(json.dumps(dedup_dict, indent=2), encoding="utf-8")
+        parser_json = dirs["validation_reports"] / f"parser_field_coverage_{stem}.json"
+        parser_json.write_text(json.dumps(parser_field_report, indent=2), encoding="utf-8")
+        id_cmp_json = dirs["validation_reports"] / f"identifier_comparison_{stem}.json"
+        id_cmp_payload = {
+            "comparison_notes": id_comparison.get("comparison_notes", {}),
+            "summary": id_comparison["summary"].to_dict(orient="records")
+            if not id_comparison["summary"].empty
+            else [],
+            "dedup_ordering_detail": id_comparison["dedup_ordering_detail"].to_dict(
+                orient="records"
+            )
+            if not id_comparison["dedup_ordering_detail"].empty
+            else [],
+        }
+        id_cmp_json.write_text(json.dumps(id_cmp_payload, indent=2), encoding="utf-8")
+        id_cmp_xlsx = dirs["validation_reports"] / f"identifier_comparison_{stem}.xlsx"
+        with pd.ExcelWriter(id_cmp_xlsx, engine="openpyxl") as writer:
+            if not id_comparison["summary"].empty:
+                id_comparison["summary"].to_excel(writer, sheet_name="summary", index=False)
+            if not id_comparison["dedup_ordering_detail"].empty:
+                id_comparison["dedup_ordering_detail"].to_excel(
+                    writer, sheet_name="dedup_detail", index=False
+                )
 
         chandra_rows = CHANDRA_REFERENCE_15105 if str(iid) == "15105" else None
         comparison_path = export_issuer_comparison(

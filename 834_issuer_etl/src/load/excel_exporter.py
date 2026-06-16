@@ -95,6 +95,10 @@ class ExcelExporter:
         output_dir: Path,
         *,
         enrollment_dedup_debug: dict | None = None,
+        parser_field_df: pd.DataFrame | None = None,
+        parser_field_summary_df: pd.DataFrame | None = None,
+        identifier_comparison_summary_df: pd.DataFrame | None = None,
+        identifier_comparison_detail_df: pd.DataFrame | None = None,
     ) -> Path:
         output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / f"validation_report_{output_stem}.xlsx"
@@ -105,6 +109,28 @@ class ExcelExporter:
             if enrollment_dedup_debug:
                 pd.DataFrame([enrollment_dedup_debug]).to_excel(
                     writer, sheet_name="enrollment_dedup", index=False
+                )
+            if parser_field_summary_df is not None and not parser_field_summary_df.empty:
+                parser_field_summary_df.to_excel(
+                    writer, sheet_name="parser_field_summary", index=False
+                )
+            if parser_field_df is not None and not parser_field_df.empty:
+                parser_field_df.to_excel(
+                    writer, sheet_name="parser_optional_fields", index=False
+                )
+            if (
+                identifier_comparison_summary_df is not None
+                and not identifier_comparison_summary_df.empty
+            ):
+                identifier_comparison_summary_df.to_excel(
+                    writer, sheet_name="id_comparison_summary", index=False
+                )
+            if (
+                identifier_comparison_detail_df is not None
+                and not identifier_comparison_detail_df.empty
+            ):
+                identifier_comparison_detail_df.to_excel(
+                    writer, sheet_name="id_comparison_detail", index=False
                 )
         logger.info("Exported validation report to %s", path)
         return path
