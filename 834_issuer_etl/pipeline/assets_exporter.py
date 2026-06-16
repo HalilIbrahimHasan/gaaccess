@@ -6,7 +6,6 @@ Reads from staging SQLite and writes to assets/{issuer}/{year}/{month}/.
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
@@ -41,6 +40,7 @@ from validate.schema_validator import SchemaValidator  # noqa: E402
 _PROJECT_ROOT = settings.project_root
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+from validation.json_sanitize import dumps_json  # noqa: E402
 from validation.parser_field_report import (  # noqa: E402
     build_parser_field_report,
     parser_field_report_to_dataframe,
@@ -205,18 +205,18 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
         )
         json_path = dirs["validation_reports"] / f"validation_report_{stem}.json"
         json_path.write_text(
-            json.dumps(validation_df.to_dict(orient="records"), indent=2),
+            dumps_json(validation_df.to_dict(orient="records"), indent=2),
             encoding="utf-8",
         )
         summary_json = dirs["validation_reports"] / f"enrollment_summary_{stem}.json"
         summary_json.write_text(
-            json.dumps(enrollment_summary_df.to_dict(orient="records"), indent=2),
+            dumps_json(enrollment_summary_df.to_dict(orient="records"), indent=2),
             encoding="utf-8",
         )
         dedup_json = dirs["validation_reports"] / f"enrollment_dedup_debug_{stem}.json"
-        dedup_json.write_text(json.dumps(dedup_dict, indent=2), encoding="utf-8")
+        dedup_json.write_text(dumps_json(dedup_dict, indent=2), encoding="utf-8")
         parser_json = dirs["validation_reports"] / f"parser_field_coverage_{stem}.json"
-        parser_json.write_text(json.dumps(parser_field_report, indent=2), encoding="utf-8")
+        parser_json.write_text(dumps_json(parser_field_report, indent=2), encoding="utf-8")
         id_cmp_json = dirs["validation_reports"] / f"identifier_comparison_{stem}.json"
         id_cmp_payload = {
             "comparison_notes": id_comparison.get("comparison_notes", {}),
@@ -229,7 +229,7 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
             if not id_comparison["dedup_ordering_detail"].empty
             else [],
         }
-        id_cmp_json.write_text(json.dumps(id_cmp_payload, indent=2), encoding="utf-8")
+        id_cmp_json.write_text(dumps_json(id_cmp_payload, indent=2), encoding="utf-8")
         id_cmp_xlsx = dirs["validation_reports"] / f"identifier_comparison_{stem}.xlsx"
         with pd.ExcelWriter(id_cmp_xlsx, engine="openpyxl") as writer:
             if not id_comparison["summary"].empty:
@@ -293,13 +293,13 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
         summary_json = dirs["validation_reports"] / f"enrollment_summary_{stem}.json"
         dirs["validation_reports"].mkdir(parents=True, exist_ok=True)
         summary_json.write_text(
-            json.dumps(enrollment_summary_df.to_dict(orient="records"), indent=2),
+            dumps_json(enrollment_summary_df.to_dict(orient="records"), indent=2),
             encoding="utf-8",
         )
         dedup_json = dirs["validation_reports"] / f"enrollment_dedup_debug_{stem}.json"
-        dedup_json.write_text(json.dumps(dedup_dict, indent=2), encoding="utf-8")
+        dedup_json.write_text(dumps_json(dedup_dict, indent=2), encoding="utf-8")
         parser_json = dirs["validation_reports"] / f"parser_field_coverage_{stem}.json"
-        parser_json.write_text(json.dumps(parser_field_report, indent=2), encoding="utf-8")
+        parser_json.write_text(dumps_json(parser_field_report, indent=2), encoding="utf-8")
         id_cmp_json = dirs["validation_reports"] / f"identifier_comparison_{stem}.json"
         id_cmp_payload = {
             "comparison_notes": id_comparison.get("comparison_notes", {}),
@@ -312,7 +312,7 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
             if not id_comparison["dedup_ordering_detail"].empty
             else [],
         }
-        id_cmp_json.write_text(json.dumps(id_cmp_payload, indent=2), encoding="utf-8")
+        id_cmp_json.write_text(dumps_json(id_cmp_payload, indent=2), encoding="utf-8")
         id_cmp_xlsx = dirs["validation_reports"] / f"identifier_comparison_{stem}.xlsx"
         with pd.ExcelWriter(id_cmp_xlsx, engine="openpyxl") as writer:
             if not id_comparison["summary"].empty:

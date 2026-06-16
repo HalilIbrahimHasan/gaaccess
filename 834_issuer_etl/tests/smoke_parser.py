@@ -53,6 +53,10 @@ def main() -> int:
     assert report["distinct_enrollee_ids"] == 2
     assert report["enrollee_id_available"]
 
+    from validation.json_sanitize import dumps_json
+
+    dumps_json(report)  # numpy.bool_ values must serialize
+
     comparison = build_identifier_comparison(df, "99999")
     assert not comparison["summary"].empty
 
