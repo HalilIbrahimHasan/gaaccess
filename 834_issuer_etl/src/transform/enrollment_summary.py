@@ -49,7 +49,8 @@ DEDUPLICATION_RULE_USED = (
     "Within each issuer/year/month/status/insurance_type group, sort by "
     "member_maint_effective_date descending, then source_file descending; "
     "keep the latest row per member_id; aggregate Enrollment_Count as "
-    "COUNT(DISTINCT policy_id) and Enrollee_Count as COUNT(DISTINCT member_id). "
+    "COUNT(DISTINCT enrollment_key) and Enrollee_Count as COUNT(DISTINCT member_id). "
+    "enrollment_key uses policy_id, else subscriber_id, else household_or_employee_case_id. "
     "REINSTATE rows are mapped to CONFIRM before deduplication."
 )
 
@@ -82,6 +83,13 @@ class EnrollmentDedupDebug:
     distinct_member_id_count_after_dedup: int = 0
     reinstate_rows_mapped_to_confirm: int = 0
     deduplication_rule_used: str = DEDUPLICATION_RULE_USED
+    enrollment_rows_using_policy_id: int = 0
+    enrollment_rows_using_subscriber_id_fallback: int = 0
+    enrollment_rows_using_household_fallback: int = 0
+    enrollment_rows_missing_enrollment_key: int = 0
+    distinct_enrollment_key_count_before_dedup: int = 0
+    distinct_enrollment_key_count_after_dedup: int = 0
+    enrollment_key_fallback_examples: list[dict[str, Any]] = field(default_factory=list)
     duplicate_member_examples: list[dict[str, Any]] = field(default_factory=list)
     duplicate_policy_examples: list[dict[str, Any]] = field(default_factory=list)
 
@@ -93,8 +101,15 @@ class EnrollmentDedupDebug:
             "distinct_member_id_count_before_dedup": self.distinct_member_id_count_before_dedup,
             "distinct_policy_id_count_after_dedup": self.distinct_policy_id_count_after_dedup,
             "distinct_member_id_count_after_dedup": self.distinct_member_id_count_after_dedup,
+            "distinct_enrollment_key_count_before_dedup": self.distinct_enrollment_key_count_before_dedup,
+            "distinct_enrollment_key_count_after_dedup": self.distinct_enrollment_key_count_after_dedup,
+            "enrollment_rows_using_policy_id": self.enrollment_rows_using_policy_id,
+            "enrollment_rows_using_subscriber_id_fallback": self.enrollment_rows_using_subscriber_id_fallback,
+            "enrollment_rows_using_household_fallback": self.enrollment_rows_using_household_fallback,
+            "enrollment_rows_missing_enrollment_key": self.enrollment_rows_missing_enrollment_key,
             "reinstate_rows_mapped_to_confirm": self.reinstate_rows_mapped_to_confirm,
             "deduplication_rule_used": self.deduplication_rule_used,
+            "enrollment_key_fallback_examples": self.enrollment_key_fallback_examples,
             "duplicate_member_examples": self.duplicate_member_examples,
             "duplicate_policy_examples": self.duplicate_policy_examples,
         }
@@ -128,6 +143,120 @@ def _policy_column(df: pd.DataFrame) -> str:
     if "policy_id" in df.columns:
         return "policy_id"
     raise ValueError("No policy identifier column found for enrollment count")
+
+
+def _subscriber_column(df: pd.DataFrame) -> str:
+    if "exchg_subscriber_identifier" in df.columns:
+        return "exchg_subscriber_identifier"
+    if "subscriber_id" in df.columns:
+        return "subscriber_id"
+    raise ValueError("No subscriber identifier column found")
+
+
+def _household_column(df: pd.DataFrame) -> str:
+    if "household_or_employee_case_id" in df.columns:
+        return "household_or_employee_case_id"
+    raise ValueError("No household identifier column found")
+
+
+def _normalize_key_value(value: object) -> str | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def _enrollment_key_from_row(row: pd.Series) -> tuple[str | None, str]:
+    """
+    Build a stable enrollment business key with fallback order:
+    policy_id -> subscriber_id -> household_or_employee_case_id.
+    """
+    for col in ("exchg_assigned_policy_id", "policy_id"):
+        policy = _normalize_key_value(row.get(col)) if col in row.index else None
+        if policy:
+            return f"policy:{policy}", "policy_id"
+
+    for col in ("exchg_subscriber_identifier", "subscriber_id"):
+        subscriber = _normalize_key_value(row.get(col)) if col in row.index else None
+        if subscriber:
+            return f"subscriber:{subscriber}", "subscriber_id"
+
+    household = (
+        _normalize_key_value(row.get("household_or_employee_case_id"))
+        if "household_or_employee_case_id" in row.index
+        else None
+    )
+    if household:
+        return f"household:{household}", "household_or_employee_case_id"
+
+    return None, "missing"
+
+
+def _add_enrollment_keys(work: pd.DataFrame) -> pd.DataFrame:
+    """Add enrollment_key and enrollment_key_source columns for business counting."""
+    keys = work.apply(_enrollment_key_from_row, axis=1, result_type="expand")
+    work = work.copy()
+    work["enrollment_key"] = keys[0]
+    work["enrollment_key_source"] = keys[1]
+    return work
+
+
+def _enrollment_key_fallback_stats(work: pd.DataFrame) -> dict[str, int]:
+    if work.empty or "enrollment_key_source" not in work.columns:
+        return {
+            "enrollment_rows_using_policy_id": 0,
+            "enrollment_rows_using_subscriber_id_fallback": 0,
+            "enrollment_rows_using_household_fallback": 0,
+            "enrollment_rows_missing_enrollment_key": 0,
+        }
+    counts = work["enrollment_key_source"].value_counts()
+    return {
+        "enrollment_rows_using_policy_id": int(counts.get("policy_id", 0)),
+        "enrollment_rows_using_subscriber_id_fallback": int(counts.get("subscriber_id", 0)),
+        "enrollment_rows_using_household_fallback": int(
+            counts.get("household_or_employee_case_id", 0)
+        ),
+        "enrollment_rows_missing_enrollment_key": int(counts.get("missing", 0)),
+    }
+
+
+def _enrollment_key_fallback_examples(
+    work: pd.DataFrame,
+    *,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    if work.empty or "enrollment_key_source" not in work.columns:
+        return []
+
+    member_col = _member_column(work)
+    file_col = _source_file_column(work)
+    policy_col = "exchg_assigned_policy_id" if "exchg_assigned_policy_id" in work.columns else "policy_id"
+    subscriber_col = (
+        "exchg_subscriber_identifier"
+        if "exchg_subscriber_identifier" in work.columns
+        else "subscriber_id"
+    )
+    household_col = "household_or_employee_case_id"
+
+    fallback = work[work["enrollment_key_source"] != "policy_id"].copy()
+    if fallback.empty:
+        return []
+
+    examples: list[dict[str, Any]] = []
+    for _, row in fallback.head(limit).iterrows():
+        examples.append(
+            {
+                "enrollment_key": row.get("enrollment_key"),
+                "enrollment_key_source": row.get("enrollment_key_source"),
+                "member_id": row.get(member_col),
+                "policy_id": row.get(policy_col),
+                "subscriber_id": row.get(subscriber_col),
+                "household_or_employee_case_id": row.get(household_col),
+                "source_file": row.get(file_col),
+                "enrolleeStatus": row.get("enrolleeStatus"),
+            }
+        )
+    return examples
 
 
 def _issuer_column(df: pd.DataFrame) -> str:
@@ -248,7 +377,24 @@ def _prepare_work_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _count_distinct(series: pd.Series) -> int:
-    return int(series.dropna().astype(str).nunique())
+    cleaned = series.dropna().astype(str).str.strip()
+    cleaned = cleaned[cleaned != ""]
+    return int(cleaned.nunique())
+
+
+def _apply_debug_fallback_stats(debug: EnrollmentDedupDebug, work: pd.DataFrame) -> None:
+    stats = _enrollment_key_fallback_stats(work)
+    debug.enrollment_rows_using_policy_id = stats["enrollment_rows_using_policy_id"]
+    debug.enrollment_rows_using_subscriber_id_fallback = stats[
+        "enrollment_rows_using_subscriber_id_fallback"
+    ]
+    debug.enrollment_rows_using_household_fallback = stats[
+        "enrollment_rows_using_household_fallback"
+    ]
+    debug.enrollment_rows_missing_enrollment_key = stats[
+        "enrollment_rows_missing_enrollment_key"
+    ]
+    debug.enrollment_key_fallback_examples = _enrollment_key_fallback_examples(work)
 
 
 def _duplicate_examples(
@@ -303,9 +449,11 @@ def _dedupe_business_rows(work: pd.DataFrame) -> tuple[pd.DataFrame, EnrollmentD
         raw_row_count=len(work),
         distinct_policy_id_count_before_dedup=_count_distinct(work[policy_col]),
         distinct_member_id_count_before_dedup=_count_distinct(work[member_col]),
+        distinct_enrollment_key_count_before_dedup=_count_distinct(work["enrollment_key"]),
         duplicate_member_examples=_duplicate_examples(work, member_col),
-        duplicate_policy_examples=_duplicate_examples(work, policy_col),
+        duplicate_policy_examples=_duplicate_examples(work, "enrollment_key"),
     )
+    _apply_debug_fallback_stats(debug, work)
 
     if work.empty:
         return work, debug
@@ -330,6 +478,7 @@ def _dedupe_business_rows(work: pd.DataFrame) -> tuple[pd.DataFrame, EnrollmentD
     debug.duplicate_row_count = debug.raw_row_count - len(deduped)
     debug.distinct_policy_id_count_after_dedup = _count_distinct(deduped[policy_col])
     debug.distinct_member_id_count_after_dedup = _count_distinct(deduped[member_col])
+    debug.distinct_enrollment_key_count_after_dedup = _count_distinct(deduped["enrollment_key"])
     return deduped, debug
 
 
@@ -371,8 +520,9 @@ def build_enrollment_summary_with_debug(
     """
     Build business-level enrollment summary with deduplication metrics.
 
-    Enrollment_Count = COUNT(DISTINCT policy_id) after dedup.
+    Enrollment_Count = COUNT(DISTINCT enrollment_key) after dedup.
     Enrollee_Count = COUNT(DISTINCT member_id) after dedup.
+    enrollment_key fallback: policy_id -> subscriber_id -> household_or_employee_case_id.
     """
     empty_debug = EnrollmentDedupDebug()
     if df.empty:
@@ -380,7 +530,6 @@ def build_enrollment_summary_with_debug(
 
     work = _prepare_work_frame(df)
     member_col = _member_column(work)
-    policy_col = _policy_column(work)
 
     work["enrolleeStatus"] = work.apply(_resolve_enrollee_status, axis=1)
     reinstate_mask = work.apply(_is_reinstate_row, axis=1)
@@ -392,6 +541,7 @@ def build_enrollment_summary_with_debug(
         return pd.DataFrame(columns=OUTPUT_COLUMNS), empty_debug
 
     work["status_id"] = work["enrolleeStatus"].map(STATUS_TO_ID)
+    work = _add_enrollment_keys(work)
 
     deduped, debug = _dedupe_business_rows(work)
     debug.reinstate_rows_mapped_to_confirm = reinstate_count
@@ -402,7 +552,7 @@ def build_enrollment_summary_with_debug(
     grouped = (
         deduped.groupby(SUMMARY_GROUP_COLUMNS, dropna=False)
         .agg(
-            Enrollment_Count=(policy_col, lambda s: _count_distinct(s)),
+            Enrollment_Count=("enrollment_key", lambda s: _count_distinct(s)),
             Enrollee_Count=(member_col, lambda s: _count_distinct(s)),
         )
         .reset_index()

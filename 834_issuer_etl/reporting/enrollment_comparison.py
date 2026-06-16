@@ -10,7 +10,9 @@ import pandas as pd
 
 from config.config import settings
 
-# Business-approved reference for issuer 15105 (from Chandra report screenshots).
+# Optional comparison reference only — NOT used by aggregation logic.
+# Optional comparison reference only — NOT used by aggregation logic.
+# Business-approved expected counts for issuer 15105 (Chandra report screenshots).
 CHANDRA_REFERENCE_15105: list[dict[str, object]] = [
     {"Coverage_Year": "2026", "GAA_HIOS_ID": "15105", "GAA_Load_Date": "1/1/2026", "Insurance_Type": "Health", "enrolleeStatus": "CONFIRM", "Enrollment_Count": 1240, "Enrollee_Count": 1690},
     {"Coverage_Year": "2026", "GAA_HIOS_ID": "15105", "GAA_Load_Date": "1/1/2026", "Insurance_Type": "Health", "enrolleeStatus": "CANCEL", "Enrollment_Count": 47, "Enrollee_Count": 47},
