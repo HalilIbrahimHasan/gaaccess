@@ -11,6 +11,8 @@ from config.config import (
     REQUIRED_ID_FIELDS,
     TABLE_ENROLLEES,
     TABLE_ENROLLEES_ROLLUP,
+    TABLE_ENROLLMENT_SUMMARY,
+    TABLE_ENROLLMENT_SUMMARY_ROLLUP,
     TABLE_KPIS,
     TABLE_KPIS_ROLLUP,
     TABLE_VALIDATION,
@@ -19,8 +21,14 @@ from config.config import (
     settings,
 )
 
+# Convenience aliases for callers expecting *_PATH constants
+SOURCE_DATA_PATH = settings.source_data_path
+EXTRACTED_PATH = settings.extracted_path
+
 __all__ = [
     "settings",
+    "SOURCE_DATA_PATH",
+    "EXTRACTED_PATH",
     "LOG_FORMAT",
     "LOG_LEVEL",
     "EXPORT_PII",
@@ -36,4 +44,6 @@ __all__ = [
     "TABLE_ENROLLEES_ROLLUP",
     "TABLE_KPIS_ROLLUP",
     "TABLE_VALIDATION_ROLLUP",
+    "TABLE_ENROLLMENT_SUMMARY",
+    "TABLE_ENROLLMENT_SUMMARY_ROLLUP",
 ]

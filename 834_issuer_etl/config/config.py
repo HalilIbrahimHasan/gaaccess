@@ -171,8 +171,10 @@ VALID_SUBSCRIBER_FLAGS = {"Y", "N"}
 TABLE_ENROLLEES = "issuer_enrollees"
 TABLE_KPIS = "issuer_kpis"
 TABLE_VALIDATION = "validation_results"
+TABLE_ENROLLMENT_SUMMARY = "enrollment_summary"
 TABLE_ENROLLEES_ROLLUP = "issuer_enrollees_all_periods"
 TABLE_KPIS_ROLLUP = "issuer_kpis_all_periods"
 TABLE_VALIDATION_ROLLUP = "validation_results_all_periods"
+TABLE_ENROLLMENT_SUMMARY_ROLLUP = "enrollment_summary_all_periods"
 
 settings = Settings()
