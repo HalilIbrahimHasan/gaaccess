@@ -512,32 +512,169 @@ def compare_chandra_known_values(conn):
     2026-05 CANCEL : Enrollment 64   / Enrollee 63
     2026-05 TERM   : Enrollment 179  / Enrollee 179
     """))
+def test_chandra_matching_rules(conn):
+    print_title("16. Test possible Chandra matching rules")
 
+    sql = """
+    WITH base AS (
+        SELECT
+            issuer,
+            year,
+            month,
+            insurance_type_code,
+            additional_maint_reason_code AS status,
+            policy_id,
+            member_id,
+            subscriber_id,
+            member_maint_effective_date,
+            request_submit_timestamp,
+            file_id,
+            CASE
+                WHEN policy_id IS NOT NULL AND policy_id <> '' THEN policy_id
+                ELSE subscriber_id
+            END AS enrollment_key
+        FROM stg_834_records
+        WHERE issuer = :issuer
+          AND year = :year
+          AND month IN ('01','02','03','04','05')
+          AND insurance_type_code = 'HLT'
+          AND additional_maint_reason_code IN ('CONFIRM','CANCEL','TERM')
+    ),
+
+    raw_counts AS (
+        SELECT
+            year, month, status,
+            'A_raw_no_dedup' AS rule,
+            COUNT(DISTINCT enrollment_key) AS enrollment_count,
+            COUNT(DISTINCT member_id) AS enrollee_count
+        FROM base
+        GROUP BY year, month, status
+    ),
+
+    dedup_member_status AS (
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, status, member_id
+                    ORDER BY member_maint_effective_date DESC, request_submit_timestamp DESC, file_id DESC
+                ) AS rn
+            FROM base
+        )
+        WHERE rn = 1
+    ),
+
+    rule_member_status AS (
+        SELECT
+            year, month, status,
+            'B_latest_per_member_status' AS rule,
+            COUNT(DISTINCT enrollment_key) AS enrollment_count,
+            COUNT(DISTINCT member_id) AS enrollee_count
+        FROM dedup_member_status
+        GROUP BY year, month, status
+    ),
+
+    dedup_member_policy_status AS (
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, status, member_id, policy_id
+                    ORDER BY member_maint_effective_date DESC, request_submit_timestamp DESC, file_id DESC
+                ) AS rn
+            FROM base
+        )
+        WHERE rn = 1
+    ),
+
+    rule_member_policy_status AS (
+        SELECT
+            year, month, status,
+            'C_latest_per_member_policy_status' AS rule,
+            COUNT(DISTINCT enrollment_key) AS enrollment_count,
+            COUNT(DISTINCT member_id) AS enrollee_count
+        FROM dedup_member_policy_status
+        GROUP BY year, month, status
+    ),
+
+    dedup_policy_status AS (
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, status, policy_id
+                    ORDER BY member_maint_effective_date DESC, request_submit_timestamp DESC, file_id DESC
+                ) AS rn
+            FROM base
+        )
+        WHERE rn = 1
+    ),
+
+    rule_policy_status AS (
+        SELECT
+            year, month, status,
+            'D_latest_per_policy_status' AS rule,
+            COUNT(DISTINCT enrollment_key) AS enrollment_count,
+            COUNT(DISTINCT member_id) AS enrollee_count
+        FROM dedup_policy_status
+        GROUP BY year, month, status
+    ),
+
+    chandra AS (
+        SELECT '2026' AS year, '01' AS month, 'CONFIRM' AS status, 1240 AS ch_enrollment, 1690 AS ch_enrollee UNION ALL
+        SELECT '2026','01','CANCEL',47,47 UNION ALL
+        SELECT '2026','02','CONFIRM',490,744 UNION ALL
+        SELECT '2026','02','CANCEL',734,709 UNION ALL
+        SELECT '2026','02','TERM',1435,1435 UNION ALL
+        SELECT '2026','03','CONFIRM',453,584 UNION ALL
+        SELECT '2026','03','CANCEL',278,271 UNION ALL
+        SELECT '2026','03','TERM',20,20 UNION ALL
+        SELECT '2026','04','CONFIRM',463,559 UNION ALL
+        SELECT '2026','04','CANCEL',236,233 UNION ALL
+        SELECT '2026','04','TERM',4255,4255 UNION ALL
+        SELECT '2026','05','CONFIRM',340,418 UNION ALL
+        SELECT '2026','05','CANCEL',64,63 UNION ALL
+        SELECT '2026','05','TERM',179,179
+    ),
+
+    all_rules AS (
+        SELECT * FROM raw_counts
+        UNION ALL SELECT * FROM rule_member_status
+        UNION ALL SELECT * FROM rule_member_policy_status
+        UNION ALL SELECT * FROM rule_policy_status
+    )
+
+    SELECT
+        r.year,
+        r.month,
+        r.status,
+        r.rule,
+        r.enrollment_count,
+        c.ch_enrollment,
+        r.enrollment_count - c.ch_enrollment AS enrollment_delta,
+        r.enrollee_count,
+        c.ch_enrollee,
+        r.enrollee_count - c.ch_enrollee AS enrollee_delta,
+        ABS(r.enrollment_count - c.ch_enrollment) + ABS(r.enrollee_count - c.ch_enrollee) AS total_delta
+    FROM all_rules r
+    JOIN chandra c
+      ON r.year = c.year
+     AND r.month = c.month
+     AND r.status = c.status
+    ORDER BY r.year, r.month, r.status, total_delta;
+    """
+
+    run_query(conn, "16. Test possible Chandra matching rules", sql, {"issuer": ISSUER, "year": YEAR})
 
 def main():
     conn = connect()
 
-    # Comment out any section you do not want to run.
-    database_overview(conn)
-    file_inventory_summary(conn)
-    status_summary_raw(conn)
-    status_bucket_distribution(conn)
-    compare_member_vs_enrollee_id(conn)
-    duplicate_members_by_month_status(conn)
-    duplicate_policy_by_month_status(conn)
-
-    feb_confirm_detail_distribution(conn)
-    feb_term_detail_distribution(conn)
-    march_term_detail_distribution(conn)
-
-    sample_duplicate_members_feb_confirm(conn)
-    sample_policy_family_feb_confirm(conn)
-
-    reproduce_current_summary_approx(conn)
-    compare_chandra_known_values(conn)
+    test_chandra_matching_rules(conn)
 
     conn.close()
-
 
 if __name__ == "__main__":
     main()
