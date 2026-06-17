@@ -3,110 +3,77 @@ import csv
 from pathlib import Path
 
 DB_PATH = Path("data/issuer_834.db")
-OUT_DIR = Path("query_outputs")
-OUT_DIR.mkdir(exist_ok=True)
-
-ISSUER = "15105"
-YEAR = "2026"
-MONTHS = ("01", "02", "03", "04", "05")
-
-CUSTOM_QUERY = """
-SELECT
-    year,
-    month,
-    additional_maint_reason_code AS status,
-    COUNT(DISTINCT policy_id) AS enrollment_count,
-    COUNT(DISTINCT member_id) AS enrollee_count
-FROM stg_834_records
-WHERE issuer = '15105'
-  AND year = '2026'
-  AND month IN ('01','02','03','04','05')
-  AND insurance_type_code = 'HLT'
-GROUP BY year, month, additional_maint_reason_code
-ORDER BY year, month, status;
-"""
+OUTPUT_DIR = Path("query_outputs")
+OUTPUT_DIR.mkdir(exist_ok=True)
 
 
 def connect():
     if not DB_PATH.exists():
         raise FileNotFoundError(f"DB not found: {DB_PATH.resolve()}")
-    return sqlite3.connect(f"file:{DB_PATH.resolve()}?mode=ro", uri=True)
+    return sqlite3.connect(DB_PATH)
 
 
-def run_sql(conn, sql, title, export_name=None, limit=200):
+def get_columns(conn, table_name="stg_834_records"):
     cur = conn.cursor()
-    cur.execute(sql)
-    rows = cur.fetchall()
-    cols = [d[0] for d in cur.description] if cur.description else []
-
-    print("\n" + "=" * 120)
-    print(title)
-    print("=" * 120)
-
-    if not cols:
-        print("No result set.")
-        return rows, cols
-
-    print(" | ".join(cols))
-    print("-" * 120)
-
-    for row in rows[:limit]:
-        print(" | ".join("" if v is None else str(v) for v in row))
-
-    print(f"\nRows shown: {min(len(rows), limit)} / {len(rows)}")
-
-    if export_name:
-        path = OUT_DIR / export_name
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(cols)
-            writer.writerows(rows)
-        print(f"CSV exported: {path}")
-
-    return rows, cols
-
-
-def get_columns(conn, table="stg_834_records"):
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table})")
-    return [r[1] for r in cur.fetchall()]
-
-
-def existing(cols, candidates):
-    return [c for c in candidates if c in cols]
+    cur.execute(f"PRAGMA table_info({table_name})")
+    return [row[1] for row in cur.fetchall()]
 
 
 def show_tables(conn):
-    run_sql(
-        conn,
-        """
-        SELECT name
-        FROM sqlite_master
-        WHERE type='table'
-        ORDER BY name;
-        """,
-        "TABLES",
-        "00_tables.csv"
-    )
+    print("\n=== TABLES ===")
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+    for row in cur.fetchall():
+        print(row[0])
 
 
-def show_columns(conn):
-    run_sql(
-        conn,
-        "PRAGMA table_info(stg_834_records);",
-        "STG_834_RECORDS COLUMNS",
-        "01_stg_columns.csv",
-        limit=300
-    )
+def show_columns(conn, table_name="stg_834_records"):
+    print(f"\n=== COLUMNS OF {table_name} ===")
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table_name})")
+    for cid, name, col_type, *_ in cur.fetchall():
+        print(f"{cid:02d} | {name} | {col_type}")
 
 
-def show_sample_rows(conn):
-    cols = get_columns(conn)
+def run_query(conn, sql, output_name="custom_query_output.csv", limit_print=50):
+    print("\n=== RUNNING QUERY ===")
+    print(sql)
+
+    cur = conn.cursor()
+    cur.execute(sql)
+
+    columns = [desc[0] for desc in cur.description]
+    rows = cur.fetchall()
+
+    print(f"\nRows returned: {len(rows)}")
+    print(" | ".join(columns))
+    print("-" * 120)
+
+    for row in rows[:limit_print]:
+        print(" | ".join("" if v is None else str(v) for v in row))
+
+    out_path = OUTPUT_DIR / output_name
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(columns)
+        writer.writerows(rows)
+
+    print(f"\nCSV exported: {out_path}")
+
+
+def show_sample_staging_rows(conn):
+    columns = get_columns(conn)
 
     wanted = [
-        "record_id", "id",
-        "issuer", "year", "month",
-        "policy_id", "member_id", "subscriber_id",
+        "record_id",
+        "issuer",
+        "year",
+        "month",
+        "policy_id",
+        "member_id",
+        "subscriber_id",
+        "relationship",
+        "subscriber_flag",
         "insurance_type_code",
         "additional_maint_reason_code",
         "maintenance_type_code",
@@ -114,164 +81,171 @@ def show_sample_rows(conn):
         "enrollee_event_reason_code",
         "transaction_classification",
         "coverage_status",
-        "relationship",
-        "subscriber_flag",
         "benefit_effective_date",
         "benefit_end_date",
         "member_maint_effective_date",
         "request_submit_timestamp",
-        "file_name",
         "raw_xml_path",
     ]
 
-    selected = existing(cols, wanted)
+    selected = [c for c in wanted if c in columns]
 
     sql = f"""
     SELECT {", ".join(selected)}
     FROM stg_834_records
-    WHERE issuer = '{ISSUER}'
-      AND year = '{YEAR}'
-    LIMIT 50;
+    WHERE issuer = '15105'
+      AND year = '2026'
+      AND month = '02'
+    LIMIT 100
     """
 
-    run_sql(conn, sql, "SAMPLE STAGING ROWS", "02_sample_staging_rows.csv", limit=50)
+    run_query(conn, sql, "sample_staging_rows.csv")
 
 
-def show_field_distributions(conn):
-    cols = get_columns(conn)
+def show_our_dashboard_logic(conn):
+    columns = get_columns(conn)
 
-    optional_group_cols = existing(cols, [
-        "insurance_type_code",
-        "additional_maint_reason_code",
-        "maintenance_type_code",
-        "enrollee_event_type_code",
-        "enrollee_event_reason_code",
-        "transaction_classification",
-        "coverage_status",
-        "subscriber_flag",
-        "relationship",
-    ])
-
-    select_cols = ["year", "month"] + optional_group_cols
-    group_cols = ", ".join(select_cols)
-
-    sql = f"""
-    SELECT
-        {group_cols},
-        COUNT(*) AS raw_rows,
-        COUNT(DISTINCT policy_id) AS policies,
-        COUNT(DISTINCT member_id) AS members,
-        COUNT(DISTINCT subscriber_id) AS subscribers
-    FROM stg_834_records
-    WHERE issuer = '{ISSUER}'
-      AND year = '{YEAR}'
-      AND month IN ('01','02','03','04','05')
-    GROUP BY {group_cols}
-    ORDER BY year, month, raw_rows DESC;
-    """
-
-    run_sql(conn, sql, "FIELD DISTRIBUTIONS", "03_field_distributions.csv", limit=300)
-
-
-def our_dashboard_monthly_logic(conn):
-    """
-    This reproduces the current dashboard/enrollment-summary style logic:
-    - use staging rows
-    - normalize status from additional_maint_reason_code
-    - HLT => Health, DEN => Dental
-    - reporting-level dedup by issuer/year/month/insurance/status/member_id
-    - keep latest by member_maint_effective_date/request_submit_timestamp/file name
-    - Enrollment_Count = distinct policy_id
-    - Enrollee_Count = distinct member_id
-    """
-    cols = get_columns(conn)
-
-    order_parts = []
-    for c in ["member_maint_effective_date", "request_submit_timestamp", "file_name"]:
-        if c in cols:
-            order_parts.append(f"COALESCE({c}, '') DESC")
-    order_parts.append("rowid DESC")
-    order_sql = ", ".join(order_parts)
+    if "raw_xml_path" in columns:
+        file_col = "raw_xml_path"
+    else:
+        file_col = "record_id"
 
     sql = f"""
     WITH base AS (
         SELECT
-            *,
+            issuer,
+            year,
+            month,
             CASE
                 WHEN insurance_type_code = 'DEN' THEN 'Dental'
                 ELSE 'Health'
             END AS Insurance_Type,
             CASE
-                WHEN UPPER(COALESCE(additional_maint_reason_code,'')) LIKE '%CONFIRM%' THEN 'CONFIRM'
-                WHEN UPPER(COALESCE(additional_maint_reason_code,'')) LIKE '%REINSTATE%' THEN 'CONFIRM'
-                WHEN UPPER(COALESCE(additional_maint_reason_code,'')) LIKE '%CANCEL%' THEN 'CANCEL'
-                WHEN UPPER(COALESCE(additional_maint_reason_code,'')) LIKE '%TERM%' THEN 'TERM'
-                ELSE NULL
-            END AS enrolleeStatus
+                WHEN additional_maint_reason_code = 'REINSTATE' THEN 'CONFIRM'
+                ELSE additional_maint_reason_code
+            END AS enrolleeStatus,
+            CASE
+                WHEN additional_maint_reason_code IN ('CONFIRM', 'REINSTATE') THEN 1
+                WHEN additional_maint_reason_code = 'CANCEL' THEN 2
+                WHEN additional_maint_reason_code = 'TERM' THEN 3
+            END AS status_id,
+            policy_id,
+            member_id,
+            subscriber_id,
+            household_or_employee_case_id,
+            member_maint_effective_date,
+            benefit_effective_date,
+            {file_col} AS file_sort
         FROM stg_834_records
-        WHERE issuer = '{ISSUER}'
-          AND year = '{YEAR}'
-          AND month IN ('01','02','03','04','05')
+        WHERE additional_maint_reason_code IN ('CONFIRM', 'CANCEL', 'TERM', 'REINSTATE')
+    ),
+    keyed AS (
+        SELECT
+            *,
+            CASE
+                WHEN policy_id IS NOT NULL AND policy_id != '' THEN 'policy:' || policy_id
+                WHEN subscriber_id IS NOT NULL AND subscriber_id != '' THEN 'subscriber:' || subscriber_id
+                WHEN household_or_employee_case_id IS NOT NULL AND household_or_employee_case_id != '' THEN 'household:' || household_or_employee_case_id
+                ELSE NULL
+            END AS enrollment_key
+        FROM base
     ),
     ranked AS (
         SELECT
             *,
             ROW_NUMBER() OVER (
                 PARTITION BY issuer, year, month, Insurance_Type, enrolleeStatus, member_id
-                ORDER BY {order_sql}
+                ORDER BY
+                    COALESCE(member_maint_effective_date, benefit_effective_date, '') DESC,
+                    file_sort DESC
             ) AS rn
-        FROM base
-        WHERE enrolleeStatus IS NOT NULL
-    ),
-    dedup AS (
-        SELECT *
-        FROM ranked
-        WHERE rn = 1
+        FROM keyed
     )
     SELECT
-        year AS Coverage_Year,
-        issuer AS GAA_HIOS_ID,
+        year,
         month,
         Insurance_Type,
-        CASE enrolleeStatus
-            WHEN 'CONFIRM' THEN 1
-            WHEN 'CANCEL' THEN 2
-            WHEN 'TERM' THEN 3
-        END AS status_id,
         enrolleeStatus,
+        status_id,
+        COUNT(DISTINCT enrollment_key) AS Enrollment_Count,
+        COUNT(DISTINCT member_id) AS Enrollee_Count
+    FROM ranked
+    WHERE rn = 1
+      AND issuer = '15105'
+    GROUP BY year, month, Insurance_Type, enrolleeStatus, status_id
+    ORDER BY year, month, status_id
+    """
+
+    run_query(conn, sql, "our_dashboard_monthly_logic.csv")
+
+
+def show_simple_status_counts(conn):
+    sql = """
+    SELECT
+        year,
+        month,
+        additional_maint_reason_code AS status,
+        COUNT(*) AS raw_rows,
+        COUNT(DISTINCT policy_id) AS distinct_policies,
+        COUNT(DISTINCT member_id) AS distinct_members,
+        COUNT(DISTINCT subscriber_id) AS distinct_subscribers
+    FROM stg_834_records
+    WHERE issuer = '15105'
+      AND year = '2026'
+      AND additional_maint_reason_code IN ('CONFIRM', 'CANCEL', 'TERM')
+    GROUP BY year, month, additional_maint_reason_code
+    ORDER BY year, month, status
+    """
+
+    run_query(conn, sql, "simple_status_counts.csv")
+
+
+def show_duplicate_members(conn):
+    sql = """
+    SELECT
+        year,
+        month,
+        additional_maint_reason_code AS status,
+        member_id,
+        COUNT(*) AS row_count,
+        COUNT(DISTINCT policy_id) AS policy_count,
+        MIN(member_maint_effective_date) AS first_maint_date,
+        MAX(member_maint_effective_date) AS latest_maint_date
+    FROM stg_834_records
+    WHERE issuer = '15105'
+      AND year = '2026'
+      AND additional_maint_reason_code IN ('CONFIRM', 'CANCEL', 'TERM')
+    GROUP BY year, month, additional_maint_reason_code, member_id
+    HAVING COUNT(*) > 1
+    ORDER BY year, month, status, row_count DESC
+    LIMIT 300
+    """
+
+    run_query(conn, sql, "duplicate_members.csv")
+
+
+def chandra_query_workspace(conn):
+    """
+    Buraya Chandra kendi query'sini yazabilir.
+    Sadece SQL'i değiştirip çalıştırmak yeterli.
+    """
+
+    sql = """
+    SELECT
+        year,
+        month,
+        additional_maint_reason_code AS status,
         COUNT(DISTINCT policy_id) AS Enrollment_Count,
-        COUNT(DISTINCT member_id) AS Enrollee_Count,
-        COUNT(*) AS dedup_rows_used
-    FROM dedup
-    GROUP BY year, issuer, month, Insurance_Type, status_id, enrolleeStatus
-    ORDER BY year, month, Insurance_Type, status_id;
+        COUNT(DISTINCT member_id) AS Enrollee_Count
+    FROM stg_834_records
+    WHERE issuer = '15105'
+      AND year = '2026'
+      AND additional_maint_reason_code IN ('CONFIRM', 'CANCEL', 'TERM')
+    GROUP BY year, month, additional_maint_reason_code
+    ORDER BY year, month, status
     """
 
-    run_sql(
-        conn,
-        sql,
-        "OUR CURRENT DASHBOARD / ENROLLMENT SUMMARY LOGIC - MONTHLY",
-        "04_our_dashboard_monthly_logic.csv",
-        limit=300
-    )
-
-
-def our_dashboard_rollup_logic(conn):
-    """
-    Same logic as monthly, but shows all months together for one issuer.
-    Useful to show Chandra/Hari the all-month rollup view.
-    """
-    our_dashboard_monthly_logic(conn)
-
-
-def run_chandra_custom_query(conn):
-    run_sql(
-        conn,
-        CUSTOM_QUERY,
-        "CUSTOM QUERY RESULT - CHANDRA CAN EDIT CUSTOM_QUERY",
-        "05_custom_query_result.csv",
-        limit=500
-    )
+    run_query(conn, sql, "chandra_custom_query_result.csv")
 
 
 def main():
@@ -279,17 +253,14 @@ def main():
 
     show_tables(conn)
     show_columns(conn)
-    show_sample_rows(conn)
 
-    # This is the most important explanation piece:
-    # It shows the exact logic we currently reflect in dashboard/monthly output.
-    our_dashboard_monthly_logic(conn)
+    show_sample_staging_rows(conn)
+    show_our_dashboard_logic(conn)
+    show_simple_status_counts(conn)
+    show_duplicate_members(conn)
 
-    # Optional supporting outputs
-    show_field_distributions(conn)
-
-    # Chandra can replace CUSTOM_QUERY at the top and run this.
-    run_chandra_custom_query(conn)
+    # Chandra kendi query'sini burada değiştirebilir:
+    chandra_query_workspace(conn)
 
     conn.close()
 
