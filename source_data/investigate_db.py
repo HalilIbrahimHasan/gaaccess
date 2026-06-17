@@ -4,9 +4,9 @@ from pathlib import Path
 
 
 DB_PATH = r"C:\Users\SelmaKazanci\Downloads\gaaccess-develop6\gaaccess-develop6\834_issuer_etl\data\issuer_834.db"
+
 ISSUER = "15105"
 YEAR = "2026"
-MONTHS = ("01", "02", "03", "04", "05")
 
 OUT_DIR = Path("investigation_outputs")
 OUT_DIR.mkdir(exist_ok=True)
@@ -55,8 +55,10 @@ def print_rows(title, cols, rows, limit=100):
     print_title(title)
     print(" | ".join(cols))
     print("-" * 120)
+
     for row in rows[:limit]:
         print(" | ".join("" if v is None else str(v) for v in row))
+
     print(f"\nRows shown: {min(len(rows), limit)} / {len(rows)}")
 
 
@@ -69,22 +71,22 @@ def export_csv(filename, cols, rows):
     print(f"CSV exported: {path}")
 
 
-def show_columns(conn):
-    cols, rows = fetch_rows(conn, "PRAGMA table_info(stg_834_records);")
-    print_rows("STAGING COLUMNS", cols, rows, limit=200)
-
-
 def chandra_cte():
     parts = []
-    for month, status, enroll, enrollee in CHANDRA:
+    for month, status, enrollment, enrollee in CHANDRA:
         parts.append(
             f"SELECT '{YEAR}' AS year, '{month}' AS month, '{status}' AS status, "
-            f"{enroll} AS ch_enrollment, {enrollee} AS ch_enrollee"
+            f"{enrollment} AS ch_enrollment, {enrollee} AS ch_enrollee"
         )
     return "\nUNION ALL\n".join(parts)
 
 
-def test_all_matching_rules(conn):
+def show_columns(conn):
+    cols, rows = fetch_rows(conn, "PRAGMA table_info(stg_834_records);")
+    print_rows("STAGING COLUMNS", cols, rows, limit=100)
+
+
+def test_all_rules(conn):
     sql = f"""
     WITH base AS (
         SELECT
@@ -108,6 +110,7 @@ def test_all_matching_rules(conn):
             member_maint_effective_date,
             request_submit_timestamp,
             file_id,
+            household_or_employee_case_id,
             raw_xml_path,
             CASE
                 WHEN policy_id IS NOT NULL AND policy_id <> '' THEN policy_id
@@ -125,101 +128,154 @@ def test_all_matching_rules(conn):
 
     exact_distinct AS (
         SELECT DISTINCT
-            year, month, status, policy_id, member_id, subscriber_id,
-            relationship, subscriber_flag, maintenance_type_code,
-            enrollee_event_type_code, enrollee_event_reason_code,
-            transaction_classification, coverage_status,
-            benefit_effective_date, benefit_end_date,
-            member_maint_effective_date, request_submit_timestamp,
-            file_id, enrollment_key
+            year,
+            month,
+            status,
+            policy_id,
+            member_id,
+            subscriber_id,
+            relationship,
+            subscriber_flag,
+            maintenance_type_code,
+            enrollee_event_type_code,
+            enrollee_event_reason_code,
+            transaction_classification,
+            coverage_status,
+            benefit_effective_date,
+            benefit_end_date,
+            member_maint_effective_date,
+            request_submit_timestamp,
+            file_id,
+            household_or_employee_case_id,
+            enrollment_key
         FROM base
     ),
 
     latest_member_status AS (
-        SELECT * FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY year, month, status, member_id
-                ORDER BY member_maint_effective_date DESC, request_submit_timestamp DESC, file_id DESC
-            ) rn
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, status, member_id
+                    ORDER BY member_maint_effective_date DESC, request_submit_timestamp DESC, file_id DESC
+                ) AS rn
             FROM base
-        ) WHERE rn = 1
+        )
+        WHERE rn = 1
     ),
 
     latest_member_policy_status AS (
-        SELECT * FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY year, month, status, member_id, policy_id
-                ORDER BY member_maint_effective_date DESC, request_submit_timestamp DESC, file_id DESC
-            ) rn
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, status, member_id, policy_id
+                    ORDER BY member_maint_effective_date DESC, request_submit_timestamp DESC, file_id DESC
+                ) AS rn
             FROM base
-        ) WHERE rn = 1
+        )
+        WHERE rn = 1
     ),
 
     latest_member_policy_effective AS (
-        SELECT * FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY year, month, status, member_id, policy_id, member_maint_effective_date
-                ORDER BY request_submit_timestamp DESC, file_id DESC
-            ) rn
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, status, member_id, policy_id, member_maint_effective_date
+                    ORDER BY request_submit_timestamp DESC, file_id DESC
+                ) AS rn
             FROM base
-        ) WHERE rn = 1
+        )
+        WHERE rn = 1
     ),
 
     latest_policy_status AS (
-        SELECT * FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY year, month, status, policy_id
-                ORDER BY member_maint_effective_date DESC, request_submit_timestamp DESC, file_id DESC
-            ) rn
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, status, policy_id
+                    ORDER BY member_maint_effective_date DESC, request_submit_timestamp DESC, file_id DESC
+                ) AS rn
             FROM base
-        ) WHERE rn = 1
+        )
+        WHERE rn = 1
     ),
 
     latest_policy_subscriber_status AS (
-        SELECT * FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY year, month, status, policy_id, subscriber_id
-                ORDER BY member_maint_effective_date DESC, request_submit_timestamp DESC, file_id DESC
-            ) rn
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, status, policy_id, subscriber_id
+                    ORDER BY member_maint_effective_date DESC, request_submit_timestamp DESC, file_id DESC
+                ) AS rn
             FROM base
-        ) WHERE rn = 1
+        )
+        WHERE rn = 1
     ),
 
-    latest_by_request_ts_member AS (
-        SELECT * FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY year, month, status, member_id
-                ORDER BY request_submit_timestamp DESC, member_maint_effective_date DESC, file_id DESC
-            ) rn
+    latest_request_member_status AS (
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, status, member_id
+                    ORDER BY request_submit_timestamp DESC, member_maint_effective_date DESC, file_id DESC
+                ) AS rn
             FROM base
-        ) WHERE rn = 1
+        )
+        WHERE rn = 1
     ),
 
-    latest_by_request_ts_policy_member AS (
-        SELECT * FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY year, month, status, policy_id, member_id
-                ORDER BY request_submit_timestamp DESC, member_maint_effective_date DESC, file_id DESC
-            ) rn
+    latest_request_policy_member_status AS (
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, status, policy_id, member_id
+                    ORDER BY request_submit_timestamp DESC, member_maint_effective_date DESC, file_id DESC
+                ) AS rn
             FROM base
-        ) WHERE rn = 1
+        )
+        WHERE rn = 1
+    ),
+
+    latest_request_policy_status AS (
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, status, policy_id
+                    ORDER BY request_submit_timestamp DESC, member_maint_effective_date DESC, file_id DESC
+                ) AS rn
+            FROM base
+        )
+        WHERE rn = 1
     ),
 
     subscriber_only AS (
-        SELECT * FROM base WHERE subscriber_flag = 'Y'
+        SELECT *
+        FROM base
+        WHERE subscriber_flag = 'Y'
     ),
 
     relationship_18_only AS (
-        SELECT * FROM base WHERE relationship = '18'
+        SELECT *
+        FROM base
+        WHERE relationship = '18'
     ),
 
-    current_not_cancel_window AS (
-        SELECT * FROM base
-        WHERE cancellation_window_status IS NULL
-           OR cancellation_window_status NOT LIKE '%duplicate%'
-    ),
-
-    status_from_transaction_classification AS (
+    transaction_classification_based AS (
         SELECT
             *,
             CASE
@@ -232,96 +288,195 @@ def test_all_matching_rules(conn):
         WHERE transaction_classification IN ('CONFIRMATION','CANCELLATION','TERMINATION')
     ),
 
-    latest_tx_class_member AS (
-        SELECT * FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY year, month, normalized_status, member_id
-                ORDER BY request_submit_timestamp DESC, member_maint_effective_date DESC, file_id DESC
-            ) rn
-            FROM status_from_transaction_classification
-        ) WHERE rn = 1
+    latest_tx_member AS (
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, normalized_status, member_id
+                    ORDER BY request_submit_timestamp DESC, member_maint_effective_date DESC, file_id DESC
+                ) AS rn
+            FROM transaction_classification_based
+        )
+        WHERE rn = 1
     ),
 
     all_rules AS (
-        SELECT year, month, status, 'A_raw_distinct_policy_member' rule,
-               COUNT(DISTINCT enrollment_key) enrollment_count,
-               COUNT(DISTINCT member_id) enrollee_count
-        FROM base GROUP BY year, month, status
+        SELECT
+            year,
+            month,
+            status,
+            'A_raw_distinct_policy_member' AS rule,
+            COUNT(DISTINCT enrollment_key) AS enrollment_count,
+            COUNT(DISTINCT member_id) AS enrollee_count
+        FROM base
+        GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'B_exact_distinct_rows',
-               COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
-        FROM exact_distinct GROUP BY year, month, status
+        SELECT
+            year,
+            month,
+            status,
+            'B_exact_distinct_rows' AS rule,
+            COUNT(DISTINCT enrollment_key),
+            COUNT(DISTINCT member_id)
+        FROM exact_distinct
+        GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'C_latest_member_status',
-               COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
-        FROM latest_member_status GROUP BY year, month, status
+        SELECT
+            year,
+            month,
+            status,
+            'C_latest_member_status' AS rule,
+            COUNT(DISTINCT enrollment_key),
+            COUNT(DISTINCT member_id)
+        FROM latest_member_status
+        GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'D_latest_member_policy_status',
-               COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
-        FROM latest_member_policy_status GROUP BY year, month, status
+        SELECT
+            year,
+            month,
+            status,
+            'D_latest_member_policy_status' AS rule,
+            COUNT(DISTINCT enrollment_key),
+            COUNT(DISTINCT member_id)
+        FROM latest_member_policy_status
+        GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'E_latest_member_policy_effective_date',
-               COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
-        FROM latest_member_policy_effective GROUP BY year, month, status
+        SELECT
+            year,
+            month,
+            status,
+            'E_latest_member_policy_effective' AS rule,
+            COUNT(DISTINCT enrollment_key),
+            COUNT(DISTINCT member_id)
+        FROM latest_member_policy_effective
+        GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'F_latest_policy_status',
-               COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
-        FROM latest_policy_status GROUP BY year, month, status
+        SELECT
+            year,
+            month,
+            status,
+            'F_latest_policy_status' AS rule,
+            COUNT(DISTINCT enrollment_key),
+            COUNT(DISTINCT member_id)
+        FROM latest_policy_status
+        GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'G_latest_policy_subscriber_status',
-               COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
-        FROM latest_policy_subscriber_status GROUP BY year, month, status
+        SELECT
+            year,
+            month,
+            status,
+            'G_latest_policy_subscriber_status' AS rule,
+            COUNT(DISTINCT enrollment_key),
+            COUNT(DISTINCT member_id)
+        FROM latest_policy_subscriber_status
+        GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'H_latest_by_request_ts_member',
-               COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
-        FROM latest_by_request_ts_member GROUP BY year, month, status
+        SELECT
+            year,
+            month,
+            status,
+            'H_latest_request_member_status' AS rule,
+            COUNT(DISTINCT enrollment_key),
+            COUNT(DISTINCT member_id)
+        FROM latest_request_member_status
+        GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'I_latest_by_request_ts_policy_member',
-               COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
-        FROM latest_by_request_ts_policy_member GROUP BY year, month, status
+        SELECT
+            year,
+            month,
+            status,
+            'I_latest_request_policy_member_status' AS rule,
+            COUNT(DISTINCT enrollment_key),
+            COUNT(DISTINCT member_id)
+        FROM latest_request_policy_member_status
+        GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'J_subscriber_flag_Y_only',
-               COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
-        FROM subscriber_only GROUP BY year, month, status
+        SELECT
+            year,
+            month,
+            status,
+            'J_latest_request_policy_status' AS rule,
+            COUNT(DISTINCT enrollment_key),
+            COUNT(DISTINCT member_id)
+        FROM latest_request_policy_status
+        GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'K_relationship_18_only',
-               COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
-        FROM relationship_18_only GROUP BY year, month, status
+        SELECT
+            year,
+            month,
+            status,
+            'K_subscriber_flag_Y_only' AS rule,
+            COUNT(DISTINCT enrollment_key),
+            COUNT(DISTINCT member_id)
+        FROM subscriber_only
+        GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'L_policy_id_as_enrollment_member_raw',
-               COUNT(DISTINCT policy_id), COUNT(DISTINCT member_id)
-        FROM base GROUP BY year, month, status
+        SELECT
+            year,
+            month,
+            status,
+            'L_relationship_18_only' AS rule,
+            COUNT(DISTINCT enrollment_key),
+            COUNT(DISTINCT member_id)
+        FROM relationship_18_only
+        GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'M_subscriber_id_as_enrollment_member_raw',
-               COUNT(DISTINCT subscriber_id), COUNT(DISTINCT member_id)
-        FROM base GROUP BY year, month, status
+        SELECT
+            year,
+            month,
+            status,
+            'M_policy_id_as_enrollment_raw' AS rule,
+            COUNT(DISTINCT policy_id),
+            COUNT(DISTINCT member_id)
+        FROM base
+        GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'N_health_coverage_policy_no_as_enrollment',
-               COUNT(DISTINCT health_coverage_policy_no), COUNT(DISTINCT member_id)
-        FROM base GROUP BY year, month, status
+        SELECT
+            year,
+            month,
+            status,
+            'N_subscriber_id_as_enrollment_raw' AS rule,
+            COUNT(DISTINCT subscriber_id),
+            COUNT(DISTINCT member_id)
+        FROM base
+        GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, normalized_status AS status, 'O_transaction_classification_raw',
-               COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
-        FROM status_from_transaction_classification GROUP BY year, month, normalized_status
+        SELECT
+            year,
+            month,
+            normalized_status AS status,
+            'O_transaction_classification_raw' AS rule,
+            COUNT(DISTINCT enrollment_key),
+            COUNT(DISTINCT member_id)
+        FROM transaction_classification_based
+        GROUP BY year, month, normalized_status
 
         UNION ALL
-        SELECT year, month, normalized_status AS status, 'P_latest_transaction_classification_member',
-               COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
-        FROM latest_tx_class_member GROUP BY year, month, normalized_status
+        SELECT
+            year,
+            month,
+            normalized_status AS status,
+            'P_latest_tx_class_member' AS rule,
+            COUNT(DISTINCT enrollment_key),
+            COUNT(DISTINCT member_id)
+        FROM latest_tx_member
+        GROUP BY year, month, normalized_status
     ),
 
     chandra AS (
@@ -340,7 +495,8 @@ def test_all_matching_rules(conn):
             r.enrollee_count,
             c.ch_enrollee,
             r.enrollee_count - c.ch_enrollee AS enrollee_delta,
-            ABS(r.enrollment_count - c.ch_enrollment) + ABS(r.enrollee_count - c.ch_enrollee) AS total_delta
+            ABS(r.enrollment_count - c.ch_enrollment)
+              + ABS(r.enrollee_count - c.ch_enrollee) AS total_delta
         FROM all_rules r
         JOIN chandra c
           ON r.year = c.year
@@ -357,21 +513,32 @@ def test_all_matching_rules(conn):
     print_rows("ALL CHANDRA MATCHING RULE TESTS", cols, rows, limit=500)
     export_csv("all_chandra_rule_tests.csv", cols, rows)
 
-    return cols, rows
 
-
-def summarize_best_rules(conn):
+def best_rule_per_month_status(conn):
     sql = f"""
     WITH base AS (
         SELECT
-            issuer, year, month, insurance_type_code,
+            issuer,
+            year,
+            month,
+            insurance_type_code,
             additional_maint_reason_code AS status,
-            policy_id, member_id, subscriber_id, relationship, subscriber_flag,
-            maintenance_type_code, enrollee_event_type_code, enrollee_event_reason_code,
-            transaction_classification, coverage_status,
-            benefit_effective_date, benefit_end_date,
-            member_maint_effective_date, request_submit_timestamp, file_id,
-            health_coverage_policy_no,
+            policy_id,
+            member_id,
+            subscriber_id,
+            relationship,
+            subscriber_flag,
+            maintenance_type_code,
+            enrollee_event_type_code,
+            enrollee_event_reason_code,
+            transaction_classification,
+            coverage_status,
+            benefit_effective_date,
+            benefit_end_date,
+            member_maint_effective_date,
+            request_submit_timestamp,
+            file_id,
+            household_or_employee_case_id,
             CASE
                 WHEN policy_id IS NOT NULL AND policy_id <> '' THEN policy_id
                 WHEN subscriber_id IS NOT NULL AND subscriber_id <> '' THEN subscriber_id
@@ -387,76 +554,81 @@ def summarize_best_rules(conn):
     ),
 
     latest_member_status AS (
-        SELECT * FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY year, month, status, member_id
-                ORDER BY member_maint_effective_date DESC, request_submit_timestamp DESC, file_id DESC
-            ) rn
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, status, member_id
+                    ORDER BY request_submit_timestamp DESC, member_maint_effective_date DESC, file_id DESC
+                ) AS rn
             FROM base
-        ) WHERE rn = 1
+        )
+        WHERE rn = 1
     ),
 
     latest_policy_status AS (
-        SELECT * FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY year, month, status, policy_id
-                ORDER BY member_maint_effective_date DESC, request_submit_timestamp DESC, file_id DESC
-            ) rn
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, status, policy_id
+                    ORDER BY request_submit_timestamp DESC, member_maint_effective_date DESC, file_id DESC
+                ) AS rn
             FROM base
-        ) WHERE rn = 1
+        )
+        WHERE rn = 1
     ),
 
-    exact_distinct AS (
-        SELECT DISTINCT
-            year, month, status, policy_id, member_id, subscriber_id,
-            relationship, subscriber_flag, maintenance_type_code,
-            enrollee_event_type_code, enrollee_event_reason_code,
-            transaction_classification, coverage_status,
-            benefit_effective_date, benefit_end_date,
-            member_maint_effective_date, request_submit_timestamp,
-            file_id, enrollment_key, health_coverage_policy_no
-        FROM base
+    latest_policy_member_status AS (
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, status, policy_id, member_id
+                    ORDER BY request_submit_timestamp DESC, member_maint_effective_date DESC, file_id DESC
+                ) AS rn
+            FROM base
+        )
+        WHERE rn = 1
     ),
 
     all_rules AS (
-        SELECT year, month, status, 'RAW_POLICY_MEMBER' rule,
-               COUNT(DISTINCT enrollment_key) enrollment_count,
-               COUNT(DISTINCT member_id) enrollee_count
+        SELECT year, month, status, 'RAW_POLICY_MEMBER' AS rule,
+               COUNT(DISTINCT enrollment_key) AS enrollment_count,
+               COUNT(DISTINCT member_id) AS enrollee_count
         FROM base GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'EXACT_DISTINCT',
-               COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
-        FROM exact_distinct GROUP BY year, month, status
-
-        UNION ALL
-        SELECT year, month, status, 'LATEST_MEMBER_STATUS',
+        SELECT year, month, status, 'LATEST_MEMBER_STATUS' AS rule,
                COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
         FROM latest_member_status GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'LATEST_POLICY_STATUS',
+        SELECT year, month, status, 'LATEST_POLICY_STATUS' AS rule,
                COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
         FROM latest_policy_status GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'SUBSCRIBER_ONLY',
+        SELECT year, month, status, 'LATEST_POLICY_MEMBER_STATUS' AS rule,
+               COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
+        FROM latest_policy_member_status GROUP BY year, month, status
+
+        UNION ALL
+        SELECT year, month, status, 'SUBSCRIBER_ONLY' AS rule,
                COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
         FROM base WHERE subscriber_flag='Y' GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'RELATIONSHIP_18_ONLY',
+        SELECT year, month, status, 'RELATIONSHIP_18_ONLY' AS rule,
                COUNT(DISTINCT enrollment_key), COUNT(DISTINCT member_id)
         FROM base WHERE relationship='18' GROUP BY year, month, status
 
         UNION ALL
-        SELECT year, month, status, 'SUBSCRIBER_ID_AS_ENROLLMENT',
+        SELECT year, month, status, 'SUBSCRIBER_ID_AS_ENROLLMENT' AS rule,
                COUNT(DISTINCT subscriber_id), COUNT(DISTINCT member_id)
-        FROM base GROUP BY year, month, status
-
-        UNION ALL
-        SELECT year, month, status, 'HEALTH_COVERAGE_POLICY_NO',
-               COUNT(DISTINCT health_coverage_policy_no), COUNT(DISTINCT member_id)
         FROM base GROUP BY year, month, status
     ),
 
@@ -469,7 +641,8 @@ def summarize_best_rules(conn):
             r.*,
             c.ch_enrollment,
             c.ch_enrollee,
-            ABS(r.enrollment_count - c.ch_enrollment) + ABS(r.enrollee_count - c.ch_enrollee) AS total_delta
+            ABS(r.enrollment_count - c.ch_enrollment)
+              + ABS(r.enrollee_count - c.ch_enrollee) AS total_delta
         FROM all_rules r
         JOIN chandra c
           ON r.year = c.year
@@ -482,7 +655,7 @@ def summarize_best_rules(conn):
             *,
             ROW_NUMBER() OVER (
                 PARTITION BY year, month, status
-                ORDER BY total_delta ASC
+                ORDER BY total_delta ASC, rule
             ) AS best_rank
         FROM scored
     )
@@ -498,7 +671,7 @@ def summarize_best_rules(conn):
     export_csv("best_rule_per_month_status.csv", cols, rows)
 
 
-def explain_biggest_gaps(conn):
+def count_grain_comparison(conn):
     sql = """
     SELECT
         year,
@@ -506,7 +679,6 @@ def explain_biggest_gaps(conn):
         additional_maint_reason_code AS status,
         COUNT(*) AS raw_rows,
         COUNT(DISTINCT policy_id) AS distinct_policy_id,
-        COUNT(DISTINCT health_coverage_policy_no) AS distinct_health_policy_no,
         COUNT(DISTINCT subscriber_id) AS distinct_subscriber_id,
         COUNT(DISTINCT member_id) AS distinct_member_id,
         COUNT(DISTINCT policy_id || '|' || member_id) AS distinct_policy_member,
@@ -531,10 +703,12 @@ def explain_biggest_gaps(conn):
 def main():
     conn = connect()
 
-    show_columns(conn)
-    test_all_matching_rules(conn)
-    summarize_best_rules(conn)
-    explain_biggest_gaps(conn)
+    # Uncomment if you need schema again:
+    # show_columns(conn)
+
+    test_all_rules(conn)
+    best_rule_per_month_status(conn)
+    count_grain_comparison(conn)
 
     conn.close()
 
