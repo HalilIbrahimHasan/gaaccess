@@ -1,93 +1,95 @@
 import sqlite3
 import csv
 from pathlib import Path
+from collections import defaultdict
 
-
-DB_PATH = r"C:\Users\SelmaKazanci\Downloads\gaaccess-develop6\gaaccess-develop6\834_issuer_etl\data\issuer_834.db"
-
-ISSUER = "15105"
-YEAR = "2026"
-
-OUT_DIR = Path("investigation_outputs")
+DB_PATH = Path("data/issuer_834.db")
+OUT_DIR = Path("investigation_outputs_final")
 OUT_DIR.mkdir(exist_ok=True)
 
-
 CHANDRA = {
-    ("01", "CONFIRM"): (1240, 1690),
-    ("01", "CANCEL"): (47, 47),
-    ("02", "CONFIRM"): (490, 744),
-    ("02", "CANCEL"): (734, 709),
-    ("02", "TERM"): (1435, 1435),
-    ("03", "CONFIRM"): (453, 584),
-    ("03", "CANCEL"): (278, 271),
-    ("03", "TERM"): (20, 20),
-    ("04", "CONFIRM"): (463, 559),
-    ("04", "CANCEL"): (236, 233),
-    ("04", "TERM"): (4255, 4255),
-    ("05", "CONFIRM"): (340, 418),
-    ("05", "CANCEL"): (64, 63),
-    ("05", "TERM"): (179, 179),
+    ("2026", "01", "CONFIRM"): (1240, 1690),
+    ("2026", "01", "CANCEL"): (47, 47),
+    ("2026", "02", "CONFIRM"): (490, 744),
+    ("2026", "02", "CANCEL"): (734, 709),
+    ("2026", "02", "TERM"): (1435, 1435),
+    ("2026", "03", "CONFIRM"): (453, 584),
+    ("2026", "03", "CANCEL"): (278, 271),
+    ("2026", "03", "TERM"): (20, 20),
+    ("2026", "04", "CONFIRM"): (463, 559),
+    ("2026", "04", "CANCEL"): (236, 233),
+    ("2026", "04", "TERM"): (4255, 4255),
+    ("2026", "05", "CONFIRM"): (340, 418),
+    ("2026", "05", "CANCEL"): (64, 63),
+    ("2026", "05", "TERM"): (179, 179),
 }
 
+STATUS_SQL = """
+CASE
+    WHEN upper(coalesce(additional_maint_reason_code,'')) LIKE '%CONFIRM%' THEN 'CONFIRM'
+    WHEN upper(coalesce(additional_maint_reason_code,'')) LIKE '%CANCEL%' THEN 'CANCEL'
+    WHEN upper(coalesce(additional_maint_reason_code,'')) LIKE '%TERM%' THEN 'TERM'
+    WHEN upper(coalesce(transaction_classification,'')) LIKE '%CONFIRM%' THEN 'CONFIRM'
+    WHEN upper(coalesce(transaction_classification,'')) LIKE '%CANCEL%' THEN 'CANCEL'
+    WHEN upper(coalesce(transaction_classification,'')) LIKE '%TERM%' THEN 'TERM'
+    ELSE NULL
+END
+"""
 
 def connect():
-    db = Path(DB_PATH)
-    if not db.exists():
-        raise FileNotFoundError(f"DB not found: {db}")
-    return sqlite3.connect(db)
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"DB not found: {DB_PATH.resolve()}")
+    return sqlite3.connect(DB_PATH)
 
-
-def run(conn, sql, params=None):
+def q(conn, sql, params=()):
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    cur.execute(sql, params or {})
-    cols = [d[0] for d in cur.description]
-    rows = cur.fetchall()
-    return cols, rows
+    cur.execute(sql, params)
+    return [dict(r) for r in cur.fetchall()]
 
-
-def export_csv(name, cols, rows):
+def export_csv(name, rows):
     path = OUT_DIR / name
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(cols)
-        w.writerows(rows)
+    if not rows:
+        return
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
     print(f"CSV exported: {path}")
 
-
-def print_table(title, cols, rows, limit=80):
-    print("\n" + "=" * 120)
+def print_table(title, rows, limit=80):
+    print("\n" + "=" * 140)
     print(title)
-    print("=" * 120)
+    print("=" * 140)
+    if not rows:
+        print("No rows")
+        return
+
+    cols = list(rows[0].keys())
     print(" | ".join(cols))
-    print("-" * 120)
+    print("-" * 140)
+
     for r in rows[:limit]:
-        print(" | ".join("" if v is None else str(v) for v in r))
+        print(" | ".join(str(r.get(c, "")) for c in cols))
+
     print(f"Rows shown: {min(len(rows), limit)} / {len(rows)}")
 
-
-def chandra_cte():
-    parts = []
-    for (month, status), (enroll, enrollee) in CHANDRA.items():
-        parts.append(
-            f"SELECT '{YEAR}' year, '{month}' month, '{status}' status, "
-            f"{enroll} ch_enrollment, {enrollee} ch_enrollee"
-        )
-    return "\nUNION ALL\n".join(parts)
-
-
-def monthly_baseline(conn):
-    sql = f"""
+def base_view_sql():
+    return f"""
     WITH base AS (
         SELECT
+            issuer,
             year,
-            month,
-            additional_maint_reason_code AS status,
+            printf('%02d', CAST(month AS INTEGER)) AS month,
             policy_id,
             member_id,
             subscriber_id,
+            health_coverage_policy_no,
+            household_or_employee_case_id,
             relationship,
             subscriber_flag,
             maintenance_type_code,
+            additional_maint_reason_code,
             enrollee_event_type_code,
             enrollee_event_reason_code,
             transaction_classification,
@@ -96,449 +98,229 @@ def monthly_baseline(conn):
             benefit_end_date,
             member_maint_effective_date,
             request_submit_timestamp,
-            file_id,
-            raw_xml_path
+            file_name,
+            raw_xml_path,
+            {STATUS_SQL} AS status
         FROM stg_834_records
-        WHERE issuer = :issuer
-          AND year = :year
-          AND month IN ('01','02','03','04','05')
-          AND insurance_type_code = 'HLT'
-          AND additional_maint_reason_code IN ('CONFIRM','CANCEL','TERM')
-    ),
-
-    latest_member AS (
-        SELECT *
-        FROM (
-            SELECT
-                *,
-                ROW_NUMBER() OVER (
-                    PARTITION BY year, month, status, member_id
-                    ORDER BY request_submit_timestamp DESC, member_maint_effective_date DESC, file_id DESC
-                ) AS rn
-            FROM base
-        )
-        WHERE rn = 1
-    ),
-
-    summary AS (
-        SELECT
-            year,
-            month,
-            status,
-            COUNT(DISTINCT policy_id) AS our_enrollment,
-            COUNT(DISTINCT member_id) AS our_enrollee
-        FROM latest_member
-        GROUP BY year, month, status
-    ),
-
-    chandra AS (
-        {chandra_cte()}
+        WHERE issuer = '15105'
     )
-
-    SELECT
-        s.year,
-        s.month,
-        s.status,
-        s.our_enrollment,
-        c.ch_enrollment,
-        s.our_enrollment - c.ch_enrollment AS enrollment_gap,
-        s.our_enrollee,
-        c.ch_enrollee,
-        s.our_enrollee - c.ch_enrollee AS enrollee_gap
-    FROM summary s
-    JOIN chandra c
-      ON s.year = c.year
-     AND s.month = c.month
-     AND s.status = c.status
-    ORDER BY s.year, s.month, s.status;
     """
-    cols, rows = run(conn, sql, {"issuer": ISSUER, "year": YEAR})
-    print_table("1. BASELINE VS CHANDRA USING LATEST MEMBER STATUS", cols, rows)
-    export_csv("01_baseline_vs_chandra.csv", cols, rows)
 
-
-def gap_feature_profile(conn):
-    sql = f"""
-    WITH base AS (
-        SELECT
-            *,
-            additional_maint_reason_code AS status
-        FROM stg_834_records
-        WHERE issuer = :issuer
-          AND year = :year
-          AND month IN ('01','02','03','04','05')
-          AND insurance_type_code = 'HLT'
-          AND additional_maint_reason_code IN ('CONFIRM','CANCEL','TERM')
-    ),
-
-    latest_member AS (
+def run_rule(conn, rule_name, where_clause="", enrollment_key="policy_id", enrollee_key="member_id", dedup_key="member_id"):
+    sql = base_view_sql() + f"""
+    , filtered AS (
         SELECT *
+        FROM base
+        WHERE status IS NOT NULL
+        {where_clause}
+    ),
+    ranked AS (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY year, month, status, insurance_grain, dedup_value
+                   ORDER BY
+                       date(coalesce(member_maint_effective_date, benefit_effective_date, '1900-01-01')) DESC,
+                       coalesce(request_submit_timestamp, '') DESC,
+                       coalesce(file_name, '') DESC,
+                       record_sort DESC
+               ) AS rn
         FROM (
             SELECT
+                rowid AS record_sort,
                 *,
-                ROW_NUMBER() OVER (
-                    PARTITION BY year, month, status, member_id
-                    ORDER BY request_submit_timestamp DESC, member_maint_effective_date DESC, file_id DESC
-                ) AS rn
-            FROM base
+                coalesce(insurance_type_code, 'HLT') AS insurance_grain,
+                coalesce({dedup_key}, '') AS dedup_value
+            FROM filtered
         )
+    ),
+    final AS (
+        SELECT *
+        FROM ranked
         WHERE rn = 1
     )
-
     SELECT
         year,
         month,
         status,
-        maintenance_type_code,
-        enrollee_event_type_code,
-        enrollee_event_reason_code,
-        transaction_classification,
-        coverage_status,
-        subscriber_flag,
-        relationship,
-        COUNT(*) AS rows,
-        COUNT(DISTINCT policy_id) AS distinct_policies,
-        COUNT(DISTINCT member_id) AS distinct_members,
-        COUNT(DISTINCT subscriber_id) AS distinct_subscribers
-    FROM latest_member
-    GROUP BY
-        year,
-        month,
-        status,
-        maintenance_type_code,
-        enrollee_event_type_code,
-        enrollee_event_reason_code,
-        transaction_classification,
-        coverage_status,
-        subscriber_flag,
-        relationship
-    ORDER BY year, month, status, rows DESC;
+        '{rule_name}' AS rule,
+        COUNT(DISTINCT NULLIF({enrollment_key}, '')) AS enrollment_count,
+        COUNT(DISTINCT NULLIF({enrollee_key}, '')) AS enrollee_count
+    FROM final
+    GROUP BY year, month, status
+    ORDER BY year, month,
+        CASE status WHEN 'CONFIRM' THEN 1 WHEN 'CANCEL' THEN 2 WHEN 'TERM' THEN 3 ELSE 9 END
     """
-    cols, rows = run(conn, sql, {"issuer": ISSUER, "year": YEAR})
-    print_table("2. FEATURE PROFILE AFTER LATEST MEMBER DEDUP", cols, rows, limit=150)
-    export_csv("02_feature_profile_after_latest_member.csv", cols, rows)
+    return q(conn, sql)
 
+def score_vs_chandra(rows):
+    scored = []
+    for r in rows:
+        key = (r["year"], r["month"], r["status"])
+        if key not in CHANDRA:
+            continue
 
-def test_business_filters(conn):
-    sql = f"""
-    WITH base AS (
-        SELECT
-            *,
-            additional_maint_reason_code AS status
-        FROM stg_834_records
-        WHERE issuer = :issuer
-          AND year = :year
-          AND month IN ('01','02','03','04','05')
-          AND insurance_type_code = 'HLT'
-          AND additional_maint_reason_code IN ('CONFIRM','CANCEL','TERM')
-    ),
+        ch_enrollment, ch_enrollee = CHANDRA[key]
+        enrollment_delta = r["enrollment_count"] - ch_enrollment
+        enrollee_delta = r["enrollee_count"] - ch_enrollee
 
-    latest_member AS (
-        SELECT *
-        FROM (
-            SELECT
-                *,
-                ROW_NUMBER() OVER (
-                    PARTITION BY year, month, status, member_id
-                    ORDER BY request_submit_timestamp DESC, member_maint_effective_date DESC, file_id DESC
-                ) AS rn
-            FROM base
-        )
-        WHERE rn = 1
-    ),
+        scored.append({
+            **r,
+            "ch_enrollment": ch_enrollment,
+            "ch_enrollee": ch_enrollee,
+            "enrollment_delta": enrollment_delta,
+            "enrollee_delta": enrollee_delta,
+            "total_abs_delta": abs(enrollment_delta) + abs(enrollee_delta),
+            "exact_match": "YES" if enrollment_delta == 0 and enrollee_delta == 0 else "NO",
+        })
+    return scored
 
-    rules AS (
-        SELECT year, month, status, 'A_latest_member_all' rule,
-               COUNT(DISTINCT policy_id) enrollment_count,
-               COUNT(DISTINCT member_id) enrollee_count
-        FROM latest_member
-        GROUP BY year, month, status
+def test_all_logic_variants(conn):
+    rules = []
 
-        UNION ALL
-        SELECT year, month, status, 'B_exclude_reason_28',
-               COUNT(DISTINCT policy_id), COUNT(DISTINCT member_id)
-        FROM latest_member
-        WHERE IFNULL(enrollee_event_reason_code,'') <> '28'
-        GROUP BY year, month, status
+    filters = {
+        "ALL": "",
+        "ONLY_SUBSCRIBER_Y": "AND subscriber_flag = 'Y'",
+        "ONLY_REL_18": "AND relationship = '18'",
+        "ONLY_ACTIVE_END_NULL": "AND (benefit_end_date IS NULL OR trim(benefit_end_date) = '')",
+        "EXCLUDE_REL_18": "AND coalesce(relationship,'') <> '18'",
+        "EXCLUDE_SUBSCRIBER_Y": "AND coalesce(subscriber_flag,'') <> 'Y'",
+        "ONLY_REASON_28": "AND enrollee_event_reason_code = '28'",
+        "ONLY_REASON_59": "AND enrollee_event_reason_code = '59'",
+        "EXCLUDE_REASON_28": "AND coalesce(enrollee_event_reason_code,'') <> '28'",
+        "EXCLUDE_REASON_59": "AND coalesce(enrollee_event_reason_code,'') <> '59'",
+        "BENEFIT_MONTH_MATCH": "AND substr(benefit_effective_date,1,7) = year || '-' || printf('%02d', cast(month as integer))",
+        "REQUEST_MONTH_MATCH": "AND substr(request_submit_timestamp,1,7) = year || '-' || printf('%02d', cast(month as integer))",
+    }
 
-        UNION ALL
-        SELECT year, month, status, 'C_only_reason_28',
-               COUNT(DISTINCT policy_id), COUNT(DISTINCT member_id)
-        FROM latest_member
-        WHERE enrollee_event_reason_code = '28'
-        GROUP BY year, month, status
+    enrollment_keys = {
+        "POLICY": "policy_id",
+        "HEALTH_POLICY": "health_coverage_policy_no",
+        "SUBSCRIBER": "subscriber_id",
+        "MEMBER": "member_id",
+        "POLICY_MEMBER": "policy_id || '|' || member_id",
+        "SUBSCRIBER_MEMBER": "subscriber_id || '|' || member_id",
+    }
 
-        UNION ALL
-        SELECT year, month, status, 'D_exclude_reason_59',
-               COUNT(DISTINCT policy_id), COUNT(DISTINCT member_id)
-        FROM latest_member
-        WHERE IFNULL(enrollee_event_reason_code,'') <> '59'
-        GROUP BY year, month, status
+    enrollee_keys = {
+        "MEMBER": "member_id",
+        "SUBSCRIBER": "subscriber_id",
+        "POLICY_MEMBER": "policy_id || '|' || member_id",
+        "SUBSCRIBER_MEMBER": "subscriber_id || '|' || member_id",
+    }
 
-        UNION ALL
-        SELECT year, month, status, 'E_only_reason_59',
-               COUNT(DISTINCT policy_id), COUNT(DISTINCT member_id)
-        FROM latest_member
-        WHERE enrollee_event_reason_code = '59'
-        GROUP BY year, month, status
+    dedup_keys = {
+        "MEMBER": "member_id",
+        "POLICY_MEMBER": "policy_id || '|' || member_id",
+        "POLICY_STATUS": "policy_id",
+        "SUBSCRIBER_MEMBER": "subscriber_id || '|' || member_id",
+    }
 
-        UNION ALL
-        SELECT year, month, status, 'F_only_subscriber_Y',
-               COUNT(DISTINCT policy_id), COUNT(DISTINCT member_id)
-        FROM latest_member
-        WHERE subscriber_flag = 'Y'
-        GROUP BY year, month, status
+    all_results = []
 
-        UNION ALL
-        SELECT year, month, status, 'G_exclude_subscriber_Y',
-               COUNT(DISTINCT policy_id), COUNT(DISTINCT member_id)
-        FROM latest_member
-        WHERE IFNULL(subscriber_flag,'') <> 'Y'
-        GROUP BY year, month, status
+    for f_name, f_sql in filters.items():
+        for e_name, e_sql in enrollment_keys.items():
+            for m_name, m_sql in enrollee_keys.items():
+                for d_name, d_sql in dedup_keys.items():
+                    rule = f"FILTER={f_name} | ENROLL={e_name} | ENROLLEE={m_name} | DEDUP={d_name}"
+                    try:
+                        rows = run_rule(
+                            conn,
+                            rule_name=rule,
+                            where_clause=f_sql,
+                            enrollment_key=e_sql,
+                            enrollee_key=m_sql,
+                            dedup_key=d_sql,
+                        )
+                        all_results.extend(score_vs_chandra(rows))
+                    except Exception as ex:
+                        print(f"Rule failed: {rule} -> {ex}")
 
-        UNION ALL
-        SELECT year, month, status, 'H_only_relationship_18',
-               COUNT(DISTINCT policy_id), COUNT(DISTINCT member_id)
-        FROM latest_member
-        WHERE relationship = '18'
-        GROUP BY year, month, status
+    all_results.sort(key=lambda r: (r["total_abs_delta"], r["year"], r["month"], r["status"], r["rule"]))
 
-        UNION ALL
-        SELECT year, month, status, 'I_exclude_relationship_18',
-               COUNT(DISTINCT policy_id), COUNT(DISTINCT member_id)
-        FROM latest_member
-        WHERE IFNULL(relationship,'') <> '18'
-        GROUP BY year, month, status
+    export_csv("01_all_logic_variants_vs_chandra.csv", all_results)
+    print_table("TOP LOGIC MATCHES VS CHANDRA", all_results[:100], limit=100)
 
-        UNION ALL
-        SELECT year, month, status, 'J_only_same_begin_end',
-               COUNT(DISTINCT policy_id), COUNT(DISTINCT member_id)
-        FROM latest_member
-        WHERE benefit_effective_date = benefit_end_date
-        GROUP BY year, month, status
+    return all_results
 
-        UNION ALL
-        SELECT year, month, status, 'K_exclude_same_begin_end',
-               COUNT(DISTINCT policy_id), COUNT(DISTINCT member_id)
-        FROM latest_member
-        WHERE benefit_end_date IS NULL
-           OR benefit_end_date = ''
-           OR benefit_effective_date <> benefit_end_date
-        GROUP BY year, month, status
+def best_rule_per_month_status(all_results):
+    best = {}
+    for r in all_results:
+        key = (r["year"], r["month"], r["status"])
+        if key not in best or r["total_abs_delta"] < best[key]["total_abs_delta"]:
+            best[key] = r
 
-        UNION ALL
-        SELECT year, month, status, 'L_only_null_end_date',
-               COUNT(DISTINCT policy_id), COUNT(DISTINCT member_id)
-        FROM latest_member
-        WHERE benefit_end_date IS NULL OR benefit_end_date = ''
-        GROUP BY year, month, status
+    rows = list(best.values())
+    rows.sort(key=lambda r: (r["year"], r["month"], r["status"]))
+    export_csv("02_best_rule_per_month_status.csv", rows)
+    print_table("BEST RULE PER MONTH/STATUS", rows, limit=100)
+    return rows
 
-        UNION ALL
-        SELECT year, month, status, 'M_exclude_null_end_date',
-               COUNT(DISTINCT policy_id), COUNT(DISTINCT member_id)
-        FROM latest_member
-        WHERE benefit_end_date IS NOT NULL AND benefit_end_date <> ''
-        GROUP BY year, month, status
-
-        UNION ALL
-        SELECT year, month, status, 'N_only_policy_equals_subscriber',
-               COUNT(DISTINCT policy_id), COUNT(DISTINCT member_id)
-        FROM latest_member
-        WHERE policy_id = subscriber_id
-        GROUP BY year, month, status
-
-        UNION ALL
-        SELECT year, month, status, 'O_exclude_policy_equals_subscriber',
-               COUNT(DISTINCT policy_id), COUNT(DISTINCT member_id)
-        FROM latest_member
-        WHERE policy_id <> subscriber_id
-        GROUP BY year, month, status
-    ),
-
-    chandra AS (
-        {chandra_cte()}
-    ),
-
-    scored AS (
-        SELECT
-            r.year,
-            r.month,
-            r.status,
-            r.rule,
-            r.enrollment_count,
-            c.ch_enrollment,
-            r.enrollment_count - c.ch_enrollment AS enrollment_delta,
-            r.enrollee_count,
-            c.ch_enrollee,
-            r.enrollee_count - c.ch_enrollee AS enrollee_delta,
-            ABS(r.enrollment_count - c.ch_enrollment)
-            + ABS(r.enrollee_count - c.ch_enrollee) AS total_delta
-        FROM rules r
-        JOIN chandra c
-          ON r.year = c.year
-         AND r.month = c.month
-         AND r.status = c.status
+def baseline_current_logic(conn):
+    rows = run_rule(
+        conn,
+        rule_name="CURRENT_BASELINE_LATEST_MEMBER_STATUS",
+        where_clause="",
+        enrollment_key="policy_id",
+        enrollee_key="member_id",
+        dedup_key="member_id",
     )
+    scored = score_vs_chandra(rows)
+    export_csv("03_current_baseline_vs_chandra.csv", scored)
+    print_table("CURRENT BASELINE VS CHANDRA", scored, limit=100)
+    return scored
 
-    SELECT *
-    FROM scored
-    ORDER BY year, month, status, total_delta, rule;
-    """
-    cols, rows = run(conn, sql, {"issuer": ISSUER, "year": YEAR})
-    print_table("3. BUSINESS FILTER TESTS VS CHANDRA", cols, rows, limit=250)
-    export_csv("03_business_filter_tests.csv", cols, rows)
-
-
-def identify_month_file_patterns(conn):
-    sql = """
-    SELECT
-        s.year,
-        s.month,
-        s.additional_maint_reason_code AS status,
-        f.file_name,
-        COUNT(*) AS raw_rows,
-        COUNT(DISTINCT s.policy_id) AS policies,
-        COUNT(DISTINCT s.member_id) AS members,
-        MIN(s.member_maint_effective_date) AS min_maint_date,
-        MAX(s.member_maint_effective_date) AS max_maint_date,
-        MIN(s.request_submit_timestamp) AS min_request_ts,
-        MAX(s.request_submit_timestamp) AS max_request_ts
-    FROM stg_834_records s
-    LEFT JOIN raw_file_inventory f
-      ON s.file_id = f.file_id
-    WHERE s.issuer = :issuer
-      AND s.year = :year
-      AND s.month IN ('01','02','03','04','05')
-      AND s.insurance_type_code = 'HLT'
-      AND s.additional_maint_reason_code IN ('CONFIRM','CANCEL','TERM')
-    GROUP BY s.year, s.month, s.additional_maint_reason_code, f.file_name
-    ORDER BY s.year, s.month, status, f.file_name;
-    """
-    cols, rows = run(conn, sql, {"issuer": ISSUER, "year": YEAR})
-    print_table("4. FILE LEVEL PATTERNS", cols, rows, limit=150)
-    export_csv("04_file_level_patterns.csv", cols, rows)
-
-
-def latest_file_only_test(conn):
-    sql = f"""
-    WITH base AS (
-        SELECT
-            s.*,
-            s.additional_maint_reason_code AS status,
-            f.file_name
-        FROM stg_834_records s
-        LEFT JOIN raw_file_inventory f
-          ON s.file_id = f.file_id
-        WHERE s.issuer = :issuer
-          AND s.year = :year
-          AND s.month IN ('01','02','03','04','05')
-          AND s.insurance_type_code = 'HLT'
-          AND s.additional_maint_reason_code IN ('CONFIRM','CANCEL','TERM')
-    ),
-
-    latest_file_by_status AS (
-        SELECT *
-        FROM (
-            SELECT
-                *,
-                DENSE_RANK() OVER (
-                    PARTITION BY year, month, status
-                    ORDER BY file_name DESC
-                ) AS file_rank
-            FROM base
-        )
-        WHERE file_rank = 1
-    ),
-
-    latest_file_then_member AS (
-        SELECT *
-        FROM (
-            SELECT
-                *,
-                ROW_NUMBER() OVER (
-                    PARTITION BY year, month, status, member_id
-                    ORDER BY request_submit_timestamp DESC, member_maint_effective_date DESC, file_id DESC
-                ) AS rn
-            FROM latest_file_by_status
-        )
-        WHERE rn = 1
-    ),
-
-    rules AS (
-        SELECT year, month, status, 'LATEST_FILE_ONLY' AS rule,
-               COUNT(DISTINCT policy_id) AS enrollment_count,
-               COUNT(DISTINCT member_id) AS enrollee_count
-        FROM latest_file_by_status
-        GROUP BY year, month, status
-
-        UNION ALL
-        SELECT year, month, status, 'LATEST_FILE_THEN_MEMBER' AS rule,
-               COUNT(DISTINCT policy_id),
-               COUNT(DISTINCT member_id)
-        FROM latest_file_then_member
-        GROUP BY year, month, status
-    ),
-
-    chandra AS (
-        {chandra_cte()}
+def timeline_duplicate_members(conn):
+    sql = base_view_sql() + """
+    , member_counts AS (
+        SELECT year, month, status, member_id, COUNT(*) AS row_count, COUNT(DISTINCT file_name) AS file_count
+        FROM base
+        WHERE status IS NOT NULL
+          AND member_id IS NOT NULL
+          AND trim(member_id) <> ''
+        GROUP BY year, month, status, member_id
+        HAVING COUNT(*) > 1
     )
-
     SELECT
-        r.year,
-        r.month,
-        r.status,
-        r.rule,
-        r.enrollment_count,
-        c.ch_enrollment,
-        r.enrollment_count - c.ch_enrollment AS enrollment_delta,
-        r.enrollee_count,
-        c.ch_enrollee,
-        r.enrollee_count - c.ch_enrollee AS enrollee_delta,
-        ABS(r.enrollment_count - c.ch_enrollment)
-        + ABS(r.enrollee_count - c.ch_enrollee) AS total_delta
-    FROM rules r
-    JOIN chandra c
-      ON r.year = c.year
-     AND r.month = c.month
-     AND r.status = c.status
-    ORDER BY r.year, r.month, r.status, total_delta;
+        b.year,
+        b.month,
+        b.status,
+        b.policy_id,
+        b.member_id,
+        b.subscriber_id,
+        b.relationship,
+        b.subscriber_flag,
+        b.maintenance_type_code,
+        b.additional_maint_reason_code,
+        b.enrollee_event_type_code,
+        b.enrollee_event_reason_code,
+        b.transaction_classification,
+        b.coverage_status,
+        b.benefit_effective_date,
+        b.benefit_end_date,
+        b.member_maint_effective_date,
+        b.request_submit_timestamp,
+        b.file_name,
+        b.raw_xml_path
+    FROM base b
+    JOIN member_counts mc
+      ON b.year = mc.year
+     AND b.month = mc.month
+     AND b.status = mc.status
+     AND b.member_id = mc.member_id
+    WHERE b.month IN ('02','03','04','05')
+    ORDER BY b.year, b.month, b.status, b.member_id,
+             date(coalesce(b.member_maint_effective_date, b.benefit_effective_date, '1900-01-01')),
+             b.request_submit_timestamp,
+             b.file_name
+    LIMIT 2000
     """
-    cols, rows = run(conn, sql, {"issuer": ISSUER, "year": YEAR})
-    print_table("5. LATEST FILE TESTS VS CHANDRA", cols, rows, limit=120)
-    export_csv("05_latest_file_tests.csv", cols, rows)
-
+    rows = q(conn, sql)
+    export_csv("04_duplicate_member_timeline_sample.csv", rows)
+    print_table("DUPLICATE MEMBER TIMELINE SAMPLE", rows, limit=120)
+    return rows
 
 def suspect_gap_records(conn):
-    sql = """
-    WITH base AS (
-        SELECT
-            s.*,
-            s.additional_maint_reason_code AS status,
-            f.file_name
-        FROM stg_834_records s
-        LEFT JOIN raw_file_inventory f
-          ON s.file_id = f.file_id
-        WHERE s.issuer = :issuer
-          AND s.year = :year
-          AND s.month IN ('02','03')
-          AND s.insurance_type_code = 'HLT'
-          AND s.additional_maint_reason_code IN ('CONFIRM','TERM')
-    ),
-
-    latest_member AS (
-        SELECT *
-        FROM (
-            SELECT
-                *,
-                ROW_NUMBER() OVER (
-                    PARTITION BY year, month, status, member_id
-                    ORDER BY request_submit_timestamp DESC, member_maint_effective_date DESC, file_id DESC
-                ) AS rn
-            FROM base
-        )
-        WHERE rn = 1
-    )
-
+    sql = base_view_sql() + """
     SELECT
         year,
         month,
@@ -549,6 +331,7 @@ def suspect_gap_records(conn):
         relationship,
         subscriber_flag,
         maintenance_type_code,
+        additional_maint_reason_code,
         enrollee_event_type_code,
         enrollee_event_reason_code,
         transaction_classification,
@@ -559,27 +342,201 @@ def suspect_gap_records(conn):
         request_submit_timestamp,
         file_name,
         raw_xml_path
-    FROM latest_member
-    ORDER BY month, status, policy_id, member_id
-    LIMIT 500;
+    FROM base
+    WHERE status IS NOT NULL
+      AND (
+            month IN ('02','03')
+            OR (month='04' AND status IN ('CONFIRM','TERM'))
+            OR (month='05')
+          )
+    ORDER BY year, month, status, policy_id, member_id, request_submit_timestamp, file_name
+    LIMIT 5000
     """
-    cols, rows = run(conn, sql, {"issuer": ISSUER, "year": YEAR})
-    print_table("6. SUSPECT GAP RECORD SAMPLE - FEB/MAR CONFIRM/TERM", cols, rows, limit=100)
-    export_csv("06_suspect_gap_records_feb_mar.csv", cols, rows)
+    rows = q(conn, sql)
+    export_csv("05_suspect_gap_records.csv", rows)
+    print_table("SUSPECT GAP RECORDS SAMPLE", rows, limit=150)
+    return rows
 
+def feature_profile(conn):
+    sql = base_view_sql() + """
+    SELECT
+        year,
+        month,
+        status,
+        maintenance_type_code,
+        additional_maint_reason_code,
+        enrollee_event_type_code,
+        enrollee_event_reason_code,
+        transaction_classification,
+        coverage_status,
+        subscriber_flag,
+        relationship,
+        COUNT(*) AS raw_rows,
+        COUNT(DISTINCT policy_id) AS distinct_policies,
+        COUNT(DISTINCT member_id) AS distinct_members,
+        COUNT(DISTINCT subscriber_id) AS distinct_subscribers,
+        COUNT(DISTINCT health_coverage_policy_no) AS distinct_health_policy_no
+    FROM base
+    WHERE status IS NOT NULL
+    GROUP BY
+        year, month, status,
+        maintenance_type_code,
+        additional_maint_reason_code,
+        enrollee_event_type_code,
+        enrollee_event_reason_code,
+        transaction_classification,
+        coverage_status,
+        subscriber_flag,
+        relationship
+    ORDER BY year, month,
+        CASE status WHEN 'CONFIRM' THEN 1 WHEN 'CANCEL' THEN 2 WHEN 'TERM' THEN 3 ELSE 9 END,
+        raw_rows DESC
+    """
+    rows = q(conn, sql)
+    export_csv("06_feature_profile.csv", rows)
+    print_table("FEATURE PROFILE", rows, limit=150)
+    return rows
+
+def raw_count_grains(conn):
+    sql = base_view_sql() + """
+    SELECT
+        year,
+        month,
+        status,
+        COUNT(*) AS raw_rows,
+        COUNT(DISTINCT policy_id) AS distinct_policy_id,
+        COUNT(DISTINCT member_id) AS distinct_member_id,
+        COUNT(DISTINCT subscriber_id) AS distinct_subscriber_id,
+        COUNT(DISTINCT health_coverage_policy_no) AS distinct_health_coverage_policy_no,
+        COUNT(DISTINCT policy_id || '|' || member_id) AS distinct_policy_member,
+        COUNT(DISTINCT subscriber_id || '|' || member_id) AS distinct_subscriber_member,
+        COUNT(DISTINCT policy_id || '|' || member_id || '|' || coalesce(benefit_effective_date,'')) AS distinct_policy_member_begin,
+        COUNT(DISTINCT policy_id || '|' || member_id || '|' || coalesce(benefit_effective_date,'') || '|' || coalesce(benefit_end_date,'')) AS distinct_policy_member_begin_end
+    FROM base
+    WHERE status IS NOT NULL
+    GROUP BY year, month, status
+    ORDER BY year, month,
+        CASE status WHEN 'CONFIRM' THEN 1 WHEN 'CANCEL' THEN 2 WHEN 'TERM' THEN 3 ELSE 9 END
+    """
+    rows = q(conn, sql)
+    export_csv("07_raw_count_grains.csv", rows)
+    print_table("RAW COUNT GRAINS", rows, limit=100)
+    return rows
+
+def write_cursor_prompt(best_rows):
+    prompt = f"""
+Cursor update request:
+
+We completed the investigation against Chandra reference counts for issuer 15105.
+
+Main finding:
+The data load is not missing rows. XML files are loaded into stg_834_records, and the mismatch is caused by business counting logic: repeated monthly 834 maintenance transactions, member/policy level dedup grain, and possible Chandra-specific filters.
+
+Update enrollment_summary.py so the logic is configurable and auditable.
+
+Required implementation:
+
+1. Keep staging unchanged.
+   - Do not remove rows during load.
+   - All XML transaction rows must remain in stg_834_records.
+
+2. Add configurable enrollment summary strategy:
+   - status source: additional_maint_reason_code first, then transaction_classification fallback.
+   - status values: CONFIRM, CANCEL, TERM.
+   - insurance type default: HLT => Health.
+   - dedup strategy configurable:
+       a. member_id
+       b. policy_id + member_id
+       c. subscriber_id + member_id
+       d. policy_id
+   - enrollment key configurable:
+       a. policy_id
+       b. health_coverage_policy_no
+       c. subscriber_id
+       d. member_id
+       e. policy_id + member_id
+   - enrollee key configurable:
+       a. member_id
+       b. subscriber_id
+       c. policy_id + member_id
+
+3. Add business filters configurable:
+   - only subscriber_flag = Y
+   - only relationship = 18
+   - exclude relationship = 18
+   - only enrollee_event_reason_code = 28
+   - only enrollee_event_reason_code = 59
+   - exclude reason 28
+   - exclude reason 59
+   - require benefit_effective_date month equals reporting month
+   - require request_submit_timestamp month equals reporting month
+   - require benefit_end_date null
+   - exclude policy_id = subscriber_id
+
+4. Dedup ordering:
+   Keep latest row by:
+   - member_maint_effective_date DESC
+   - benefit_effective_date DESC
+   - request_submit_timestamp DESC
+   - file_name DESC
+
+5. Add audit exports:
+   - enrollment_summary_final.xlsx
+   - enrollment_summary_debug.csv
+   - duplicate_member_timeline.csv
+   - chandra_comparison.csv
+   - unmatched_gap_records.csv
+
+6. The system must show:
+   - raw rows before dedup
+   - rows after dedup
+   - distinct policy count
+   - distinct member count
+   - selected rule name
+   - delta vs Chandra reference if provided
+
+7. Do not hardcode Chandra values into production aggregation.
+   Chandra values can only be used in comparison/debug mode.
+
+Best currently tested rules per month/status:
+{best_rows}
+
+Important:
+This update is not because parser/load is wrong. The investigation shows the mismatch is mainly caused by business counting grain and repeated monthly maintenance transactions.
+"""
+    path = OUT_DIR / "08_cursor_update_prompt.txt"
+    path.write_text(prompt, encoding="utf-8")
+    print(f"Cursor prompt exported: {path}")
 
 def main():
     conn = connect()
 
-    monthly_baseline(conn)
-    gap_feature_profile(conn)
-    test_business_filters(conn)
-    identify_month_file_patterns(conn)
-    latest_file_only_test(conn)
+    print("\nFINAL CHANDRA LOGIC INVESTIGATION STARTED")
+    print(f"DB: {DB_PATH.resolve()}")
+
+    baseline_current_logic(conn)
+    feature_profile(conn)
+    raw_count_grains(conn)
+
+    all_results = test_all_logic_variants(conn)
+    best_rows = best_rule_per_month_status(all_results)
+
+    timeline_duplicate_members(conn)
     suspect_gap_records(conn)
+
+    write_cursor_prompt(best_rows)
 
     conn.close()
 
+    print("\nDONE.")
+    print(f"Open this folder: {OUT_DIR.resolve()}")
+    print("\nMost important files:")
+    print("01_all_logic_variants_vs_chandra.csv")
+    print("02_best_rule_per_month_status.csv")
+    print("03_current_baseline_vs_chandra.csv")
+    print("04_duplicate_member_timeline_sample.csv")
+    print("05_suspect_gap_records.csv")
+    print("08_cursor_update_prompt.txt")
 
 if __name__ == "__main__":
     main()
