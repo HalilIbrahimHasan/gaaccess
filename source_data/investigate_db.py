@@ -910,6 +910,25 @@ def test_more_chandra_rules(conn):
     run_query(conn, "17. Test additional Chandra matching rules", sql, {"issuer": ISSUER, "year": YEAR})
 
 
+def show_columns(conn, table_name):
+    print("\n" + "=" * 100)
+    print(f"COLUMNS OF {table_name}")
+    print("=" * 100)
+
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table_name});")
+
+    rows = cur.fetchall()
+
+    print(f"{'No':<5}{'Column Name':<45}{'Type'}")
+    print("-" * 100)
+
+    for row in rows:
+        print(f"{row[0]:<5}{row[1]:<45}{row[2]}")
+
+    print("-" * 100)
+    print(f"Total Columns : {len(rows)}")
+
 def main():
     conn = connect()
     test_more_chandra_rules(conn)
