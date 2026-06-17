@@ -669,11 +669,250 @@ def test_chandra_matching_rules(conn):
 
     run_query(conn, "16. Test possible Chandra matching rules", sql, {"issuer": ISSUER, "year": YEAR})
 
+def test_more_chandra_rules(conn):
+    print_title("17. Test additional Chandra matching rules")
+
+    sql = """
+    WITH base AS (
+        SELECT
+            issuer,
+            year,
+            month,
+            insurance_type_code,
+            additional_maint_reason_code AS status,
+            policy_id,
+            member_id,
+            subscriber_id,
+            relationship,
+            subscriber_flag,
+            maintenance_type_code,
+            enrollee_event_type_code,
+            enrollee_event_reason_code,
+            transaction_classification,
+            member_maint_effective_date,
+            request_submit_timestamp,
+            file_id,
+            CASE
+                WHEN policy_id IS NOT NULL AND policy_id <> '' THEN policy_id
+                ELSE subscriber_id
+            END AS enrollment_key
+        FROM stg_834_records
+        WHERE issuer = :issuer
+          AND year = :year
+          AND month IN ('01','02','03','04','05')
+          AND insurance_type_code = 'HLT'
+          AND additional_maint_reason_code IN ('CONFIRM','CANCEL','TERM')
+    ),
+
+    exact_dedup AS (
+        SELECT DISTINCT
+            year, month, status, policy_id, member_id, subscriber_id,
+            relationship, subscriber_flag, maintenance_type_code,
+            enrollee_event_type_code, enrollee_event_reason_code,
+            transaction_classification,
+            member_maint_effective_date,
+            file_id,
+            enrollment_key
+        FROM base
+    ),
+
+    rule_exact_dedup AS (
+        SELECT
+            year, month, status,
+            'E_exact_distinct_rows' AS rule,
+            COUNT(DISTINCT enrollment_key) AS enrollment_count,
+            COUNT(DISTINCT member_id) AS enrollee_count
+        FROM exact_dedup
+        GROUP BY year, month, status
+    ),
+
+    latest_member_policy_date AS (
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, status, member_id, policy_id, member_maint_effective_date
+                    ORDER BY request_submit_timestamp DESC, file_id DESC
+                ) AS rn
+            FROM exact_dedup
+        )
+        WHERE rn = 1
+    ),
+
+    rule_member_policy_date AS (
+        SELECT
+            year, month, status,
+            'F_latest_member_policy_effective_date' AS rule,
+            COUNT(DISTINCT enrollment_key) AS enrollment_count,
+            COUNT(DISTINCT member_id) AS enrollee_count
+        FROM latest_member_policy_date
+        GROUP BY year, month, status
+    ),
+
+    subscriber_only AS (
+        SELECT *
+        FROM base
+        WHERE subscriber_flag = 'Y'
+    ),
+
+    rule_subscriber_only AS (
+        SELECT
+            year, month, status,
+            'G_subscriber_flag_Y_only' AS rule,
+            COUNT(DISTINCT enrollment_key) AS enrollment_count,
+            COUNT(DISTINCT member_id) AS enrollee_count
+        FROM subscriber_only
+        GROUP BY year, month, status
+    ),
+
+    relationship_18_only AS (
+        SELECT *
+        FROM base
+        WHERE relationship = '18'
+    ),
+
+    rule_relationship_18_only AS (
+        SELECT
+            year, month, status,
+            'H_relationship_18_only' AS rule,
+            COUNT(DISTINCT enrollment_key) AS enrollment_count,
+            COUNT(DISTINCT member_id) AS enrollee_count
+        FROM relationship_18_only
+        GROUP BY year, month, status
+    ),
+
+    latest_policy_subscriber AS (
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, status, policy_id, subscriber_id
+                    ORDER BY member_maint_effective_date DESC, request_submit_timestamp DESC, file_id DESC
+                ) AS rn
+            FROM base
+        )
+        WHERE rn = 1
+    ),
+
+    rule_policy_subscriber AS (
+        SELECT
+            year, month, status,
+            'I_latest_policy_subscriber' AS rule,
+            COUNT(DISTINCT enrollment_key) AS enrollment_count,
+            COUNT(DISTINCT member_id) AS enrollee_count
+        FROM latest_policy_subscriber
+        GROUP BY year, month, status
+    ),
+
+    transaction_classification_based AS (
+        SELECT
+            year,
+            month,
+            CASE
+                WHEN transaction_classification = 'CONFIRMATION' THEN 'CONFIRM'
+                WHEN transaction_classification = 'CANCELLATION' THEN 'CANCEL'
+                WHEN transaction_classification = 'TERMINATION' THEN 'TERM'
+                ELSE status
+            END AS status,
+            enrollment_key,
+            member_id,
+            policy_id,
+            member_maint_effective_date,
+            request_submit_timestamp,
+            file_id
+        FROM base
+        WHERE transaction_classification IN ('CONFIRMATION','CANCELLATION','TERMINATION')
+    ),
+
+    rule_transaction_classification AS (
+        SELECT
+            year, month, status,
+            'J_transaction_classification_based' AS rule,
+            COUNT(DISTINCT enrollment_key) AS enrollment_count,
+            COUNT(DISTINCT member_id) AS enrollee_count
+        FROM transaction_classification_based
+        GROUP BY year, month, status
+    ),
+
+    latest_transaction_classification AS (
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY year, month, status, member_id
+                    ORDER BY member_maint_effective_date DESC, request_submit_timestamp DESC, file_id DESC
+                ) AS rn
+            FROM transaction_classification_based
+        )
+        WHERE rn = 1
+    ),
+
+    rule_latest_transaction_classification AS (
+        SELECT
+            year, month, status,
+            'K_latest_transaction_classification_member' AS rule,
+            COUNT(DISTINCT enrollment_key) AS enrollment_count,
+            COUNT(DISTINCT member_id) AS enrollee_count
+        FROM latest_transaction_classification
+        GROUP BY year, month, status
+    ),
+
+    chandra AS (
+        SELECT '2026' AS year, '01' AS month, 'CONFIRM' AS status, 1240 AS ch_enrollment, 1690 AS ch_enrollee UNION ALL
+        SELECT '2026','01','CANCEL',47,47 UNION ALL
+        SELECT '2026','02','CONFIRM',490,744 UNION ALL
+        SELECT '2026','02','CANCEL',734,709 UNION ALL
+        SELECT '2026','02','TERM',1435,1435 UNION ALL
+        SELECT '2026','03','CONFIRM',453,584 UNION ALL
+        SELECT '2026','03','CANCEL',278,271 UNION ALL
+        SELECT '2026','03','TERM',20,20 UNION ALL
+        SELECT '2026','04','CONFIRM',463,559 UNION ALL
+        SELECT '2026','04','CANCEL',236,233 UNION ALL
+        SELECT '2026','04','TERM',4255,4255 UNION ALL
+        SELECT '2026','05','CONFIRM',340,418 UNION ALL
+        SELECT '2026','05','CANCEL',64,63 UNION ALL
+        SELECT '2026','05','TERM',179,179
+    ),
+
+    all_rules AS (
+        SELECT * FROM rule_exact_dedup
+        UNION ALL SELECT * FROM rule_member_policy_date
+        UNION ALL SELECT * FROM rule_subscriber_only
+        UNION ALL SELECT * FROM rule_relationship_18_only
+        UNION ALL SELECT * FROM rule_policy_subscriber
+        UNION ALL SELECT * FROM rule_transaction_classification
+        UNION ALL SELECT * FROM rule_latest_transaction_classification
+    )
+
+    SELECT
+        r.year,
+        r.month,
+        r.status,
+        r.rule,
+        r.enrollment_count,
+        c.ch_enrollment,
+        r.enrollment_count - c.ch_enrollment AS enrollment_delta,
+        r.enrollee_count,
+        c.ch_enrollee,
+        r.enrollee_count - c.ch_enrollee AS enrollee_delta,
+        ABS(r.enrollment_count - c.ch_enrollment) + ABS(r.enrollee_count - c.ch_enrollee) AS total_delta
+    FROM all_rules r
+    JOIN chandra c
+      ON r.year = c.year
+     AND r.month = c.month
+     AND r.status = c.status
+    ORDER BY r.year, r.month, r.status, total_delta;
+    """
+
+    run_query(conn, "17. Test additional Chandra matching rules", sql, {"issuer": ISSUER, "year": YEAR})
+
+
 def main():
     conn = connect()
-
-    test_chandra_matching_rules(conn)
-
+    test_more_chandra_rules(conn)
     conn.close()
 
 if __name__ == "__main__":
