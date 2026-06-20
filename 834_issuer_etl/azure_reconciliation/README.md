@@ -24,12 +24,14 @@ python run_azure_reconciliation.py --parse-source
 AZURE_SQL_SERVER=your-server.database.windows.net
 AZURE_SQL_DATABASE=your-db
 AZURE_SQL_USERNAME=your-user
-AZURE_SQL_PASSWORD=your-password
-AZURE_SQL_DRIVER=ODBC Driver 18 for SQL Server
+AZURE_SQL_PASSWORD=your-password   # optional — omit for Trusted_Connection
+AZURE_SQL_DRIVER=ODBC Driver 17 for SQL Server
 AZURE_ENROLLMENTS_TABLE=Enrollments_PY2026
 ```
 
 Legacy aliases `SERVER`, `DATABASE`, `USERNAME`, `PASSWORD`, `DRIVER` are also supported.
+
+`PASSWORD` is optional. When empty or missing, the connection uses `Trusted_Connection=yes` (integrated / passwordless auth).
 
 ## Data sources
 

@@ -12,14 +12,13 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import text
 
 from azure_reconciliation.azure_client import (
     _azure_settings,
     azure_configured,
     fetch_enrollments_partition,
-    get_engine,
     list_table_columns,
+    verify_azure_connection,
 )
 from azure_reconciliation.azure_mirror.columns import log_missing_columns
 from azure_reconciliation.azure_mirror.dashboard import (
@@ -94,16 +93,6 @@ def _write_excel_workbook(path: Path, sheets: dict[str, pd.DataFrame]) -> None:
     logger.info("Azure reports written: %s", path)
 
 
-def _test_azure_connection(engine) -> bool:
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        return True
-    except Exception as exc:
-        logger.warning("Azure connection failed, XML reports unchanged — %s", exc)
-        return False
-
-
 def export_azure_mirror_reports(
     *,
     issuer_filter: str | None = None,
@@ -157,21 +146,17 @@ def export_azure_mirror_reports(
 
     if not azure_configured():
         logger.warning(
-            "Azure connection failed, XML reports unchanged — credentials missing in .env"
+            "Azure connection failed, XML reports unchanged — SERVER and DATABASE required"
         )
         return stats
 
-    try:
-        engine = get_engine()
-    except Exception as exc:
-        logger.warning("Azure connection failed, XML reports unchanged — %s", exc)
-        return stats
-
-    if not _test_azure_connection(engine):
+    engine, conn_meta = verify_azure_connection()
+    if engine is None:
+        logger.warning("Azure connection failed, XML reports unchanged")
+        stats["connection"] = conn_meta
         return stats
 
     cfg = _azure_settings()
-    logger.info("Azure connection successful")
     logger.info("Azure query table: %s.%s", cfg["schema"], cfg["table"])
 
     table_columns = list_table_columns(engine, cfg["schema"], cfg["table"])

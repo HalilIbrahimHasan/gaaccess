@@ -13,11 +13,12 @@ from typing import Any
 import pandas as pd
 
 from azure_reconciliation.azure_client import (
+    _azure_settings,
     azure_configured,
     fetch_enrollments_partition,
-    get_engine,
     list_available_tables,
     list_table_columns,
+    verify_azure_connection,
 )
 from azure_reconciliation.column_mapper import build_column_mapping, mapping_report_sheets
 from azure_reconciliation.dashboard import generate_reconciliation_dashboard
@@ -125,18 +126,18 @@ def run_reconciliation(
     engine = None
 
     if stats["azure_available"]:
-        try:
-            engine = get_engine()
+        engine, conn_meta = verify_azure_connection()
+        if engine is None:
+            stats["azure_available"] = False
+            stats["azure_error"] = conn_meta.get("error", "connection failed")
+            stats["connection"] = conn_meta
+        else:
             from azure_reconciliation.azure_client import _azure_settings
 
             cfg = _azure_settings()
             azure_cols = list_table_columns(engine, cfg["schema"], cfg["table"])
             available = list_available_tables(engine, cfg["schema"])
             logger.info("Azure tables available: %s", available[:10])
-        except Exception as exc:
-            logger.error("Azure connection failed: %s", exc)
-            stats["azure_available"] = False
-            stats["azure_error"] = str(exc)
     else:
         logger.warning("Azure not configured — XML-only reports will be generated")
 

@@ -2,6 +2,10 @@
 Read-only Azure SQL access via SQLAlchemy.
 
 Never INSERT/UPDATE/DELETE/ALTER. SELECT only.
+
+Connection modes:
+  - PASSWORD set  → UID + PWD (SQL auth)
+  - PASSWORD empty → Trusted_Connection=yes (integrated / passwordless)
 """
 
 from __future__ import annotations
@@ -14,7 +18,7 @@ import pandas as pd
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
 
-from config.config import PROJECT_ROOT, ENV_FILE
+from config.config import ENV_FILE
 from dotenv import load_dotenv
 from utils.logger import get_logger
 
@@ -24,6 +28,7 @@ load_dotenv(ENV_FILE, override=True)
 
 DEFAULT_ENROLLMENTS_TABLE = "Enrollments_PY2026"
 DEFAULT_SCHEMA = "dbo"
+DEFAULT_DRIVER = "ODBC Driver 17 for SQL Server"
 
 AZURE_TABLE_CANDIDATES = [
     "Enrollments_PY2026",
@@ -43,40 +48,137 @@ AZURE_TABLE_CANDIDATES = [
 ]
 
 
+def _env(key: str, legacy: str = "") -> str:
+    val = os.getenv(key) or os.getenv(legacy) or ""
+    return str(val).strip()
+
+
 def _azure_settings() -> dict[str, str]:
     return {
-        "server": os.getenv("AZURE_SQL_SERVER") or os.getenv("SERVER", ""),
-        "database": os.getenv("AZURE_SQL_DATABASE") or os.getenv("DATABASE", ""),
-        "username": os.getenv("AZURE_SQL_USERNAME") or os.getenv("USERNAME", ""),
-        "password": os.getenv("AZURE_SQL_PASSWORD") or os.getenv("PASSWORD", ""),
-        "driver": os.getenv("AZURE_SQL_DRIVER") or os.getenv("DRIVER", "ODBC Driver 18 for SQL Server"),
+        "server": _env("AZURE_SQL_SERVER", "SERVER"),
+        "database": _env("AZURE_SQL_DATABASE", "DATABASE"),
+        "username": _env("AZURE_SQL_USERNAME", "USERNAME"),
+        "password": _env("AZURE_SQL_PASSWORD", "PASSWORD"),
+        "driver": _env("AZURE_SQL_DRIVER", "DRIVER") or DEFAULT_DRIVER,
         "table": os.getenv("AZURE_ENROLLMENTS_TABLE", DEFAULT_ENROLLMENTS_TABLE),
         "schema": os.getenv("AZURE_SQL_SCHEMA", DEFAULT_SCHEMA),
     }
 
 
-def azure_configured() -> bool:
+def get_connection_meta() -> dict[str, Any]:
+    """Return connection mode diagnostics (no secrets)."""
     cfg = _azure_settings()
-    return bool(cfg["server"] and cfg["database"] and cfg["username"] and cfg["password"])
+    password_present = bool(cfg["password"])
+    return {
+        "password_mode": "password" if password_present else "passwordless",
+        "driver": cfg["driver"],
+        "server": cfg["server"],
+        "database": cfg["database"],
+        "username_present": bool(cfg["username"]),
+        "password_present": password_present,
+    }
 
 
-def build_connection_url() -> str:
+def log_connection_failure(meta: dict[str, Any], exc: Exception | str | None = None) -> None:
+    """Log exact connection mode used when Azure connection fails."""
+    msg = (
+        "Azure connection failed — password_mode=%s driver=%s server=%s database=%s "
+        "username_present=%s password_present=%s"
+    )
+    args = (
+        meta.get("password_mode"),
+        meta.get("driver"),
+        meta.get("server"),
+        meta.get("database"),
+        meta.get("username_present"),
+        meta.get("password_present"),
+    )
+    if exc is not None:
+        logger.warning(msg + " error=%s", *args, exc)
+    else:
+        logger.warning(msg, *args)
+
+
+def azure_configured() -> bool:
+    """True when SERVER and DATABASE are set. PASSWORD is optional."""
+    cfg = _azure_settings()
+    return bool(cfg["server"] and cfg["database"])
+
+
+def build_odbc_connect_string() -> str:
+    """
+    Build pyodbc connection string.
+
+    With PASSWORD: UID + PWD SQL authentication.
+    Without PASSWORD: Trusted_Connection=yes (integrated / passwordless).
+    """
     cfg = _azure_settings()
     if not azure_configured():
         raise RuntimeError(
-            "Azure SQL credentials missing. Set SERVER, DATABASE, USERNAME, PASSWORD in .env"
+            "Azure SQL connection settings missing. Set SERVER and DATABASE in .env"
         )
-    driver = quote_plus(cfg["driver"])
-    conn = (
-        f"mssql+pyodbc://{quote_plus(cfg['username'])}:{quote_plus(cfg['password'])}"
-        f"@{cfg['server']}/{cfg['database']}?driver={driver}"
-        "&TrustServerCertificate=yes"
+
+    driver = cfg["driver"]
+    server = cfg["server"]
+    database = cfg["database"]
+    password = cfg["password"]
+
+    if password:
+        return (
+            f"DRIVER={{{driver}}};"
+            f"SERVER={server};"
+            f"DATABASE={database};"
+            f"UID={cfg['username']};"
+            f"PWD={password};"
+            "Encrypt=yes;"
+            "TrustServerCertificate=yes;"
+        )
+
+    return (
+        f"DRIVER={{{driver}}};"
+        f"SERVER={server};"
+        f"DATABASE={database};"
+        "Trusted_Connection=yes;"
+        "Encrypt=yes;"
+        "TrustServerCertificate=yes;"
     )
-    return conn
+
+
+def build_connection_url() -> str:
+    conn_str = build_odbc_connect_string()
+    return "mssql+pyodbc:///?odbc_connect=" + quote_plus(conn_str)
 
 
 def get_engine() -> Engine:
     return create_engine(build_connection_url(), future=True)
+
+
+def verify_azure_connection() -> tuple[Engine | None, dict[str, Any]]:
+    """
+    Test Azure connectivity. Returns (engine, meta).
+
+    Logs ``Azure connection successful`` on success, or connection mode details on failure.
+    Never raises.
+    """
+    meta = get_connection_meta()
+    if not azure_configured():
+        meta["connected"] = False
+        meta["error"] = "SERVER and DATABASE required"
+        log_connection_failure(meta, meta["error"])
+        return None, meta
+
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        meta["connected"] = True
+        logger.info("Azure connection successful")
+        return engine, meta
+    except Exception as exc:
+        meta["connected"] = False
+        meta["error"] = str(exc)
+        log_connection_failure(meta, exc)
+        return None, meta
 
 
 def list_table_columns(engine: Engine, schema: str, table: str) -> list[str]:
@@ -155,7 +257,6 @@ def fetch_enrollments_partition(
         clauses.append(f"CAST([{year_col}] AS VARCHAR(4)) = :year")
         params["year"] = str(year)
 
-    # Month filter: use date column month extraction when available
     if month_col:
         clauses.append(
             f"(MONTH([{month_col}]) = :month_int OR FORMAT([{month_col}], 'MM') = :month_str)"
