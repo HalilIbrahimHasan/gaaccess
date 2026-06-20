@@ -3,9 +3,7 @@ Read-only Azure SQL access via SQLAlchemy.
 
 Never INSERT/UPDATE/DELETE/ALTER. SELECT only.
 
-Connection modes:
-  - PASSWORD set  → UID + PWD (SQL auth)
-  - PASSWORD empty/missing → passwordless (Trusted_Connection / AAD integrated / MSI)
+Authentication: ActiveDirectoryInteractive (passwordless — no PWD, no Trusted_Connection).
 """
 
 from __future__ import annotations
@@ -26,32 +24,11 @@ logger = get_logger(__name__)
 
 load_dotenv(ENV_FILE, override=True)
 
+AUTH_MODE = "ActiveDirectoryInteractive"
 DEFAULT_ENROLLMENTS_TABLE = "Enrollments_PY2026"
 DEFAULT_SCHEMA = "dbo"
 DEFAULT_DRIVER = "ODBC Driver 17 for SQL Server"
-
-# Placeholder values treated as "no password"
-_PASSWORD_PLACEHOLDERS = frozenset({
-    "",
-    "none",
-    "null",
-    "nil",
-    "n/a",
-    "na",
-    "-",
-    "undefined",
-    "your-password",
-    "your_password",
-    "dummy",
-    "dummy_password",
-    "changeme",
-    "password",
-    "empty",
-})
-
-# Cached working ODBC string after successful verify (passwordless may try several modes)
-_cached_odbc_connect: str | None = None
-_cached_auth_mode: str | None = None
+CONNECTION_TIMEOUT = 30
 
 AZURE_TABLE_CANDIDATES = [
     "Enrollments_PY2026",
@@ -81,19 +58,11 @@ def _env(key: str, legacy: str = "") -> str:
     return str(val).strip().strip('"').strip("'")
 
 
-def _is_real_password(value: str) -> bool:
-    """True only when PASSWORD is a non-empty, non-placeholder value."""
-    cleaned = str(value or "").strip().strip('"').strip("'")
-    return cleaned.lower() not in _PASSWORD_PLACEHOLDERS
-
-
 def _azure_settings() -> dict[str, str]:
-    raw_password = _env("AZURE_SQL_PASSWORD", "PASSWORD")
     return {
         "server": _env("AZURE_SQL_SERVER", "SERVER"),
         "database": _env("AZURE_SQL_DATABASE", "DATABASE"),
         "username": _env("AZURE_SQL_USERNAME", "USERNAME"),
-        "password": raw_password if _is_real_password(raw_password) else "",
         "driver": _env("AZURE_SQL_DRIVER", "DRIVER") or DEFAULT_DRIVER,
         "table": os.getenv("AZURE_ENROLLMENTS_TABLE", DEFAULT_ENROLLMENTS_TABLE),
         "schema": os.getenv("AZURE_SQL_SCHEMA", DEFAULT_SCHEMA),
@@ -101,34 +70,28 @@ def _azure_settings() -> dict[str, str]:
 
 
 def get_connection_meta() -> dict[str, Any]:
-    """Return connection mode diagnostics (no secrets)."""
+    """Return connection diagnostics (no secrets)."""
     cfg = _azure_settings()
-    password_present = bool(cfg["password"])
     return {
-        "password_mode": "password" if password_present else "passwordless",
-        "auth_mode": _cached_auth_mode,
+        "connection_mode": AUTH_MODE,
         "driver": cfg["driver"],
         "server": cfg["server"],
         "database": cfg["database"],
         "username_present": bool(cfg["username"]),
-        "password_present": password_present,
     }
 
 
 def log_connection_failure(meta: dict[str, Any], exc: Exception | str | None = None) -> None:
-    """Log exact connection mode used when Azure connection fails."""
     msg = (
-        "Azure connection failed — password_mode=%s auth_mode=%s driver=%s server=%s "
-        "database=%s username_present=%s password_present=%s"
+        "Azure connection failed — connection_mode=%s driver=%s server=%s "
+        "database=%s username_present=%s"
     )
     args = (
-        meta.get("password_mode"),
-        meta.get("auth_mode"),
+        meta.get("connection_mode"),
         meta.get("driver"),
         meta.get("server"),
         meta.get("database"),
         meta.get("username_present"),
-        meta.get("password_present"),
     )
     if exc is not None:
         logger.warning(msg + " error=%s", *args, exc)
@@ -137,181 +100,70 @@ def log_connection_failure(meta: dict[str, Any], exc: Exception | str | None = N
 
 
 def azure_configured() -> bool:
-    """True when SERVER and DATABASE are set. PASSWORD is never required."""
+    """True when SERVER, DATABASE, and USERNAME are set. PASSWORD is not used."""
     cfg = _azure_settings()
-    return bool(cfg["server"] and cfg["database"])
-
-
-def _encrypt_suffix() -> str:
-    return "Encrypt=yes;TrustServerCertificate=yes;"
-
-
-def _odbc_base(cfg: dict[str, str]) -> str:
-    return (
-        f"DRIVER={{{cfg['driver']}}};"
-        f"SERVER={cfg['server']};"
-        f"DATABASE={cfg['database']};"
-    )
-
-
-def build_password_connect_string(cfg: dict[str, str]) -> str:
-    """SQL authentication with UID + PWD."""
-    return (
-        _odbc_base(cfg)
-        + f"UID={cfg['username']};"
-        + f"PWD={cfg['password']};"
-        + _encrypt_suffix()
-    )
-
-
-def passwordless_connect_candidates(cfg: dict[str, str]) -> list[tuple[str, str]]:
-    """
-    Passwordless ODBC strings to try in order.
-
-    Uses USERNAME/DRIVER when present; never includes PWD.
-    """
-    base = _odbc_base(cfg)
-    enc = _encrypt_suffix()
-    username = cfg.get("username") or ""
-    candidates: list[tuple[str, str]] = []
-
-    # 1) User-specified trusted connection (Windows integrated auth)
-    candidates.append(("trusted_connection", base + "Trusted_Connection=yes;" + enc))
-
-    # 2) Integrated Security SSPI (alias used by some drivers)
-    candidates.append(("integrated_security_sspi", base + "Integrated Security=SSPI;" + enc))
-
-    # 3) Azure AD integrated — with UID when USERNAME is set
-    if username:
-        candidates.append((
-            "active_directory_integrated_uid",
-            base + f"UID={username};Authentication=ActiveDirectoryIntegrated;" + enc,
-        ))
-
-    # 4) Azure AD integrated — current identity
-    candidates.append((
-        "active_directory_integrated",
-        base + "Authentication=ActiveDirectoryIntegrated;" + enc,
-    ))
-
-    # 5) Azure managed identity (no username/password)
-    candidates.append(("active_directory_msi", base + "Authentication=ActiveDirectoryMsi;" + enc))
-
-    # 6) Username only, trusted connection (some on-prem SQL setups)
-    if username:
-        candidates.append((
-            "trusted_connection_uid",
-            base + f"UID={username};Trusted_Connection=yes;" + enc,
-        ))
-
-    return candidates
+    return bool(cfg["server"] and cfg["database"] and cfg["username"])
 
 
 def build_odbc_connect_string() -> str:
     """
-    Build pyodbc connection string.
+    Build ActiveDirectoryInteractive ODBC connection string.
 
-    Returns cached string from a successful verify when available.
+    Pattern:
+        DRIVER={DRIVER};SERVER={SERVER};DATABASE={DATABASE};UID={USERNAME};
+        Authentication=ActiveDirectoryInteractive;Encrypt=yes;
+        TrustServerCertificate=yes;Connection Timeout=30;
     """
-    global _cached_odbc_connect
-    if _cached_odbc_connect:
-        return _cached_odbc_connect
-
     cfg = _azure_settings()
     if not azure_configured():
         raise RuntimeError(
-            "Azure SQL connection settings missing. Set SERVER and DATABASE in .env"
+            "Azure SQL settings missing. Set SERVER, DATABASE, and USERNAME in .env"
         )
 
-    if cfg["password"]:
-        return build_password_connect_string(cfg)
+    return (
+        f"DRIVER={{{cfg['driver']}}};"
+        f"SERVER={cfg['server']};"
+        f"DATABASE={cfg['database']};"
+        f"UID={cfg['username']};"
+        f"Authentication={AUTH_MODE};"
+        "Encrypt=yes;"
+        "TrustServerCertificate=yes;"
+        f"Connection Timeout={CONNECTION_TIMEOUT};"
+    )
 
-    # Default passwordless: first candidate (trusted_connection)
-    return passwordless_connect_candidates(cfg)[0][1]
 
-
-def build_connection_url(conn_str: str | None = None) -> str:
-    conn_str = conn_str or build_odbc_connect_string()
+def build_connection_url() -> str:
+    conn_str = build_odbc_connect_string()
     return "mssql+pyodbc:///?odbc_connect=" + quote_plus(conn_str)
 
 
-def _engine_from_conn_str(conn_str: str) -> Engine:
-    return create_engine(build_connection_url(conn_str), future=True)
-
-
 def get_engine() -> Engine:
-    return _engine_from_conn_str(build_odbc_connect_string())
-
-
-def _try_connect(conn_str: str) -> Engine:
-    engine = _engine_from_conn_str(conn_str)
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
-    return engine
+    return create_engine(build_connection_url(), future=True)
 
 
 def verify_azure_connection() -> tuple[Engine | None, dict[str, Any]]:
     """
-    Test Azure connectivity. Returns (engine, meta).
+    Test Azure connectivity via ActiveDirectoryInteractive.
 
-    Passwordless mode tries multiple auth strategies until one succeeds.
-    Logs ``Azure connection successful`` on success.
-    Never raises.
+    Logs connection mode and success/failure details. Never raises.
     """
-    global _cached_odbc_connect, _cached_auth_mode
-
-    _cached_odbc_connect = None
-    _cached_auth_mode = None
-
     meta = get_connection_meta()
     if not azure_configured():
         meta["connected"] = False
-        meta["error"] = "SERVER and DATABASE required"
+        meta["error"] = "SERVER, DATABASE, and USERNAME required"
         log_connection_failure(meta, meta["error"])
         return None, meta
 
-    cfg = _azure_settings()
-    logger.info(
-        "Azure connecting — password_mode=%s driver=%s server=%s database=%s "
-        "username_present=%s password_present=%s",
-        meta["password_mode"],
-        meta["driver"],
-        meta["server"],
-        meta["database"],
-        meta["username_present"],
-        meta["password_present"],
-    )
+    logger.info("Azure connection mode: %s", AUTH_MODE)
 
     try:
-        if cfg["password"]:
-            conn_str = build_password_connect_string(cfg)
-            engine = _try_connect(conn_str)
-            _cached_odbc_connect = conn_str
-            _cached_auth_mode = "sql_auth"
-        else:
-            last_exc: Exception | None = None
-            engine = None
-            for auth_mode, conn_str in passwordless_connect_candidates(cfg):
-                try:
-                    engine = _try_connect(conn_str)
-                    _cached_odbc_connect = conn_str
-                    _cached_auth_mode = auth_mode
-                    logger.info("Azure passwordless auth succeeded: auth_mode=%s", auth_mode)
-                    break
-                except Exception as exc:
-                    last_exc = exc
-                    logger.debug("Azure auth_mode=%s failed: %s", auth_mode, exc)
-            if engine is None:
-                raise last_exc or RuntimeError("All passwordless auth modes failed")
-
-        meta = get_connection_meta()
+        engine = get_engine()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
         meta["connected"] = True
-        meta["auth_mode"] = _cached_auth_mode
         logger.info("Azure connection successful")
         return engine, meta
-
     except Exception as exc:
-        meta = get_connection_meta()
         meta["connected"] = False
         meta["error"] = str(exc)
         log_connection_failure(meta, exc)

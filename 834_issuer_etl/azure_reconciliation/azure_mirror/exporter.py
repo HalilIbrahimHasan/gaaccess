@@ -146,8 +146,7 @@ def export_azure_mirror_reports(
 
     if not azure_configured():
         logger.warning(
-            "Azure connection failed, XML reports unchanged — set SERVER and DATABASE in .env "
-            "(PASSWORD not required)"
+            "Azure connection failed, XML reports unchanged — set SERVER, DATABASE, and USERNAME in .env"
         )
         return stats
 
