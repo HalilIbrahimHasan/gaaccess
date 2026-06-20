@@ -16,7 +16,6 @@ import pandas as pd
 from azure_reconciliation.azure_client import (
     _azure_settings,
     azure_configured,
-    fetch_enrollments_partition,
     list_table_columns,
     verify_azure_connection,
 )
@@ -26,6 +25,11 @@ from azure_reconciliation.azure_mirror.dashboard import (
     generate_monthly_dashboard,
     generate_rollup_dashboard,
     write_enrollment_summary_html,
+)
+from azure_reconciliation.azure_mirror.diagnostics import (
+    run_issuer_diagnostics,
+    write_no_data_html,
+    write_query_diagnostic_workbook,
 )
 from azure_reconciliation.azure_mirror.kpi_builder import (
     build_enrollment_summary,
@@ -52,7 +56,6 @@ def _azurevs_dirs(issuer: str) -> dict[str, Path]:
 
 
 def _issuers_with_xml_assets() -> set[str]:
-    """Issuers that have existing XML report folders under assets/."""
     root = settings.assets_path
     if not root.exists():
         return set()
@@ -99,11 +102,6 @@ def export_azure_mirror_reports(
     year_filter: str | None = None,
     month_filter: str | None = None,
 ) -> dict[str, Any]:
-    """
-    Generate Azure mirror reports for issuers in source_data that have XML assets.
-
-    Never raises — logs and returns stats. XML pipeline must not depend on this.
-    """
     stats: dict[str, Any] = {
         "azure_available": False,
         "issuers_processed": 0,
@@ -123,9 +121,7 @@ def export_azure_mirror_reports(
     xml_asset_issuers = _issuers_with_xml_assets()
     target_issuers = sorted({p.issuer for p in partitions} & xml_asset_issuers)
     if not target_issuers:
-        logger.info(
-            "No issuers with both source_data and XML assets — skipping Azure mirror"
-        )
+        logger.info("No issuers with both source_data and XML assets — skipping Azure mirror")
         return stats
 
     by_issuer: dict[str, list[Partition]] = {}
@@ -169,38 +165,67 @@ def export_azure_mirror_reports(
         for d in dirs.values():
             d.mkdir(parents=True, exist_ok=True)
 
+        diagnostic_path = dirs["excel"] / f"azure_query_diagnostic_{issuer}.xlsx"
+
+        # --- Diagnostic pass (issuer+year SQL only; month filter in Python) ---
+        diag = run_issuer_diagnostics(
+            engine,
+            issuer=issuer,
+            partitions=issuer_parts,
+            table_columns=table_columns,
+        )
+        write_query_diagnostic_workbook(diagnostic_path, diag["diagnostic_sheets"])
+
+        partition_frames: dict[str, pd.DataFrame] = diag["partition_frames"]
+        month_column = diag["month_column"]
+        total_month_rows = sum(len(df) for df in partition_frames.values())
+
+        stats["partitions_queried"] += len(issuer_parts)
+        stats["azure_rows_total"] += total_month_rows
+
+        if total_month_rows == 0:
+            write_no_data_html(
+                issuer=issuer,
+                partitions=issuer_parts,
+                output_path=dirs["html"] / f"azure_no_data_{issuer}.html",
+                diagnostic_xlsx=diagnostic_path,
+            )
+            _write_excel_workbook(
+                diagnostic_path.parent / f"azure_status_{issuer}.xlsx",
+                {
+                    "status": pd.DataFrame([{
+                        "issuer": issuer,
+                        "message": "No Azure rows returned for issuer/year/month partitions",
+                        "diagnostic_workbook": diagnostic_path.name,
+                        "month_column_used": month_column or "(none)",
+                        "issuer_year_rows": len(diag["combined"]),
+                    }]),
+                },
+            )
+            stats["issuers_processed"] += 1
+            logger.warning(
+                "Azure mirror issuer %s: 0 month-filtered rows — see %s",
+                issuer, diagnostic_path,
+            )
+            continue
+
         monthly_kpi_frames: list[pd.DataFrame] = []
         enrollment_frames: list[pd.DataFrame] = []
         snapshot_frames: list[pd.DataFrame] = []
         prepared_parts: list[pd.DataFrame] = []
 
         for part in issuer_parts:
-            try:
-                df = fetch_enrollments_partition(
-                    engine,
-                    issuer=part.issuer,
-                    year=part.year,
-                    month=part.month,
-                )
-            except Exception as exc:
-                logger.error(
-                    "Azure fetch failed %s/%s/%s: %s",
-                    part.issuer, part.year, part.month, exc,
-                )
-                df = pd.DataFrame()
-
+            df = partition_frames.get(part.label(), pd.DataFrame())
             logger.info(
-                "Azure rows extracted per issuer/year/month: %s/%s/%s = %d",
-                part.issuer, part.year, part.month, len(df),
+                "Azure rows for reports %s/%s/%s = %d (month via %s)",
+                part.issuer, part.year, part.month, len(df), month_column or "none",
             )
-            stats["partitions_queried"] += 1
-            stats["azure_rows_total"] += len(df)
-
             if df.empty:
                 continue
 
             tagged = df.copy()
             tagged["_partition"] = part.label()
+            tagged["_month_source_column"] = month_column or ""
             snapshot_frames.append(tagged)
             prepared_parts.append(
                 prepare_azure_frame(df, issuer=part.issuer, year=part.year, month=part.month)
@@ -228,7 +253,6 @@ def export_azure_mirror_reports(
             pd.concat(snapshot_frames, ignore_index=True)
             if snapshot_frames else pd.DataFrame()
         )
-
         rollup_prepared = (
             pd.concat(prepared_parts, ignore_index=True)
             if prepared_parts else pd.DataFrame()
@@ -241,7 +265,7 @@ def export_azure_mirror_reports(
         )
         _write_excel_workbook(
             dirs["excel"] / f"azure_monthly_kpi_{issuer}.xlsx",
-            {"monthly_kpi": monthly_kpi},
+            {"monthly_kpi": monthly_kpi, "month_source_column": pd.DataFrame([{"column": month_column}])},
         )
         _write_excel_workbook(
             dirs["excel"] / f"azure_rollup_kpi_{issuer}.xlsx",
@@ -290,12 +314,12 @@ def export_azure_mirror_reports(
             output_path=dirs["dashboards"] / f"azure_rollup_kpi_dashboard_{issuer}.html",
         )
 
-        _write_sqlite_snapshot(
-            snapshot_df,
-            dirs["sqlite"] / f"azure_snapshot_{issuer}.sqlite",
-        )
+        _write_sqlite_snapshot(snapshot_df, dirs["sqlite"] / f"azure_snapshot_{issuer}.sqlite")
 
         stats["issuers_processed"] += 1
-        logger.info("Azure mirror reports complete for issuer %s", issuer)
+        logger.info(
+            "Azure mirror reports complete for issuer %s (%d rows, month via %s)",
+            issuer, total_month_rows, month_column,
+        )
 
     return stats
