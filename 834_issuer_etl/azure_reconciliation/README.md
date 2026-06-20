@@ -28,7 +28,9 @@ DRIVER=ODBC Driver 17 for SQL Server
 AZURE_ENROLLMENTS_TABLE=Enrollments_PY2026
 ```
 
-Authentication is **ActiveDirectoryInteractive** (passwordless — no PASSWORD, no Trusted_Connection).
+Optional: `CONNECTION_TIMEOUT=600` (seconds) — increase if the browser sign-in page takes longer (default **300** / 5 minutes).
+
+Authentication is **ActiveDirectoryInteractive** (sign in via browser; no PASSWORD in `.env`).
 
 Legacy `AZURE_SQL_*` aliases for `SERVER`, `DATABASE`, `USERNAME`, and `DRIVER` are also supported.
 

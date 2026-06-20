@@ -28,7 +28,8 @@ AUTH_MODE = "ActiveDirectoryInteractive"
 DEFAULT_ENROLLMENTS_TABLE = "Enrollments_PY2026"
 DEFAULT_SCHEMA = "dbo"
 DEFAULT_DRIVER = "ODBC Driver 17 for SQL Server"
-CONNECTION_TIMEOUT = 30
+# Interactive AAD login needs time for browser sign-in (default 5 minutes)
+DEFAULT_CONNECTION_TIMEOUT = 300
 
 AZURE_TABLE_CANDIDATES = [
     "Enrollments_PY2026",
@@ -58,6 +59,17 @@ def _env(key: str, legacy: str = "") -> str:
     return str(val).strip().strip('"').strip("'")
 
 
+def _connection_timeout() -> int:
+    """Seconds to wait during connect (includes interactive AAD sign-in)."""
+    raw = _env("AZURE_CONNECTION_TIMEOUT", "CONNECTION_TIMEOUT")
+    if raw:
+        try:
+            return max(30, int(raw))
+        except ValueError:
+            logger.warning("Invalid CONNECTION_TIMEOUT=%r — using default %s", raw, DEFAULT_CONNECTION_TIMEOUT)
+    return DEFAULT_CONNECTION_TIMEOUT
+
+
 def _azure_settings() -> dict[str, str]:
     return {
         "server": _env("AZURE_SQL_SERVER", "SERVER"),
@@ -74,6 +86,7 @@ def get_connection_meta() -> dict[str, Any]:
     cfg = _azure_settings()
     return {
         "connection_mode": AUTH_MODE,
+        "connection_timeout": _connection_timeout(),
         "driver": cfg["driver"],
         "server": cfg["server"],
         "database": cfg["database"],
@@ -112,7 +125,7 @@ def build_odbc_connect_string() -> str:
     Pattern:
         DRIVER={DRIVER};SERVER={SERVER};DATABASE={DATABASE};UID={USERNAME};
         Authentication=ActiveDirectoryInteractive;Encrypt=yes;
-        TrustServerCertificate=yes;Connection Timeout=30;
+        TrustServerCertificate=yes;Connection Timeout=<seconds>;
     """
     cfg = _azure_settings()
     if not azure_configured():
@@ -120,6 +133,7 @@ def build_odbc_connect_string() -> str:
             "Azure SQL settings missing. Set SERVER, DATABASE, and USERNAME in .env"
         )
 
+    timeout = _connection_timeout()
     return (
         f"DRIVER={{{cfg['driver']}}};"
         f"SERVER={cfg['server']};"
@@ -128,7 +142,7 @@ def build_odbc_connect_string() -> str:
         f"Authentication={AUTH_MODE};"
         "Encrypt=yes;"
         "TrustServerCertificate=yes;"
-        f"Connection Timeout={CONNECTION_TIMEOUT};"
+        f"Connection Timeout={timeout};"
     )
 
 
@@ -155,6 +169,10 @@ def verify_azure_connection() -> tuple[Engine | None, dict[str, Any]]:
         return None, meta
 
     logger.info("Azure connection mode: %s", AUTH_MODE)
+    logger.info(
+        "Azure connection timeout: %s seconds (complete browser sign-in within this window)",
+        meta.get("connection_timeout", _connection_timeout()),
+    )
 
     try:
         engine = get_engine()
