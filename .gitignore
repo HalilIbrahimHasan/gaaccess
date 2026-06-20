@@ -33,6 +33,7 @@ build/
 834_issuer_etl/extracted/
 834_issuer_etl/data/
 834_issuer_etl/logs/
+834_issuer_etl/outputs/
 **/assets/**
 
 # Python cache (never commit)
