@@ -1,4 +1,4 @@
-"""Azure query helpers for mirror reports (issuer/year only — no SQL month filter)."""
+"""Azure query helpers — issuer/year SQL fetch + active-coverage month mapping."""
 
 from __future__ import annotations
 
@@ -13,17 +13,12 @@ from azure_reconciliation.azure_client import (
     _pick_filter_column,
     list_table_columns,
 )
+from azure_reconciliation.azure_mirror.columns import resolve_column
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-MONTH_SOURCE_PRIORITY: list[str] = [
-    "GAA_Load_Date",
-    "enrollment_last_update_date",
-    "enrollee_last_update_date",
-    "enrollment_create_date",
-    "benefit_effective_date",
-]
+MONTH_MAPPING_METHOD = "benefit_effective_date / benefit_end_date active coverage"
 
 DIAGNOSTIC_DATE_COLUMNS: list[str] = [
     "GAA_Load_Date",
@@ -37,6 +32,15 @@ DIAGNOSTIC_DATE_COLUMNS: list[str] = [
 
 def _table_ref(schema: str, table: str) -> str:
     return f"[{schema}].[{table}]"
+
+
+def month_window(year: str, month: str) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """First and last calendar day of a discovered source_data month."""
+    y = int(year)
+    m = int(str(month).lstrip("0") or "0") or int(month)
+    start = pd.Timestamp(year=y, month=m, day=1)
+    end = start + pd.offsets.MonthEnd(0)
+    return start, end
 
 
 def build_issuer_year_sql(
@@ -96,55 +100,99 @@ def fetch_enrollments_issuer_year(
         df = pd.read_sql(text(sql), conn, params=params)
 
     logger.info(
-        "Azure raw row count returned: %d (issuer=%s year=%s)",
+        "Azure issuer/year base row count: %d (issuer=%s year=%s)",
         len(df), issuer, year,
     )
     return df, sql, params, full_table
 
 
-def resolve_month_source_column(
-    columns: list[str],
-    sample_df: pd.DataFrame | None = None,
-) -> str | None:
-    """Pick best month source: first priority column present with non-null data."""
-    from azure_reconciliation.azure_mirror.columns import resolve_column
-
-    for canonical in MONTH_SOURCE_PRIORITY:
-        actual = resolve_column(columns, canonical)
-        if not actual:
-            continue
-        if sample_df is not None and not sample_df.empty and actual in sample_df.columns:
-            non_null = pd.to_datetime(sample_df[actual], errors="coerce").notna().sum()
-            if non_null == 0:
-                continue
-        return canonical
-    return None
+def count_missing_benefit_dates(df: pd.DataFrame) -> int:
+    """Rows missing benefit_effective_date and/or benefit_end_date."""
+    if df.empty:
+        return 0
+    eff_col = resolve_column(list(df.columns), "benefit_effective_date")
+    end_col = resolve_column(list(df.columns), "benefit_end_date")
+    if not eff_col or not end_col:
+        return len(df)
+    eff = pd.to_datetime(df[eff_col], errors="coerce")
+    end = pd.to_datetime(df[end_col], errors="coerce")
+    return int((eff.isna() | end.isna()).sum())
 
 
-def filter_by_month(
+def filter_by_active_coverage(
     df: pd.DataFrame,
     *,
     year: str,
     month: str,
-    month_column_canonical: str,
-) -> pd.DataFrame:
-    """Filter issuer+year dataframe to rows matching calendar month on date column."""
+) -> tuple[pd.DataFrame, str]:
+    """
+    Map Azure rows to a source_data month using active coverage window.
+
+    Row is active in month when:
+      benefit_effective_date <= month_end
+      AND benefit_end_date >= month_start
+
+    Rows missing benefit dates are included in every month (coverage_year fallback).
+    """
     if df.empty:
-        return df
+        return df, MONTH_MAPPING_METHOD
 
-    from azure_reconciliation.azure_mirror.columns import resolve_column
+    eff_col = resolve_column(list(df.columns), "benefit_effective_date")
+    end_col = resolve_column(list(df.columns), "benefit_end_date")
+    month_start, month_end = month_window(year, month)
 
-    actual = resolve_column(list(df.columns), month_column_canonical)
-    if not actual:
-        return pd.DataFrame()
-
-    dates = pd.to_datetime(df[actual], errors="coerce")
-    target_month = int(str(month).lstrip("0") or "0") or int(month)
-    mask = dates.dt.month == target_month
-    filtered = df.loc[mask].copy()
-    if filtered.empty:
+    if not eff_col or not end_col:
         logger.warning(
-            "Month filter via %s returned 0 rows for %s/%s (base rows=%d)",
-            month_column_canonical, year, month, len(df),
+            "Missing benefit date columns; using coverage_year fallback for %s/%s.",
+            year, month,
         )
-    return filtered
+        return df.copy(), "coverage_year_fallback (missing date columns)"
+
+    eff = pd.to_datetime(df[eff_col], errors="coerce")
+    end = pd.to_datetime(df[end_col], errors="coerce")
+    missing = eff.isna() | end.isna()
+
+    if missing.any():
+        logger.warning(
+            "Missing benefit dates; using coverage_year fallback for %d row(s) in %s/%s.",
+            int(missing.sum()), year, month,
+        )
+
+    active = (eff <= month_end) & (end >= month_start)
+    mask = active | missing
+    filtered = df.loc[mask].copy()
+    method = MONTH_MAPPING_METHOD
+    if missing.any():
+        method = f"{MONTH_MAPPING_METHOD} + coverage_year fallback ({int(missing.sum())} rows)"
+    return filtered, method
+
+
+def map_partitions_active_coverage(
+    year_data: dict[str, pd.DataFrame],
+    partitions: list,
+) -> tuple[dict[str, pd.DataFrame], pd.DataFrame, int]:
+    """Build partition frames and active-rows-per-month summary."""
+    partition_frames: dict[str, pd.DataFrame] = {}
+    summary_rows: list[dict[str, Any]] = []
+    missing_total = 0
+
+    for part in partitions:
+        base = year_data.get(part.year, pd.DataFrame())
+        missing_total += count_missing_benefit_dates(base)
+        filtered, method = filter_by_active_coverage(
+            base, year=part.year, month=part.month
+        )
+        partition_frames[part.label()] = filtered
+        ms, me = month_window(part.year, part.month)
+        summary_rows.append({
+            "issuer": part.issuer,
+            "year": part.year,
+            "month": str(part.month).zfill(2),
+            "base_row_count": len(base),
+            "active_row_count": len(filtered),
+            "month_mapping_method": method,
+            "month_start": str(ms.date()),
+            "month_end": str(me.date()),
+        })
+
+    return partition_frames, pd.DataFrame(summary_rows), missing_total

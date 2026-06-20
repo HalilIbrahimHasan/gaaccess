@@ -96,6 +96,34 @@ def _write_excel_workbook(path: Path, sheets: dict[str, pd.DataFrame]) -> None:
     logger.info("Azure reports written: %s", path)
 
 
+def _rollup_from_base_and_monthly(
+    combined_base: pd.DataFrame,
+    monthly_kpi: pd.DataFrame,
+    issuer: str,
+) -> dict[str, pd.DataFrame]:
+    """Rollup totals from deduplicated issuer/year base; month trend from monthly KPI."""
+    if combined_base.empty:
+        return build_rollup_summary(pd.DataFrame())
+
+    year_col = combined_base.get("coverage_year")
+    first_year = str(year_col.iloc[0]) if year_col is not None and len(year_col) else "2026"
+    rollup_base = prepare_azure_frame(
+        combined_base, issuer=issuer, year=first_year, month="01"
+    )
+    rollup = build_rollup_summary(rollup_base)
+
+    if not monthly_kpi.empty:
+        trend = monthly_kpi.groupby(["year", "month"], dropna=False).agg({
+            "enrollment_count": "sum",
+            "enrollee_count": "sum",
+            "gross_premium_total": "sum",
+            "net_premium_total": "sum",
+        }).reset_index()
+        rollup["month_trend"] = trend.sort_values(["year", "month"])
+
+    return rollup
+
+
 def export_azure_mirror_reports(
     *,
     issuer_filter: str | None = None,
@@ -130,15 +158,6 @@ def export_azure_mirror_reports(
             by_issuer.setdefault(p.issuer, []).append(p)
 
     logger.info("source_data discovered issuers (with XML assets): %s", target_issuers)
-    for issuer, parts in by_issuer.items():
-        months_by_year: dict[str, list[str]] = {}
-        for p in parts:
-            months_by_year.setdefault(p.year, []).append(p.month)
-        logger.info(
-            "source_data discovered years/months for issuer %s: %s",
-            issuer,
-            {y: sorted(set(ms)) for y, ms in months_by_year.items()},
-        )
 
     if not azure_configured():
         logger.warning(
@@ -167,7 +186,6 @@ def export_azure_mirror_reports(
 
         diagnostic_path = dirs["excel"] / f"azure_query_diagnostic_{issuer}.xlsx"
 
-        # --- Diagnostic pass (issuer+year SQL only; month filter in Python) ---
         diag = run_issuer_diagnostics(
             engine,
             issuer=issuer,
@@ -176,60 +194,81 @@ def export_azure_mirror_reports(
         )
         write_query_diagnostic_workbook(diagnostic_path, diag["diagnostic_sheets"])
 
-        partition_frames: dict[str, pd.DataFrame] = diag["partition_frames"]
-        month_column = diag["month_column"]
-        total_month_rows = sum(len(df) for df in partition_frames.values())
+        partition_frames = diag["partition_frames"]
+        mapping_method = diag["month_mapping_method"]
+        base_row_total = diag["base_row_total"]
+        active_row_total = diag["active_row_total"]
 
         stats["partitions_queried"] += len(issuer_parts)
-        stats["azure_rows_total"] += total_month_rows
+        stats["azure_rows_total"] += active_row_total
 
-        if total_month_rows == 0:
+        if base_row_total == 0:
+            reason = (
+                "No Azure rows for issuer/coverage_year. "
+                "Check hios_issuer_id and coverage_year in diagnostic raw_sample."
+            )
             write_no_data_html(
                 issuer=issuer,
                 partitions=issuer_parts,
                 output_path=dirs["html"] / f"azure_no_data_{issuer}.html",
                 diagnostic_xlsx=diagnostic_path,
+                reason=reason,
+                base_row_count=0,
             )
             _write_excel_workbook(
-                diagnostic_path.parent / f"azure_status_{issuer}.xlsx",
-                {
-                    "status": pd.DataFrame([{
-                        "issuer": issuer,
-                        "message": "No Azure rows returned for issuer/year/month partitions",
-                        "diagnostic_workbook": diagnostic_path.name,
-                        "month_column_used": month_column or "(none)",
-                        "issuer_year_rows": len(diag["combined"]),
-                    }]),
-                },
+                dirs["excel"] / f"azure_status_{issuer}.xlsx",
+                {"status": pd.DataFrame([{"issuer": issuer, "message": reason}])},
+            )
+            stats["issuers_processed"] += 1
+            continue
+
+        if active_row_total == 0:
+            reason = (
+                "Azure issuer/year base rows exist but active-coverage mapping returned 0 rows. "
+                "Check benefit_effective_date and benefit_end_date in date_min_max — "
+                "ranges may not overlap discovered source_data months."
+            )
+            write_no_data_html(
+                issuer=issuer,
+                partitions=issuer_parts,
+                output_path=dirs["html"] / f"azure_no_data_{issuer}.html",
+                diagnostic_xlsx=diagnostic_path,
+                reason=reason,
+                base_row_count=base_row_total,
+            )
+            _write_excel_workbook(
+                dirs["excel"] / f"azure_status_{issuer}.xlsx",
+                {"status": pd.DataFrame([{
+                    "issuer": issuer,
+                    "message": reason,
+                    "base_row_count": base_row_total,
+                    "month_mapping_method": mapping_method,
+                }])},
             )
             stats["issuers_processed"] += 1
             logger.warning(
-                "Azure mirror issuer %s: 0 month-filtered rows — see %s",
-                issuer, diagnostic_path,
+                "Azure mirror issuer %s: base=%d active=0 — see %s",
+                issuer, base_row_total, diagnostic_path,
             )
             continue
 
         monthly_kpi_frames: list[pd.DataFrame] = []
         enrollment_frames: list[pd.DataFrame] = []
         snapshot_frames: list[pd.DataFrame] = []
-        prepared_parts: list[pd.DataFrame] = []
 
         for part in issuer_parts:
             df = partition_frames.get(part.label(), pd.DataFrame())
             logger.info(
-                "Azure rows for reports %s/%s/%s = %d (month via %s)",
-                part.issuer, part.year, part.month, len(df), month_column or "none",
+                "Azure active rows for reports %s/%s/%s = %d (mapping: %s)",
+                part.issuer, part.year, part.month, len(df), mapping_method,
             )
             if df.empty:
                 continue
 
             tagged = df.copy()
             tagged["_partition"] = part.label()
-            tagged["_month_source_column"] = month_column or ""
+            tagged["_month_mapping_method"] = mapping_method
             snapshot_frames.append(tagged)
-            prepared_parts.append(
-                prepare_azure_frame(df, issuer=part.issuer, year=part.year, month=part.month)
-            )
             monthly_kpi_frames.append(
                 build_monthly_kpi_by_insurance_type(
                     df, issuer=part.issuer, year=part.year, month=part.month
@@ -253,73 +292,79 @@ def export_azure_mirror_reports(
             pd.concat(snapshot_frames, ignore_index=True)
             if snapshot_frames else pd.DataFrame()
         )
-        rollup_prepared = (
-            pd.concat(prepared_parts, ignore_index=True)
-            if prepared_parts else pd.DataFrame()
-        )
-        rollup = build_rollup_summary(rollup_prepared)
+
+        rollup = _rollup_from_base_and_monthly(diag["combined"], monthly_kpi, issuer)
+
+        report_paths = {
+            "enrollment_summary_xlsx": dirs["excel"] / f"azure_enrollment_summary_{issuer}.xlsx",
+            "monthly_kpi_xlsx": dirs["excel"] / f"azure_monthly_kpi_{issuer}.xlsx",
+            "rollup_kpi_xlsx": dirs["excel"] / f"azure_rollup_kpi_{issuer}.xlsx",
+            "monthly_summary_xlsx": dirs["excel"] / f"azure_monthly_summary_{issuer}.xlsx",
+            "rollup_summary_xlsx": dirs["excel"] / f"azure_rollup_summary_{issuer}.xlsx",
+            "enrollment_summary_html": dirs["html"] / f"azure_enrollment_summary_{issuer}.html",
+            "sqlite": dirs["sqlite"] / f"azure_snapshot_{issuer}.sqlite",
+        }
 
         _write_excel_workbook(
-            dirs["excel"] / f"azure_enrollment_summary_{issuer}.xlsx",
+            report_paths["enrollment_summary_xlsx"],
             {"enrollment_summary": enrollment_summary},
         )
         _write_excel_workbook(
-            dirs["excel"] / f"azure_monthly_kpi_{issuer}.xlsx",
-            {"monthly_kpi": monthly_kpi, "month_source_column": pd.DataFrame([{"column": month_column}])},
-        )
-        _write_excel_workbook(
-            dirs["excel"] / f"azure_rollup_kpi_{issuer}.xlsx",
+            report_paths["monthly_kpi_xlsx"],
             {
-                "issuer_totals": rollup["issuer_totals"],
-                "year_totals": rollup["year_totals"],
-                "insurance_type_totals": rollup["insurance_type_totals"],
-                "status_totals": rollup["status_totals"],
-                "month_trend": rollup["month_trend"],
-                "premium_totals": rollup["premium_totals"],
+                "monthly_kpi": monthly_kpi,
+                "month_mapping": pd.DataFrame([{"method": mapping_method}]),
             },
         )
+        _write_excel_workbook(report_paths["rollup_kpi_xlsx"], {
+            "issuer_totals": rollup["issuer_totals"],
+            "year_totals": rollup["year_totals"],
+            "insurance_type_totals": rollup["insurance_type_totals"],
+            "status_totals": rollup["status_totals"],
+            "month_trend": rollup["month_trend"],
+            "premium_totals": rollup["premium_totals"],
+        })
         _write_excel_workbook(
-            dirs["excel"] / f"azure_monthly_summary_{issuer}.xlsx",
+            report_paths["monthly_summary_xlsx"],
             {"monthly_kpi": monthly_kpi, "enrollment_summary": enrollment_summary},
         )
-        _write_excel_workbook(
-            dirs["excel"] / f"azure_rollup_summary_{issuer}.xlsx",
-            rollup,
-        )
+        _write_excel_workbook(report_paths["rollup_summary_xlsx"], rollup)
 
         write_enrollment_summary_html(
             enrollment_summary,
             issuer=issuer,
-            output_path=dirs["html"] / f"azure_enrollment_summary_{issuer}.html",
+            output_path=report_paths["enrollment_summary_html"],
         )
 
+        dash_paths = {
+            "monthly": dirs["dashboards"] / f"azure_monthly_dashboard_{issuer}.html",
+            "rollup": dirs["dashboards"] / f"azure_rollup_dashboard_{issuer}.html",
+            "kpi": dirs["dashboards"] / f"azure_kpi_dashboard_{issuer}.html",
+            "monthly_kpi": dirs["dashboards"] / f"azure_monthly_kpi_dashboard_{issuer}.html",
+            "rollup_kpi": dirs["dashboards"] / f"azure_rollup_kpi_dashboard_{issuer}.html",
+        }
+
         generate_monthly_dashboard(
-            monthly_kpi, enrollment_summary, issuer=issuer,
-            output_path=dirs["dashboards"] / f"azure_monthly_dashboard_{issuer}.html",
+            monthly_kpi, enrollment_summary, issuer=issuer, output_path=dash_paths["monthly"],
         )
-        generate_rollup_dashboard(
-            rollup, issuer=issuer,
-            output_path=dirs["dashboards"] / f"azure_rollup_dashboard_{issuer}.html",
-        )
+        generate_rollup_dashboard(rollup, issuer=issuer, output_path=dash_paths["rollup"])
         generate_kpi_dashboard(
-            monthly_kpi, rollup, issuer=issuer,
-            output_path=dirs["dashboards"] / f"azure_kpi_dashboard_{issuer}.html",
+            monthly_kpi, rollup, issuer=issuer, output_path=dash_paths["kpi"],
         )
         generate_monthly_dashboard(
-            monthly_kpi, enrollment_summary, issuer=issuer,
-            output_path=dirs["dashboards"] / f"azure_monthly_kpi_dashboard_{issuer}.html",
+            monthly_kpi, enrollment_summary, issuer=issuer, output_path=dash_paths["monthly_kpi"],
         )
-        generate_rollup_dashboard(
-            rollup, issuer=issuer,
-            output_path=dirs["dashboards"] / f"azure_rollup_kpi_dashboard_{issuer}.html",
-        )
+        generate_rollup_dashboard(rollup, issuer=issuer, output_path=dash_paths["rollup_kpi"])
 
-        _write_sqlite_snapshot(snapshot_df, dirs["sqlite"] / f"azure_snapshot_{issuer}.sqlite")
+        _write_sqlite_snapshot(snapshot_df, report_paths["sqlite"])
 
         stats["issuers_processed"] += 1
+        logger.info("Azure reports written under: %s", dirs["base"])
+        for label, path in {**report_paths, **dash_paths, "diagnostic": diagnostic_path}.items():
+            logger.info("  %s: %s", label, path)
         logger.info(
-            "Azure mirror reports complete for issuer %s (%d rows, month via %s)",
-            issuer, total_month_rows, month_column,
+            "Azure mirror complete issuer %s — base=%d active_mapped=%d method=%s",
+            issuer, base_row_total, active_row_total, mapping_method,
         )
 
     return stats
