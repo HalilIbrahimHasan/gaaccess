@@ -50,6 +50,27 @@ All under `outputs/reconciliation/`:
 | Dashboard | `dashboards/reconciliation_dashboard.html` |
 | SQLite | `sqlite/reconciliation.db` |
 
+## Azure mirror reports (assets/)
+
+After each XML assets export, Azure mirror reports are written under:
+
+```
+assets/{issuer}/azurevs/
+  excel/     azure_enrollment_summary_{issuer}.xlsx, azure_monthly_kpi_{issuer}.xlsx, ...
+  html/      azure_enrollment_summary_{issuer}.html
+  dashboards/ azure_monthly_kpi_dashboard_{issuer}.html, azure_rollup_kpi_dashboard_{issuer}.html, ...
+  sqlite/    azure_snapshot_{issuer}.sqlite
+```
+
+Standalone:
+
+```bash
+python run_azure_mirror.py
+python run_azure_mirror.py --issuer 13535
+```
+
+If Azure connection fails, XML reports are unchanged.
+
 SQLite tables: `xml_snapshot`, `azure_snapshot`, `comparison_detail`, `comparison_summary`, `issuer_month_summary`
 
 ## Architecture

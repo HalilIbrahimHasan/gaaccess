@@ -333,4 +333,13 @@ def export_assets(db_conn, issuer: str | None = None) -> dict[str, int]:
         rollups += 1
         logger.info("Rollup assets exported: %s", iid)
 
+    # Azure mirror reports (extension — never breaks XML export)
+    try:
+        from azure_reconciliation.azure_mirror.exporter import export_azure_mirror_reports
+
+        azure_stats = export_azure_mirror_reports(issuer_filter=issuer)
+        logger.info("Azure mirror export stats: %s", azure_stats)
+    except Exception as exc:
+        logger.warning("Azure mirror reports skipped — %s", exc)
+
     return {"partitions": partitions, "rollups": rollups}
