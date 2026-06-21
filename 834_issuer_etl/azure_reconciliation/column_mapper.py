@@ -17,7 +17,7 @@ import pandas as pd
 CANONICAL_FIELDS: dict[str, dict[str, list[str]]] = {
     "issuer": {
         "xml": ["issuer", "issuer_id", "hios_issuer_id", "gaa_hios_id"],
-        "azure": ["hios_issuer_id", "issuer_id", "hios_id", "carrier_id", "issuer"],
+        "azure": ["hios_issuer_id", "GAA_HIOS_ID", "issuer_id", "hios_id", "carrier_id", "issuer"],
     },
     "enrollment_id": {
         "xml": [
@@ -26,7 +26,10 @@ CANONICAL_FIELDS: dict[str, dict[str, list[str]]] = {
             "enrollment_id",
             "exchange_assigned_policy_id",
         ],
-        "azure": ["enrollment_id", "policy_id", "exchange_assigned_policy_id"],
+        "azure": [
+            "enrollment_id", "policy_id", "exchgAssignedPolicyID",
+            "exchg_assigned_policy_id", "exchange_assigned_policy_id",
+        ],
     },
     "enrollee_id": {
         "xml": [
@@ -35,7 +38,10 @@ CANONICAL_FIELDS: dict[str, dict[str, list[str]]] = {
             "exchg_assigned_enrollee_id",
             "enrollee_id",
         ],
-        "azure": ["enrollee_id", "member_id", "exchange_member_id", "exchange_enrollee_id"],
+        "azure": [
+            "enrollee_id", "member_id", "exchgIndivIdentifier",
+            "exchg_indiv_identifier", "exchange_member_id", "exchange_enrollee_id",
+        ],
     },
     "subscriber_id": {
         "xml": ["subscriber_id", "exchg_subscriber_identifier"],
@@ -59,9 +65,13 @@ CANONICAL_FIELDS: dict[str, dict[str, list[str]]] = {
         "azure": [
             "enrollment_status_description",
             "enrollee_status_description",
+            "enrolleeStatus",
             "enrollment_status",
             "enrollee_status",
+            "actionCode",
+            "action_code",
             "status_description",
+            "status",
         ],
     },
     "maintenance_type_code": {

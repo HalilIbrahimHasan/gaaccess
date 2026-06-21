@@ -103,6 +103,79 @@ class Settings:
     keep_compressed: bool = field(
         default_factory=lambda: os.getenv("KEEP_COMPRESSED", "false").lower() == "true"
     )
+    # Azure intelligence (additive — XML pipeline unchanged when disabled)
+    azure_enabled: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_AZURE", "false").lower() == "true"
+    )
+    azure_reconciliation_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "ENABLE_AZURE_RECONCILIATION", "false"
+        ).lower() == "true"
+    )
+    azure_mirror_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "ENABLE_AZURE_MIRROR", "true"
+        ).lower() == "true"
+    )
+    azure_discovery_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "ENABLE_AZURE_DISCOVERY", "true"
+        ).lower() == "true"
+    )
+    azure_lifecycle_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "ENABLE_AZURE_LIFECYCLE", "true"
+        ).lower() == "true"
+    )
+    xml_lifecycle_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "ENABLE_XML_LIFECYCLE", "true"
+        ).lower() == "true"
+    )
+    metadata_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "ENABLE_METADATA", "true"
+        ).lower() == "true"
+    )
+    business_dashboard_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "ENABLE_BUSINESS_DASHBOARD", "true"
+        ).lower() == "true"
+    )
+    sqlite_output_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "ENABLE_SQLITE_OUTPUT", "true"
+        ).lower() == "true"
+    )
+    excel_output_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "ENABLE_EXCEL_OUTPUT", "true"
+        ).lower() == "true"
+    )
+    html_output_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "ENABLE_HTML_OUTPUT", "true"
+        ).lower() == "true"
+    )
+    outputs_path: Path = field(
+        default_factory=lambda: _path("OUTPUTS_PATH", "outputs")
+    )
+
+    @property
+    def azure_discovery_output_path(self) -> Path:
+        return self.outputs_path / "azure_discovery"
+
+    @property
+    def azure_reconciliation_output_path(self) -> Path:
+        return self.outputs_path / "reconciliation"
+
+    @property
+    def metadata_output_path(self) -> Path:
+        return self.outputs_path / "metadata"
+
+    @property
+    def dashboard_output_path(self) -> Path:
+        return self.outputs_path / "dashboard"
 
     def reference_row_counts(self) -> dict[str, int]:
         raw = os.getenv("REFERENCE_ROW_COUNTS", "")
@@ -138,6 +211,18 @@ class Settings:
             self.reports_path / "validation",
             self.reports_path / "kpi",
             self.assets_path,
+            self.outputs_path,
+            self.azure_discovery_output_path,
+            self.azure_reconciliation_output_path,
+            self.metadata_output_path,
+            self.dashboard_output_path,
+            self.outputs_path / "excel",
+            self.outputs_path / "sqlite",
+            self.outputs_path / "reports",
+            self.azure_reconciliation_output_path / "excel",
+            self.azure_reconciliation_output_path / "dashboards",
+            self.azure_reconciliation_output_path / "sqlite",
+            self.azure_reconciliation_output_path / "reports",
         ):
             p.mkdir(parents=True, exist_ok=True)
 

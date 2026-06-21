@@ -28,7 +28,7 @@ from azure_reconciliation.azure_mirror.discovery.xml_reference import (
     load_xml_summaries,
     xml_monthly_totals,
 )
-from azure_reconciliation.partition_discovery import Partition, discover_partitions
+from azure_reconciliation.discovery_store import publish_discovery_outputs
 from config.config import settings
 from utils.logger import get_logger
 
@@ -233,6 +233,17 @@ def run_azure_logic_discovery(
     html_path = out_dir / f"azure_event_candidate_summary_{issuer}.html"
     _write_html_summary(html_path, issuer, scores_df, recommendation, xml_totals, all_strategies)
 
+    published = publish_discovery_outputs(
+        issuer,
+        table_profiles=table_discovery,
+        logic_candidates=pd.DataFrame(logic_candidates),
+        strategy_scores=scores_df,
+        recommendations=recommendation,
+        all_strategies=all_strategies,
+        xml_reference=xml_totals,
+        closest_match=closest,
+    )
+
     return {
         "issuer": issuer,
         "tables_inspected": len(profiles),
@@ -243,6 +254,7 @@ def run_azure_logic_discovery(
             "logic_candidates": str(candidates_path),
             "comparison": str(comparison_path),
             "html_summary": str(html_path),
+            **published,
         },
     }
 

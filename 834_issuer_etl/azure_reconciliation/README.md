@@ -2,9 +2,24 @@
 
 Extension module — does **not** modify the existing pipeline, SFTP downloader, parser, or `main.py`.
 
+## Feature flags (.env)
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `ENABLE_AZURE` | `false` | Master switch — when false, XML-only pipeline unchanged |
+| `ENABLE_AZURE_MIRROR` | `true` | Mirror reports under `assets/{issuer}/azurevs/` after XML export |
+| `ENABLE_AZURE_DISCOVERY` | `true` | Logic discovery (strategies A–E vs XML) |
+| `ENABLE_AZURE_RECONCILIATION` | `false` | Run reconciliation after `main.py` pipeline completes |
+
 ## Run
 
 ```bash
+# Unified discovery + reconciliation
+python run_azure_intelligence.py --issuer 13535
+
+# Discovery only (interactive Azure login)
+python run_azure_discovery.py --issuer 13535
+
 # Full reconciliation (requires Azure credentials in .env)
 python run_azure_reconciliation.py
 
@@ -13,10 +28,22 @@ python run_azure_reconciliation.py --issuer 13535 --year 2026 --month 02
 
 # XML + column mapping only (no Azure connection)
 python run_azure_reconciliation.py --skip-azure
-
-# Force parse source_data instead of reading staging SQLite
-python run_azure_reconciliation.py --parse-source
 ```
+
+## Discovery findings (issuer 13535)
+
+From reverse-engineering reports:
+
+| Rank | Table | Strategy | Logic |
+|------|-------|----------|-------|
+| 1 | `dbo.834_Inbound_test` | C | Event — `GAA_834_File_Date` + `enrolleeStatus` |
+| 2 | `dbo.834_Inbound_test` | D | Event — `memberMaintEffectiveDate` + `actionCode` |
+| 3 | `dbo.CarrierInvoice` | E | Financial — `invoice_month` |
+| Snapshot | `dbo.Enrollments_PY2026` | A | Active coverage — repeating monthly counts |
+
+Reconciliation uses discovery recommendations automatically when available under `outputs/azure_discovery/`.
+
+Override via env: `AZURE_ENROLLMENTS_TABLE`, `AZURE_STRATEGY`, `AZURE_DATE_COLUMN`.
 
 ## Azure credentials (.env)
 
@@ -44,14 +71,17 @@ Legacy `AZURE_SQL_*` aliases for `SERVER`, `DATABASE`, `USERNAME`, and `DRIVER` 
 
 ## Outputs
 
-All under `outputs/reconciliation/`:
+All under `outputs/`:
 
 | Output | Location |
 |--------|----------|
-| Column mapping report | `excel/column_mapping_report.xlsx` |
-| Comparison workbook | `excel/azure_xml_comparison.xlsx` |
-| Dashboard | `dashboards/reconciliation_dashboard.html` |
-| SQLite | `sqlite/reconciliation.db` |
+| Azure discovery (unified) | `azure_discovery/azure_discovery.xlsx`, `.sqlite`, `.html` |
+| Per-issuer recommendations | `azure_discovery/recommendations_{issuer}.xlsx` |
+| Column mapping report | `reconciliation/excel/column_mapping_report.xlsx` |
+| Column mapping HTML | `reconciliation/reports/column_mapping_report.html` |
+| Comparison workbook | `reconciliation/excel/azure_xml_comparison.xlsx` |
+| Dashboards | `reconciliation/dashboards/reconciliation_dashboard.html`, `lifecycle_dashboard.html` |
+| SQLite | `reconciliation/sqlite/reconciliation.db` |
 
 ## Azure mirror reports (assets/)
 

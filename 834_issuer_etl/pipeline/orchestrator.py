@@ -115,6 +115,23 @@ class Pipeline:
         asset_stats = self.export_assets(issuer or settings.issuer_filter)
         stats["asset_partitions"] = asset_stats["partitions"]
         stats["asset_rollups"] = asset_stats["rollups"]
+
+        if settings.azure_enabled and settings.azure_reconciliation_enabled:
+            try:
+                from azure_reconciliation.intelligence_pipeline import run_intelligence_pipeline
+
+                recon_stats = run_intelligence_pipeline(
+                    issuer_filter=issuer or settings.issuer_filter,
+                    year_filter=settings.year_filter,
+                    month_filter=settings.month_filter,
+                    prefer_staging=True,
+                    skip_azure=False,
+                )
+                stats["azure_reconciliation"] = recon_stats
+                logger.info("Azure intelligence stats: %s", recon_stats)
+            except Exception as exc:
+                logger.warning("Azure intelligence skipped — %s", exc)
+
         return stats
 
     def close(self) -> None:

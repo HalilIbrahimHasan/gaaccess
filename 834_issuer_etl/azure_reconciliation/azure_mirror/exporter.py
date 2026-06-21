@@ -372,7 +372,7 @@ def export_azure_mirror_reports(
             issuer, base_row_total, active_row_total, mapping_method,
         )
 
-    if run_discovery and stats["azure_available"]:
+    if run_discovery and stats["azure_available"] and settings.azure_discovery_enabled:
         try:
             from azure_reconciliation.azure_mirror.discovery.runner import export_azure_logic_discovery
 

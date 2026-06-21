@@ -36,8 +36,11 @@ def build_comparison_workbook(
     xml_not_in_azure: pd.DataFrame,
     azure_not_in_xml: pd.DataFrame,
     detailed: pd.DataFrame,
+    lifecycle_summary: pd.DataFrame | None = None,
+    column_mapping: pd.DataFrame | None = None,
+    azure_discovery: pd.DataFrame | None = None,
 ) -> dict[str, pd.DataFrame]:
-    return {
+    sheets = {
         "Final_Result_Summary": final_summary,
         "Status_Result_Summary": status_summary,
         "Issuer_Month_Result": issuer_month,
@@ -49,3 +52,10 @@ def build_comparison_workbook(
         "Azure_Not_In_XML": azure_not_in_xml,
         "Detailed_Comparison": detailed,
     }
+    if lifecycle_summary is not None and not lifecycle_summary.empty:
+        sheets["Lifecycle_Summary"] = lifecycle_summary
+    if column_mapping is not None and not column_mapping.empty:
+        sheets["Column_Mapping"] = column_mapping
+    if azure_discovery is not None and not azure_discovery.empty:
+        sheets["Azure_Discovery"] = azure_discovery
+    return sheets
