@@ -261,7 +261,16 @@ def build_canonical_xml_records(
     rec["normalized_status"] = _col_series(
         work, "additional_maint_reason_code", "coverage_status", "canonical_status",
     ).astype(str).map(normalize_status)
-    rec["event_date"] = _col_series(work, "member_maint_effective_date", "event_date").astype(str)
+    rec["member_maint_effective_date"] = _date_ymd(
+        _col_series(work, "member_maint_effective_date", "event_date")
+    )
+    rec["benefit_effective_date"] = _date_ymd(
+        _col_series(work, "benefit_effective_date", "benefit_effective_begin_date")
+    )
+    rec["benefit_end_date"] = _date_ymd(
+        _col_series(work, "benefit_end_date", "benefit_effective_end_date")
+    )
+    rec["event_date"] = rec["member_maint_effective_date"]
     rec["action_code"] = _col_series(
         work, "maintenance_type_code", "enrollment_action_code", "event_type_code",
     ).astype(str)
@@ -318,7 +327,17 @@ def build_canonical_azure_records(
         _col_series(work, profile.subscriber_col or "exchgSubscriberIdentifier")
     )
     rec["normalized_status"] = _col_series(work, st_col).astype(str).map(normalize_status)
-    rec["event_date"] = dates.dt.strftime("%Y-%m-%d").fillna("")
+    rec["file_event_date"] = _date_ymd(dates)
+    rec["member_maint_effective_date"] = _date_ymd(
+        _col_series(work, "memberMaintEffectiveDate", "member_maint_effective_date")
+    )
+    rec["benefit_effective_date"] = _date_ymd(
+        _col_series(work, "benefitEffectiveBeginDate", "benefit_effective_date")
+    )
+    rec["benefit_end_date"] = _date_ymd(
+        _col_series(work, "benefitEffectiveEndDate", "benefit_end_date")
+    )
+    rec["event_date"] = rec["file_event_date"]
     rec["action_code"] = _col_series(work, act_col).astype(str)
     rec["source_table"] = pd.Series([profile.full_name] * len(work), index=work.index)
 
@@ -429,6 +448,125 @@ def select_best_join_mapping(
     return best
 
 
+def _date_ymd(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+
+
+def _pct(n: float, d: float) -> float:
+    return round(100.0 * n / d, 2) if d else 0.0
+
+
+def _compute_record_rates(
+    matched: pd.DataFrame,
+    *,
+    xml_total: int,
+    az_total: int,
+    status_diff_count: int,
+) -> dict[str, float | bool]:
+    """Record-level rates — dates compared only on matching business fields."""
+    mc = len(matched)
+    xml_only = max(xml_total - mc, 0)
+    az_only = max(az_total - mc, 0)
+    denom = max(xml_total, 1)
+
+    rates: dict[str, float | bool] = {
+        "record_match_rate": _pct(mc, denom),
+        "status_match_rate": _pct(mc - status_diff_count, mc) if mc else 0.0,
+        "date_exact_match_rate": 0.0,
+        "date_month_match_rate": 100.0 if mc else 0.0,
+        "effective_date_match_rate": 0.0,
+        "coverage_effective_match_rate": 0.0,
+        "benefit_end_match_rate": 0.0,
+        "maint_effective_match_rate": 0.0,
+        "file_event_month_match_rate": 0.0,
+        "relationship_valid": False,
+    }
+
+    if mc == 0:
+        return rates
+
+    # Partition year/month (XML source) vs Azure file-event year/month — already in join key
+    xml_ym = matched["year"].astype(str) + "-" + matched["month"].astype(str).str.zfill(2)
+    az_ym_col = "file_event_date_az" if "file_event_date_az" in matched.columns else None
+    if az_ym_col:
+        az_dt = pd.to_datetime(matched[az_ym_col], errors="coerce")
+        az_ym = az_dt.dt.year.astype(str) + "-" + az_dt.dt.month.astype(str).str.zfill(2)
+        rates["file_event_month_match_rate"] = _pct(int((xml_ym == az_ym).sum()), mc)
+    else:
+        rates["file_event_month_match_rate"] = 100.0
+
+    rates["date_month_match_rate"] = rates["file_event_month_match_rate"]
+
+    # Same business-field date comparisons only
+    pairs = [
+        ("benefit_effective_date", "benefit_effective_date", "effective_date_match_rate"),
+        ("benefit_effective_date", "benefit_effective_date", "coverage_effective_match_rate"),
+        ("benefit_end_date", "benefit_end_date", "benefit_end_match_rate"),
+        ("member_maint_effective_date", "member_maint_effective_date", "maint_effective_match_rate"),
+    ]
+    maint_matches = 0
+    for xml_suffix, az_suffix, rate_key in pairs:
+        xc = f"{xml_suffix}_xml" if f"{xml_suffix}_xml" in matched.columns else xml_suffix
+        ac = f"{az_suffix}_az" if f"{az_suffix}_az" in matched.columns else az_suffix
+        if xc in matched.columns and ac in matched.columns:
+            xm = _date_ymd(matched[xc])
+            am = _date_ymd(matched[ac])
+            both = (xm != "") & (am != "")
+            if both.any():
+                n_match = int((xm[both] == am[both]).sum())
+                rates[rate_key] = _pct(n_match, int(both.sum()))
+                if rate_key == "maint_effective_match_rate":
+                    maint_matches = n_match
+
+    rates["date_exact_match_rate"] = rates["maint_effective_match_rate"]
+
+    rr = float(rates["record_match_rate"])
+    sr = float(rates["status_match_rate"])
+    rates["relationship_valid"] = (
+        rr >= settings.relationship_min_record_match_rate
+        and sr >= settings.relationship_min_status_match_rate
+    )
+
+    rates["xml_not_in_azure_remaining"] = xml_only
+    rates["azure_not_in_xml_remaining"] = az_only
+    return rates
+
+
+def _comparable_date_diff(matched: pd.DataFrame) -> pd.DataFrame:
+    """Rows where same business-field dates differ (not file date vs maint date)."""
+    if matched.empty:
+        return matched
+    work = matched.copy()
+    flags = pd.Series(False, index=work.index)
+    for xml_suffix, az_suffix in (
+        ("benefit_effective_date", "benefit_effective_date"),
+        ("benefit_end_date", "benefit_end_date"),
+        ("member_maint_effective_date", "member_maint_effective_date"),
+    ):
+        xc = f"{xml_suffix}_xml" if f"{xml_suffix}_xml" in work.columns else xml_suffix
+        ac = f"{az_suffix}_az" if f"{az_suffix}_az" in work.columns else az_suffix
+        if xc in work.columns and ac in work.columns:
+            xm = _date_ymd(work[xc])
+            am = _date_ymd(work[ac])
+            both = (xm != "") & (am != "")
+            flags = flags | (both & (xm != am))
+    return work[flags].copy()
+
+
+def _cross_field_date_note(matched: pd.DataFrame) -> pd.DataFrame:
+    """Informational: XML maint/event date vs Azure file date (different business fields)."""
+    if matched.empty:
+        return matched
+    xc = "member_maint_effective_date_xml" if "member_maint_effective_date_xml" in matched.columns else "event_date_xml"
+    ac = "file_event_date_az" if "file_event_date_az" in matched.columns else "event_date_az"
+    if xc not in matched.columns or ac not in matched.columns:
+        return pd.DataFrame()
+    xm = _date_ymd(matched[xc])
+    am = _date_ymd(matched[ac])
+    both = (xm != "") & (am != "")
+    return matched[both & (xm != am)].copy()
+
+
 def learn_status_mapping_from_matches(matched: pd.DataFrame) -> dict[str, str]:
     if matched.empty:
         return {}
@@ -459,15 +597,20 @@ def compare_records(
         "azure_not_in_xml_count": 0,
         "status_diff_count": 0,
         "date_diff_count": 0,
+        "comparable_date_diff_count": 0,
+        "cross_field_date_diff_count": 0,
         "matched_records": pd.DataFrame(),
         "xml_not_in_azure": pd.DataFrame(),
         "azure_not_in_xml": pd.DataFrame(),
         "status_diff": pd.DataFrame(),
         "date_diff": pd.DataFrame(),
+        "comparable_date_diff": pd.DataFrame(),
+        "cross_field_date_diff": pd.DataFrame(),
         "summary_rows": [],
         "join_mapping": join_mapping,
         "status_mapping_reliable": False,
         "status_mapping": {},
+        "rates": {},
     }
     if xml_records.empty and az_records.empty:
         return empty_stats
@@ -480,7 +623,8 @@ def compare_records(
     az_only = merged[merged["_merge"] == "right_only"].copy()
 
     status_diff = pd.DataFrame()
-    date_diff = pd.DataFrame()
+    comparable_date_diff = pd.DataFrame()
+    cross_field_date_diff = pd.DataFrame()
     status_mapping: dict[str, str] = {}
     reliable = len(matched) > 0
 
@@ -490,12 +634,15 @@ def compare_records(
         if sx_col in matched.columns and sa_col in matched.columns:
             status_diff = matched[matched[sx_col].astype(str) != matched[sa_col].astype(str)].copy()
             status_mapping = learn_status_mapping_from_matches(matched)
-        dx_col = "event_date_xml" if "event_date_xml" in matched.columns else "event_date_x"
-        da_col = "event_date_az" if "event_date_az" in matched.columns else "event_date_y"
-        if dx_col in matched.columns and da_col in matched.columns:
-            date_diff = matched[
-                matched[dx_col].astype(str).str[:10] != matched[da_col].astype(str).str[:10]
-            ].copy()
+        comparable_date_diff = _comparable_date_diff(matched)
+        cross_field_date_diff = _cross_field_date_note(matched)
+
+    rates = _compute_record_rates(
+        matched,
+        xml_total=len(xml_records),
+        az_total=len(az_records),
+        status_diff_count=len(status_diff),
+    )
 
     join_label = join_mapping.label() if join_mapping else "+".join(PRIMARY_JOIN)
     summary_rows = [{
@@ -505,7 +652,13 @@ def compare_records(
         "xml_not_in_azure": len(xml_only),
         "azure_not_in_xml": len(az_only),
         "status_diff": len(status_diff),
-        "date_diff": len(date_diff),
+        "date_diff": len(comparable_date_diff),
+        "cross_field_date_diff": len(cross_field_date_diff),
+        "record_match_rate": rates.get("record_match_rate", 0),
+        "status_match_rate": rates.get("status_match_rate", 0),
+        "effective_date_match_rate": rates.get("effective_date_match_rate", 0),
+        "file_event_month_match_rate": rates.get("file_event_month_match_rate", 0),
+        "relationship_valid": rates.get("relationship_valid", False),
     }]
 
     for label, keys in DIAGNOSTIC_JOINS:
@@ -528,16 +681,21 @@ def compare_records(
         "xml_not_in_azure_count": len(xml_only),
         "azure_not_in_xml_count": len(az_only),
         "status_diff_count": len(status_diff),
-        "date_diff_count": len(date_diff),
+        "date_diff_count": len(comparable_date_diff),
+        "comparable_date_diff_count": len(comparable_date_diff),
+        "cross_field_date_diff_count": len(cross_field_date_diff),
         "matched_records": matched,
         "xml_not_in_azure": xml_only,
         "azure_not_in_xml": az_only,
         "status_diff": status_diff,
-        "date_diff": date_diff,
+        "date_diff": comparable_date_diff,
+        "comparable_date_diff": comparable_date_diff,
+        "cross_field_date_diff": cross_field_date_diff,
         "summary_rows": summary_rows,
         "join_mapping": join_mapping,
         "status_mapping_reliable": reliable,
         "status_mapping": status_mapping if reliable else {},
+        "rates": rates,
     }
 
 
@@ -649,4 +807,16 @@ def export_record_debug_csvs(
             p = dbg / fname
             safe_write_csv(p, df.head(100_000), table_name=fname.replace(".csv", ""))
             paths[key] = str(p)
+
+    for key, fname in [
+        ("status_diff", "status_diff_sample.csv"),
+        ("date_diff", "date_diff_sample.csv"),
+        ("xml_not_in_azure", "xml_not_in_azure_sample.csv"),
+        ("azure_not_in_xml", "azure_not_in_xml_sample.csv"),
+    ]:
+        df = record_stats.get(key, pd.DataFrame())
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            p = dbg / fname
+            safe_write_csv(p, df.head(500), table_name=fname.replace(".csv", ""))
+            paths[fname.replace(".csv", "")] = str(p)
     return paths

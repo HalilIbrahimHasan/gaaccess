@@ -46,6 +46,76 @@ LEVEL_WEIGHTS = {
     "business_timeline_match": 0.05,
 }
 
+RECORD_LEVEL_WEIGHTS = {
+    "record_match_rate": 0.30,
+    "status_match_rate": 0.35,
+    "file_event_month_match_rate": 0.15,
+    "effective_date_match_rate": 0.20,
+}
+
+
+def _overall_from_record_rates(rates: dict[str, Any]) -> float:
+    overall = sum(
+        float(rates.get(k, 0) or 0) * w for k, w in RECORD_LEVEL_WEIGHTS.items()
+    )
+    return round(min(100.0, max(0.0, overall)), 2)
+
+
+def aggregate_fast_comparisons(comparisons: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge per-issuer fast comparison results into one summary."""
+    if not comparisons:
+        return {"winner": None, "results": []}
+    if len(comparisons) == 1:
+        return comparisons[0]
+
+    base = dict(comparisons[0])
+    total_xml = sum(int(c.get("xml_raw_rows", 0) or 0) for c in comparisons)
+    total_match = sum(int(c.get("match_count", 0) or 0) for c in comparisons)
+    total_xml_only = sum(int(c.get("xml_not_in_azure_count", 0) or 0) for c in comparisons)
+    total_az_only = sum(int(c.get("azure_not_in_xml_count", 0) or 0) for c in comparisons)
+    total_status_diff = sum(int(c.get("status_diff_count", 0) or 0) for c in comparisons)
+    total_date_diff = sum(int(c.get("date_diff_count", 0) or 0) for c in comparisons)
+    total_cross = sum(int(c.get("cross_field_date_diff_count", 0) or 0) for c in comparisons)
+
+    agg_rates: dict[str, float | bool] = {}
+    for k in RECORD_LEVEL_WEIGHTS:
+        weighted = sum(
+            float(c.get("record_stats", {}).get("rates", {}).get(k, 0) or 0)
+            * int(c.get("xml_raw_rows", 0) or 0)
+            for c in comparisons
+        )
+        agg_rates[k] = round(weighted / total_xml, 2) if total_xml else 0.0
+
+    rr = float(agg_rates.get("record_match_rate", 0))
+    sr = float(agg_rates.get("status_match_rate", 0))
+    from config.config import settings
+    agg_rates["relationship_valid"] = (
+        rr >= settings.relationship_min_record_match_rate
+        and sr >= settings.relationship_min_status_match_rate
+    )
+    agg_rates["xml_not_in_azure_remaining"] = total_xml_only
+    agg_rates["azure_not_in_xml_remaining"] = total_az_only
+
+    winner: ComparisonResult | None = base.get("winner")
+    if winner and total_match > 0:
+        winner.scores.update({k: float(v) for k, v in agg_rates.items() if isinstance(v, (int, float))})
+        winner.overall_accuracy = _overall_from_record_rates(agg_rates)
+
+    base.update({
+        "xml_raw_rows": total_xml,
+        "match_count": total_match,
+        "xml_not_in_azure_count": total_xml_only,
+        "azure_not_in_xml_count": total_az_only,
+        "status_diff_count": total_status_diff,
+        "date_diff_count": total_date_diff,
+        "cross_field_date_diff_count": total_cross,
+        "record_rates": agg_rates,
+        "relationship_valid": agg_rates.get("relationship_valid", False),
+        "accuracy_reliable": total_match > 0,
+        "issuers_processed": [c.get("issuer", "") for c in comparisons if c.get("issuer")],
+    })
+    return base
+
 
 @dataclass
 class ComparisonResult:
@@ -558,6 +628,12 @@ def run_fast_final_comparison(
         run_fixed_strategy_c,
         fixed_table_name,
     )
+    from azure_reconciliation.azure_lifecycle_engine import (
+        build_all_azure_lifecycle_snapshots,
+        normalize_azure_events,
+    )
+    from azure_reconciliation.column_mapper import build_column_mapping
+    from azure_reconciliation.xml_loader import xml_column_inventory
     from azure_reconciliation.record_comparison import run_record_comparison
 
     hist = historical_partitions(partitions)
@@ -567,6 +643,7 @@ def run_fast_final_comparison(
         xml_lifecycle = build_all_lifecycle_snapshots(xml_raw, issuer_parts)
 
     meta: dict[str, Any] = {
+        "issuer": issuer,
         "xml_raw_rows": len(xml_raw),
         "xml_lifecycle_rows": len(xml_lifecycle),
         "fast_mode": True,
@@ -586,6 +663,22 @@ def run_fast_final_comparison(
     if table_df.empty:
         meta["cannot_calculate_reason"] = "missing Azure data — 834_Inbound_test returned zero rows"
         return {"winner": None, "results": [], **meta}
+
+    try:
+        mapping = build_column_mapping(xml_column_inventory(xml_raw), list(table_df.columns))
+        az_events = normalize_azure_events(
+            table_df, mapping, date_col=FIXED_DATE_COL, source_table=profile.full_name,
+        )
+        azure_lifecycle = build_all_azure_lifecycle_snapshots(
+            az_events, issuer_parts, date_col=FIXED_DATE_COL,
+        )
+    except Exception as exc:
+        logger.warning("Azure lifecycle build failed (non-fatal): %s", exc)
+        azure_lifecycle = pd.DataFrame()
+
+    meta["azure_raw"] = table_df
+    meta["azure_lifecycle"] = azure_lifecycle
+    meta["azure_lifecycle_rows"] = len(azure_lifecycle)
 
     strat_df = run_fixed_strategy_c(table_df, profile, issuer_parts)
     if strat_df.empty:
@@ -618,6 +711,7 @@ def run_fast_final_comparison(
     join_mapping = record_stats.get("join_mapping")
 
     match_count = record_stats.get("match_count", 0)
+    rates = record_stats.get("rates", {})
     if match_count > 0 and record_stats.get("status_mapping_reliable"):
         result.status_mapping = record_stats.get("status_mapping", {})
         result.join_key = join_mapping.label() if join_mapping else result.join_key
@@ -630,21 +724,41 @@ def run_fast_final_comparison(
         if join_mapping:
             result.join_key = join_mapping.label() + " (0 matches — mapping unverified)"
 
+    if match_count > 0 and rates:
+        result.scores.update({k: float(v) for k, v in rates.items() if isinstance(v, (int, float))})
+        result.overall_accuracy = _overall_from_record_rates(rates)
+        if rates.get("relationship_valid"):
+            result.low_confidence_reason = (
+                "Record and status alignment is strong; exact file-date vs maint-date "
+                "differences are expected and do not invalidate the relationship."
+            )
+        elif result.overall_accuracy < 90.0:
+            weak = sorted(
+                [(k, float(rates.get(k, 0))) for k in RECORD_LEVEL_WEIGHTS],
+                key=lambda x: x[1],
+            )[:2]
+            result.low_confidence_reason = (
+                "Overall below 90% — weakest record metrics: "
+                + ", ".join(f"{k}={v:.1f}%" for k, v in weak)
+            )
+
     meta.update({
         "winner": result,
         "results": [result],
         "azure_rows_sampled": len(table_df),
-        "azure_lifecycle_rows": len(table_df),
         "record_stats": record_stats,
         "record_paths": record_paths,
+        "record_rates": rates,
         "join_mapping": join_mapping.label() if join_mapping else "",
         "status_mapping_reliable": record_stats.get("status_mapping_reliable", False),
         "accuracy_reliable": match_count > 0,
+        "relationship_valid": rates.get("relationship_valid", False) if rates else False,
         "match_count": match_count,
         "xml_not_in_azure_count": record_stats["xml_not_in_azure_count"],
         "azure_not_in_xml_count": record_stats["azure_not_in_xml_count"],
         "status_diff_count": record_stats["status_diff_count"],
         "date_diff_count": record_stats["date_diff_count"],
+        "cross_field_date_diff_count": record_stats.get("cross_field_date_diff_count", 0),
     })
     return meta
 
@@ -789,13 +903,27 @@ def print_final_result(comparison: dict[str, Any]) -> None:
     lines.append(f"Azure lifecycle rows: {comparison.get('azure_lifecycle_rows', 'n/a')}")
 
     if "match_count" in comparison:
+        rates = comparison.get("record_rates") or comparison.get("record_stats", {}).get("rates", {})
         lines.extend([
             f"MATCH count: {comparison.get('match_count', 0)}",
             f"XML_NOT_IN_AZURE count: {comparison.get('xml_not_in_azure_count', 0)}",
             f"AZURE_NOT_IN_XML count: {comparison.get('azure_not_in_xml_count', 0)}",
             f"STATUS_DIFF count: {comparison.get('status_diff_count', 0)}",
-            f"DATE_DIFF count: {comparison.get('date_diff_count', 0)}",
+            f"COMPARABLE_DATE_DIFF count: {comparison.get('date_diff_count', 0)}",
+            f"CROSS_FIELD_DATE_DIFF count (informational): {comparison.get('cross_field_date_diff_count', 0)}",
         ])
+        if rates:
+            lines.extend([
+                f"Record Match Rate: {rates.get('record_match_rate', 0):.1f}%",
+                f"Status Match Rate: {rates.get('status_match_rate', 0):.1f}%",
+                f"Effective Date Match Rate: {rates.get('effective_date_match_rate', 0):.1f}%",
+                f"File/Event Month Match Rate: {rates.get('file_event_month_match_rate', 0):.1f}%",
+                f"Maint Effective Exact Match Rate: {rates.get('date_exact_match_rate', 0):.1f}%",
+            ])
+            if rates.get("relationship_valid"):
+                lines.append("Relationship: VALID (high record match + low status diff)")
+            else:
+                lines.append("Relationship: review recommended (record or status alignment weak)")
 
     if winner is None:
         reason = comparison.get("cannot_calculate_reason", "unknown")
@@ -845,7 +973,7 @@ def print_final_result(comparison: dict[str, Any]) -> None:
         f"Enrollment Match: {s.get('enrollment_match', 0):.1f}%",
         f"Enrollee Match: {s.get('enrollee_match', 0):.1f}%",
         f"Subscriber Match: {s.get('subscriber_match', 0):.1f}%",
-        f"Status Match: {s.get('status_match', 0):.1f}%",
+        f"Status Match (aggregate): {s.get('status_match', 0):.1f}%",
         f"Lifecycle Match: {s.get('lifecycle_match', 0):.1f}%",
         f"Timeline Match: {s.get('timeline_match', 0):.1f}%",
         f"Overall Accuracy: {winner.overall_accuracy:.1f}%"
@@ -876,4 +1004,8 @@ def _append_output_paths(lines: list[str], comparison: dict[str, Any]) -> None:
     lines.append("  outputs/comparison/final_result.xlsx")
     lines.append("  outputs/comparison/final_result.csv")
     lines.append("  outputs/debug/final_validation.txt")
+    lines.append("  outputs/debug/status_diff_sample.csv")
+    lines.append("  outputs/debug/date_diff_sample.csv")
+    lines.append("  outputs/debug/xml_not_in_azure_sample.csv")
+    lines.append("  outputs/debug/azure_not_in_xml_sample.csv")
     lines.append("  outputs/issuer_reports/index.html")

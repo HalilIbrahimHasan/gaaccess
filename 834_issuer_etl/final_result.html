@@ -1,0 +1,106 @@
+<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Final Result — issuer 13535</title>
+<style>body{font-family:sans-serif;margin:1.5rem}table{border-collapse:collapse}
+th,td{border:1px solid #ccc;padding:4px 8px}h2{margin-top:1.5rem}</style>
+</head><body>
+<h1>Final Result — issuer 13535</h1>
+<p><strong>Selected:</strong> dbo.834_Inbound_test / Strategy C</p><p><strong>Auto join:</strong> issuer + exchg_assigned_enrollee_id->healthCoveragePolicyID + subscriber_id->exchgIndivIdentifier + insurance_type + year + month</p><p><strong>Record matches:</strong> 2615</p><p><strong>Overall accuracy:</strong> 68.2%</p><p><strong>Weakest level:</strong> status_match</p>
+<h2>Summary</h2>
+<table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>issuer</th>
+      <th>selected_table</th>
+      <th>selected_strategy</th>
+      <th>selected_date_column</th>
+      <th>selected_status_column</th>
+      <th>selected_join_key</th>
+      <th>selected_status_mapping</th>
+      <th>status_mapping_reliable</th>
+      <th>match_count</th>
+      <th>confidence_score</th>
+      <th>overall_accuracy_note</th>
+      <th>historical_window</th>
+      <th>xml_raw_rows</th>
+      <th>xml_lifecycle_rows</th>
+      <th>weakest_level</th>
+      <th>weakest_score</th>
+      <th>enrollment_match</th>
+      <th>enrollee_match</th>
+      <th>subscriber_match</th>
+      <th>lifecycle_match</th>
+      <th>timeline_match</th>
+      <th>join_key_match</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>13535</td>
+      <td>dbo.834_Inbound_test</td>
+      <td>C</td>
+      <td>GAA_834_File_Date</td>
+      <td>enrolleeStatus</td>
+      <td>issuer + exchg_assigned_enrollee_id-&gt;healthCoveragePolicyID + subscriber_id-&gt;exchgIndivIdentifier + insurance_type + year + month</td>
+      <td>{'CANCELLED': 'CANCELLED', 'ENROLLED': 'ENROLLED', 'TERMINATED': 'TERMINATED'}</td>
+      <td>True</td>
+      <td>2615</td>
+      <td>68.22</td>
+      <td></td>
+      <td>2025-10 through 2026-06</td>
+      <td>2899</td>
+      <td>15045</td>
+      <td>status_match</td>
+      <td>30.419778</td>
+      <td>31.348204</td>
+      <td>30.810922</td>
+      <td>100.0</td>
+      <td>60.460465</td>
+      <td>49.349354</td>
+      <td>95.091376</td>
+    </tr>
+  </tbody>
+</table>
+<h2>Detail sample</h2>
+<table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>strategy_id</th>
+      <th>source_table</th>
+      <th>date_column</th>
+      <th>status_column</th>
+      <th>join_key</th>
+      <th>overall_accuracy</th>
+      <th>behavior_penalty</th>
+      <th>behavior_bonus</th>
+      <th>behavior_notes</th>
+      <th>enrollment_match</th>
+      <th>enrollee_match</th>
+      <th>subscriber_match</th>
+      <th>status_match</th>
+      <th>lifecycle_match</th>
+      <th>timeline_match</th>
+      <th>join_key_match</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>C</td>
+      <td>dbo.834_Inbound_test</td>
+      <td>GAA_834_File_Date</td>
+      <td>enrolleeStatus</td>
+      <td>issuer + exchg_assigned_enrollee_id-&gt;healthCoveragePolicyID + subscriber_id-&gt;exchgIndivIdentifier + insurance_type + year + month</td>
+      <td>68.22</td>
+      <td>0.0</td>
+      <td>22.0</td>
+      <td>834 inbound event candidate (+5 key columns); Strategy C event-date logic preferred</td>
+      <td>31.348204</td>
+      <td>30.810922</td>
+      <td>100.0</td>
+      <td>30.419778</td>
+      <td>60.460465</td>
+      <td>49.349354</td>
+      <td>95.091376</td>
+    </tr>
+  </tbody>
+</table>
+</body></html>

@@ -12,6 +12,7 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from azure_reconciliation.data_source_audit import record_azure_fetch
 from azure_reconciliation.azure_mirror.discovery.strategies import run_strategy_c
 from azure_reconciliation.azure_mirror.discovery.table_inspector import TableProfile
 from azure_reconciliation.azure_fetch import AzureFetchPlan
@@ -150,8 +151,11 @@ def fetch_fixed_azure_data(
             logger.warning("FAST fetch failed %s: %s", part.label(), exc)
 
     if not frames:
+        record_azure_fetch(rows=0, table=f"{profile.schema}.{profile.table}")
         return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    result = pd.concat(frames, ignore_index=True)
+    record_azure_fetch(rows=len(result), table=f"{profile.schema}.{profile.table}")
+    return result
 
 
 def run_fixed_strategy_c(

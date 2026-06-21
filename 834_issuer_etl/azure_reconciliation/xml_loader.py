@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from azure_reconciliation.data_source_audit import record_xml_load
 from config.config import settings
 from ingestion.file_discovery import discover_source_files
 from ingestion.xml_reader import read_xml_bytes
@@ -62,8 +63,10 @@ def _parse_source_data(
         except Exception as exc:
             logger.error("Parse failed %s: %s", src.file_name, exc)
     if not rows:
+        record_xml_load(rows=0, files_read=len(sources), load_path="source_data_direct")
         return pd.DataFrame(columns=XML_STAGING_COLUMNS)
     df = pd.DataFrame(rows)
+    record_xml_load(rows=len(df), files_read=len(sources), load_path="source_data_direct")
     logger.info("Parsed %d XML row(s) from source_data", len(df))
     return df
 
@@ -100,6 +103,7 @@ def _load_from_staging(
         df = pd.read_sql_query(sql, conn, params=params)
     finally:
         conn.close()
+    record_xml_load(rows=len(df), files_read=0, load_path="staging_sqlite")
     logger.info("Loaded %d row(s) from staging SQLite", len(df))
     return df
 

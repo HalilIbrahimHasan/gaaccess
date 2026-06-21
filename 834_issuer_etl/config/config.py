@@ -166,6 +166,12 @@ class Settings:
     fast_mode: bool = field(default_factory=lambda: _env_bool("FAST_MODE", True))
     enable_full_discovery: bool = field(default_factory=lambda: _env_bool("ENABLE_FULL_DISCOVERY", False))
     use_fixed_azure_candidate: bool = field(default_factory=lambda: _env_bool("USE_FIXED_AZURE_CANDIDATE", True))
+    relationship_min_record_match_rate: float = field(
+        default_factory=lambda: float(os.getenv("RELATIONSHIP_MIN_RECORD_MATCH_RATE", "70"))
+    )
+    relationship_min_status_match_rate: float = field(
+        default_factory=lambda: float(os.getenv("RELATIONSHIP_MIN_STATUS_MATCH_RATE", "85"))
+    )
     outputs_path: Path = field(
         default_factory=lambda: _path("OUTPUTS_PATH", "outputs")
     )
@@ -214,6 +220,12 @@ class Settings:
         self.fast_mode = _env_bool("FAST_MODE", True)
         self.enable_full_discovery = _env_bool("ENABLE_FULL_DISCOVERY", False)
         self.use_fixed_azure_candidate = _env_bool("USE_FIXED_AZURE_CANDIDATE", True)
+        self.relationship_min_record_match_rate = float(
+            os.getenv("RELATIONSHIP_MIN_RECORD_MATCH_RATE", "70")
+        )
+        self.relationship_min_status_match_rate = float(
+            os.getenv("RELATIONSHIP_MIN_STATUS_MATCH_RATE", "85")
+        )
 
     def apply_fast_mode(self, enabled: bool = True) -> None:
         """Enable FAST_MODE — fixed 834_Inbound_test candidate, no table scan."""

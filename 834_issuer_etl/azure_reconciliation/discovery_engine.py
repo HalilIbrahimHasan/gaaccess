@@ -14,6 +14,7 @@ from typing import Any
 import pandas as pd
 from sqlalchemy.engine import Engine
 
+from azure_reconciliation.data_source_audit import get_audit
 from azure_reconciliation.azure_client import (
     DEFAULT_SCHEMA,
     _pick_filter_column,
@@ -117,6 +118,7 @@ def _load_seed_rankings(issuer: str) -> dict[tuple[str, str], float]:
     for path in paths:
         if not path.is_file():
             continue
+        get_audit().mark_outputs_read(path)
         try:
             df = pd.read_excel(path, sheet_name="strategy_scores")
             if df.empty:

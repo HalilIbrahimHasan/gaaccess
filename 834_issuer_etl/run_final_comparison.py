@@ -4,6 +4,7 @@ Final comparison — FAST_MODE by default (834_Inbound_test / Strategy C).
 
 Examples:
     python run_final_comparison.py --issuer 13535 --fast
+    python run_final_comparison.py --fast
     python run_final_comparison.py --issuer 13535 --full-discovery
 """
 
@@ -17,9 +18,18 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import pandas as pd  # noqa: E402
+
 from azure_reconciliation.azure_client import azure_configured, connect_azure  # noqa: E402
+from azure_reconciliation.data_source_audit import (
+    log_data_source_startup,
+    record_partitions,
+    reset_audit,
+    write_data_source_audit,
+)
 from azure_reconciliation.debug_outputs import write_all_debug_outputs  # noqa: E402
 from azure_reconciliation.final_comparison_engine import (  # noqa: E402
+    aggregate_fast_comparisons,
     print_final_result,
     run_final_comparison,
 )
@@ -37,7 +47,11 @@ logger = get_logger(__name__)
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Final Azure vs XML business comparison")
-    parser.add_argument("--issuer", required=True, help="Issuer to compare")
+    parser.add_argument(
+        "--issuer",
+        default=None,
+        help="Issuer to compare (optional — all issuers in source_data when omitted)",
+    )
     parser.add_argument("--parse-source", action="store_true", help="Parse source_data instead of staging")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--fast", action="store_true", help="FAST_MODE — fixed 834_Inbound_test / Strategy C (default)")
@@ -71,22 +85,26 @@ def main() -> None:
         logger.error("Azure credentials missing in .env")
         sys.exit(1)
 
-    coverage = discover_source_coverage(issuer_filter=args.issuer)
-    if not coverage.partitions:
-        logger.error("No source_data partitions for issuer %s", args.issuer)
+    import os
+    if str(os.getenv("USE_SYNTHETIC_DATA", "")).strip().lower() in {"true", "1", "yes"}:
+        logger.error("USE_SYNTHETIC_DATA=true is not supported in production runners")
         sys.exit(1)
 
-    xml_raw = load_xml_rows(
-        prefer_staging=not args.parse_source,
-        issuer_filter=args.issuer,
-    )
-    xml_lifecycle = build_all_lifecycle_snapshots(xml_raw, coverage.partitions)
-    stats["xml_raw_rows"] = len(xml_raw)
-    stats["xml_lifecycle_rows"] = len(xml_lifecycle)
+    reset_audit()
+    log_data_source_startup(enable_full_discovery=settings.enable_full_discovery)
 
-    # CSV fallback first — before any export that might fail
-    write_csv_fallback("xml_raw", xml_raw, export_errors=export_errors)
-    write_csv_fallback("xml_lifecycle", xml_lifecycle, export_errors=export_errors)
+    coverage = discover_source_coverage(issuer_filter=args.issuer)
+    if not coverage.partitions:
+        logger.error("No source_data partitions found%s", f" for issuer {args.issuer}" if args.issuer else "")
+        sys.exit(1)
+
+    issuers = [args.issuer] if args.issuer else coverage.issuers
+    record_partitions(
+        issuers=issuers,
+        years=[p.year for p in coverage.partitions],
+        months=[p.month for p in coverage.partitions],
+    )
+    logger.info("Processing issuers from source_data: %s", issuers)
 
     logger.info("AZURE STAGE STARTED (fast_mode=%s)", settings.fast_mode)
     try:
@@ -97,19 +115,89 @@ def main() -> None:
     stats["azure_available"] = True
     stats["connection"] = conn_meta
 
-    comparison = run_final_comparison(
-        engine,
-        issuer=args.issuer,
-        partitions=coverage.partitions,
-        xml_raw=xml_raw,
-        xml_lifecycle=xml_lifecycle,
-    )
+    per_issuer_comparisons: list[dict] = []
+    all_xml_raw: list[pd.DataFrame] = []
+    all_xml_lifecycle: list[pd.DataFrame] = []
+    all_azure_raw: list[pd.DataFrame] = []
+    all_azure_lifecycle: list[pd.DataFrame] = []
+
+    for issuer in issuers:
+        parts = [p for p in coverage.partitions if p.issuer == issuer]
+        if not parts:
+            logger.warning("No partitions for issuer %s — skipping", issuer)
+            continue
+
+        xml_raw = load_xml_rows(
+            prefer_staging=not args.parse_source,
+            issuer_filter=issuer,
+        )
+        xml_lifecycle = build_all_lifecycle_snapshots(xml_raw, parts)
+        all_xml_raw.append(xml_raw)
+        all_xml_lifecycle.append(xml_lifecycle)
+
+        write_csv_fallback(f"xml_raw_{issuer}", xml_raw, export_errors=export_errors)
+        write_csv_fallback(f"xml_lifecycle_{issuer}", xml_lifecycle, export_errors=export_errors)
+
+        comparison = run_final_comparison(
+            engine,
+            issuer=issuer,
+            partitions=parts,
+            xml_raw=xml_raw,
+            xml_lifecycle=xml_lifecycle,
+        )
+        per_issuer_comparisons.append(comparison)
+
+        az_raw = comparison.get("azure_raw", pd.DataFrame())
+        az_lifecycle = comparison.get("azure_lifecycle", pd.DataFrame())
+        if isinstance(az_raw, pd.DataFrame) and not az_raw.empty:
+            all_azure_raw.append(az_raw)
+        if isinstance(az_lifecycle, pd.DataFrame) and not az_lifecycle.empty:
+            all_azure_lifecycle.append(az_lifecycle)
+
+        try:
+            generate_issuer_reports(
+                issuers=[issuer],
+                partitions=parts,
+                xml_raw=xml_raw,
+                xml_lifecycle=xml_lifecycle,
+                azure_raw=az_raw if isinstance(az_raw, pd.DataFrame) else pd.DataFrame(),
+                azure_lifecycle=az_lifecycle if isinstance(az_lifecycle, pd.DataFrame) else pd.DataFrame(),
+                comparison_detail=pd.DataFrame(),
+                comparison_summary=pd.DataFrame(),
+                export_errors=export_errors,
+            )
+        except Exception as exc:
+            export_errors.record(f"issuer_reports_{issuer}: {exc}")
+
+    if not per_issuer_comparisons:
+        logger.error("No comparisons produced for any issuer")
+        sys.exit(1)
+
+    comparison = aggregate_fast_comparisons(per_issuer_comparisons)
+    xml_raw = pd.concat(all_xml_raw, ignore_index=True) if all_xml_raw else pd.DataFrame()
+    xml_lifecycle = pd.concat(all_xml_lifecycle, ignore_index=True) if all_xml_lifecycle else pd.DataFrame()
+
+    stats["xml_raw_rows"] = len(xml_raw)
+    stats["xml_lifecycle_rows"] = len(xml_lifecycle)
+    stats["issuers_processed"] = issuers
     stats["azure_raw_rows"] = comparison.get("azure_raw_rows", 0)
     stats["match_count"] = comparison.get("match_count", 0)
+    rates = comparison.get("record_rates") or comparison.get("record_stats", {}).get("rates", {})
+    if rates:
+        stats["record_match_rate"] = rates.get("record_match_rate")
+        stats["status_match_rate"] = rates.get("status_match_rate")
+        stats["effective_date_match_rate"] = rates.get("effective_date_match_rate")
+        stats["file_event_month_match_rate"] = rates.get("file_event_month_match_rate")
+        stats["relationship_valid"] = rates.get("relationship_valid")
+    stats["xml_not_in_azure_remaining"] = comparison.get("xml_not_in_azure_count", 0)
+    stats["azure_not_in_xml_remaining"] = comparison.get("azure_not_in_xml_count", 0)
+    stats["comparable_date_diff_count"] = comparison.get("date_diff_count", 0)
+    stats["cross_field_date_diff_count"] = comparison.get("cross_field_date_diff_count", 0)
 
+    issuer_label = args.issuer or ",".join(issuers)
     paths: dict[str, str] = {}
     try:
-        paths = export_final_comparison(comparison, issuer=args.issuer, export_errors=export_errors)
+        paths = export_final_comparison(comparison, issuer=issuer_label, export_errors=export_errors)
         stats["final_comparison_paths"] = paths
     except Exception as exc:
         export_errors.record(f"export_final_comparison: {exc}")
@@ -124,28 +212,11 @@ def main() -> None:
         stats["final_selected_strategy"] = winner.strategy_id
         stats["final_overall_accuracy"] = winner.overall_accuracy
 
-    import pandas as pd  # noqa: E402
     strategy_scores = pd.DataFrame([
         {"strategy_id": r.strategy_id, "source_table": r.source_table,
          "overall_accuracy": r.overall_accuracy, **r.scores}
         for r in comparison.get("results", [])
     ])
-
-    az_raw = pd.DataFrame()
-    try:
-        generate_issuer_reports(
-            issuers=[args.issuer],
-            partitions=coverage.partitions,
-            xml_raw=xml_raw,
-            xml_lifecycle=xml_lifecycle,
-            azure_raw=az_raw,
-            azure_lifecycle=pd.DataFrame(),
-            comparison_detail=pd.DataFrame(),
-            comparison_summary=pd.DataFrame(),
-            export_errors=export_errors,
-        )
-    except Exception as exc:
-        export_errors.record(f"issuer_reports: {exc}")
 
     coverage_df = pd.DataFrame([
         {"issuer": p.issuer, "year": p.year, "month": p.month} for p in coverage.partitions
@@ -157,6 +228,8 @@ def main() -> None:
         strategy_scores=strategy_scores,
         validation={"checks": [], "all_passed": winner is not None},
     )
+    audit_path = write_data_source_audit()
+    stats["data_source_audit"] = str(audit_path)
 
     logger.info("Outputs: %s", paths)
     if winner is None and not comparison.get("results"):
