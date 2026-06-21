@@ -558,12 +558,7 @@ def run_fast_final_comparison(
         run_fixed_strategy_c,
         fixed_table_name,
     )
-    from azure_reconciliation.record_comparison import (
-        build_canonical_azure_records,
-        build_canonical_xml_records,
-        compare_records,
-        export_record_debug_csvs,
-    )
+    from azure_reconciliation.record_comparison import run_record_comparison
 
     hist = historical_partitions(partitions)
     issuer_parts = [p for p in hist if p.issuer == issuer]
@@ -615,19 +610,37 @@ def run_fast_final_comparison(
         meta["cannot_calculate_reason"] = str(exc)
         return {"winner": None, "results": [], **meta}
 
-    xml_records = build_canonical_xml_records(xml_raw)
-    az_records = build_canonical_azure_records(table_df, profile, date_col=FIXED_DATE_COL)
-    record_stats = compare_records(xml_records, az_records)
-    record_paths = export_record_debug_csvs(record_stats)
+    # Record comparison with auto join key selection (runs after aggregate compare)
+    record_stats = run_record_comparison(
+        xml_raw, table_df, profile, date_col=FIXED_DATE_COL,
+    )
+    record_paths = record_stats.get("debug_paths", {})
+    join_mapping = record_stats.get("join_mapping")
+
+    match_count = record_stats.get("match_count", 0)
+    if match_count > 0 and record_stats.get("status_mapping_reliable"):
+        result.status_mapping = record_stats.get("status_mapping", {})
+        result.join_key = join_mapping.label() if join_mapping else result.join_key
+    else:
+        result.status_mapping = {}
+        result.low_confidence_reason = (
+            "Record match is 0 — accuracy and status mapping are NOT reliable. "
+            "Next action: correct ID column mapping (see outputs/debug/id_overlap_matrix.csv)."
+        )
+        if join_mapping:
+            result.join_key = join_mapping.label() + " (0 matches — mapping unverified)"
 
     meta.update({
         "winner": result,
         "results": [result],
         "azure_rows_sampled": len(table_df),
-        "azure_lifecycle_rows": len(az_records),
+        "azure_lifecycle_rows": len(table_df),
         "record_stats": record_stats,
         "record_paths": record_paths,
-        "match_count": record_stats["match_count"],
+        "join_mapping": join_mapping.label() if join_mapping else "",
+        "status_mapping_reliable": record_stats.get("status_mapping_reliable", False),
+        "accuracy_reliable": match_count > 0,
+        "match_count": match_count,
         "xml_not_in_azure_count": record_stats["xml_not_in_azure_count"],
         "azure_not_in_xml_count": record_stats["azure_not_in_xml_count"],
         "status_diff_count": record_stats["status_diff_count"],
@@ -801,17 +814,32 @@ def print_final_result(comparison: dict[str, Any]) -> None:
         return
 
     s = winner.scores
+    match_count = int(comparison.get("match_count", 0))
+    accuracy_reliable = comparison.get("accuracy_reliable", match_count > 0)
+
     lines.extend([
         f"Selected Azure Table: {winner.source_table}",
         f"Selected Strategy: Strategy {winner.strategy_id} ({STRATEGY_META.get(winner.strategy_id, ('',))[0]})",
         f"Date Column: {winner.date_column or 'n/a'}",
         f"Join Key: {winner.join_key}",
-        "Status Mapping",
     ])
-    for xk, av in winner.status_mapping.items():
-        lines.append(f"  {xk} → {av}")
-    if not winner.status_mapping:
-        lines.append("  (learned from matched keys — none found)")
+    if comparison.get("join_mapping"):
+        lines.append(f"Auto-selected join mapping: {comparison.get('join_mapping')}")
+
+    if match_count == 0:
+        lines.append("*** RECORD MATCH = 0 — OVERALL ACCURACY IS NOT RELIABLE ***")
+        lines.append("Next action: review outputs/debug/id_overlap_matrix.csv and correct ID mapping")
+        lines.append("Status Mapping: not reliable (no matched records)")
+    else:
+        lines.append("Status Mapping")
+        if winner.status_mapping and comparison.get("status_mapping_reliable", True):
+            for xk, av in winner.status_mapping.items():
+                lines.append(f"  {xk} → {av}")
+        elif winner.status_mapping:
+            lines.append("  (present but not verified at record level)")
+        else:
+            lines.append("  (none learned from matched records)")
+
     lines.extend([
         f"Historical Window: {comparison.get('historical_window', 'n/a')}",
         f"Enrollment Match: {s.get('enrollment_match', 0):.1f}%",
@@ -820,7 +848,8 @@ def print_final_result(comparison: dict[str, Any]) -> None:
         f"Status Match: {s.get('status_match', 0):.1f}%",
         f"Lifecycle Match: {s.get('lifecycle_match', 0):.1f}%",
         f"Timeline Match: {s.get('timeline_match', 0):.1f}%",
-        f"Overall Accuracy: {winner.overall_accuracy:.1f}%",
+        f"Overall Accuracy: {winner.overall_accuracy:.1f}%"
+        + (" (NOT RELIABLE — 0 record matches)" if not accuracy_reliable else ""),
     ])
     if winner.behavior_penalty or winner.behavior_bonus:
         lines.append(

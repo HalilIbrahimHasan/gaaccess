@@ -66,6 +66,7 @@ def _build_final_result_frames(
     comparison_details = pd.DataFrame(detail_rows)
 
     if winner:
+        reliable = comparison.get("accuracy_reliable", comparison.get("match_count", 0) > 0)
         best = pd.DataFrame([{
             "issuer": issuer,
             "selected_table": winner.source_table,
@@ -73,9 +74,14 @@ def _build_final_result_frames(
             "selected_date_column": winner.date_column,
             "selected_status_column": winner.status_column,
             "selected_join_key": winner.join_key,
-            "selected_status_mapping": str(winner.status_mapping),
-            "confidence_score": winner.overall_accuracy,
+            "auto_join_mapping": comparison.get("join_mapping", ""),
+            "selected_status_mapping": str(winner.status_mapping) if reliable else "not reliable",
+            "status_mapping_reliable": comparison.get("status_mapping_reliable", reliable),
+            "accuracy_reliable": reliable,
+            "match_count": comparison.get("match_count", 0),
+            "confidence_score": winner.overall_accuracy if reliable else None,
             "overall_accuracy": winner.overall_accuracy,
+            "overall_accuracy_note": "" if reliable else "NOT RELIABLE — 0 record matches; fix ID mapping",
             "historical_window": comparison.get("historical_window", ""),
             "xml_raw_rows": comparison.get("xml_raw_rows"),
             "xml_lifecycle_rows": comparison.get("xml_lifecycle_rows"),
@@ -141,12 +147,25 @@ def export_final_result(
     # HTML
     extra = ""
     if winner:
+        reliable = comparison.get("accuracy_reliable", comparison.get("match_count", 0) > 0)
         weak = min(winner.scores, key=winner.scores.get) if winner.scores else "n/a"
         extra = (
             f"<p><strong>Selected:</strong> {winner.source_table} / Strategy {winner.strategy_id}</p>"
-            f"<p><strong>Overall accuracy:</strong> {winner.overall_accuracy:.1f}%</p>"
-            f"<p><strong>Weakest level:</strong> {weak}</p>"
+            f"<p><strong>Auto join:</strong> {comparison.get('join_mapping', winner.join_key)}</p>"
+            f"<p><strong>Record matches:</strong> {comparison.get('match_count', 0)}</p>"
         )
+        if not reliable:
+            extra += (
+                "<p style='color:#c00'><strong>RECORD MATCH = 0 — accuracy is NOT reliable.</strong></p>"
+                "<p>Next action: review <code>outputs/debug/id_overlap_matrix.csv</code> "
+                "and correct ID column mapping.</p>"
+                "<p><strong>Status mapping:</strong> not reliable (suppressed)</p>"
+            )
+        else:
+            extra += (
+                f"<p><strong>Overall accuracy:</strong> {winner.overall_accuracy:.1f}%</p>"
+                f"<p><strong>Weakest level:</strong> {weak}</p>"
+            )
     else:
         extra = f"<p><strong>Cannot calculate:</strong> {comparison.get('cannot_calculate_reason', 'unknown')}</p>"
 
