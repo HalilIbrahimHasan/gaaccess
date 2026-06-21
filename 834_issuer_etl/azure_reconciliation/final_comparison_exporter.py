@@ -67,7 +67,8 @@ def _build_final_result_frames(
 
     if winner:
         reliable = comparison.get("accuracy_reliable", comparison.get("match_count", 0) > 0)
-        rates = comparison.get("record_rates") or comparison.get("record_stats", {}).get("rates", {})
+        raw_rates = comparison.get("raw_event_rates") or comparison.get("record_stats", {}).get("rates", {})
+        lifecycle_rates = comparison.get("lifecycle_rates") or comparison.get("record_rates", {})
         best = pd.DataFrame([{
             "issuer": issuer,
             "selected_table": winner.source_table,
@@ -79,22 +80,32 @@ def _build_final_result_frames(
             "selected_status_mapping": str(winner.status_mapping) if reliable else "not reliable",
             "status_mapping_reliable": comparison.get("status_mapping_reliable", reliable),
             "accuracy_reliable": reliable,
-            "relationship_valid": comparison.get("relationship_valid", rates.get("relationship_valid", False)),
+            "relationship_valid": comparison.get("relationship_valid", lifecycle_rates.get("relationship_valid", False)),
+            "xml_raw_rows": comparison.get("xml_raw_rows"),
+            "xml_lifecycle_snapshot_rows": comparison.get("xml_lifecycle_snapshot_rows"),
+            "azure_raw_rows": comparison.get("azure_raw_rows"),
+            "azure_lifecycle_snapshot_rows": comparison.get("azure_lifecycle_snapshot_rows"),
+            "raw_event_match_rate": comparison.get("raw_event_match_rate", raw_rates.get("record_match_rate")),
+            "lifecycle_snapshot_match_rate": comparison.get(
+                "lifecycle_snapshot_match_rate",
+                lifecycle_rates.get("lifecycle_snapshot_match_rate"),
+            ),
+            "status_match_rate": lifecycle_rates.get("status_match_rate"),
+            "effective_date_match_rate": lifecycle_rates.get("effective_date_match_rate"),
+            "file_event_month_match_rate": lifecycle_rates.get("file_event_month_match_rate"),
+            "final_business_match_rate": comparison.get("final_business_match_rate"),
+            "lifecycle_match_count": comparison.get("match_count", 0),
+            "lifecycle_xml_not_in_azure": comparison.get("xml_not_in_azure_count", 0),
+            "lifecycle_azure_not_in_xml": comparison.get("azure_not_in_xml_count", 0),
             "match_count": comparison.get("match_count", 0),
             "confidence_score": winner.overall_accuracy if reliable else None,
             "overall_accuracy": winner.overall_accuracy,
-            "overall_accuracy_note": "" if reliable else "NOT RELIABLE — 0 record matches; fix ID mapping",
-            "record_match_rate": rates.get("record_match_rate"),
-            "status_match_rate": rates.get("status_match_rate"),
-            "effective_date_match_rate": rates.get("effective_date_match_rate"),
-            "file_event_month_match_rate": rates.get("file_event_month_match_rate"),
-            "date_exact_match_rate": rates.get("date_exact_match_rate"),
+            "overall_accuracy_note": "" if reliable else "NOT RELIABLE — 0 lifecycle matches; fix ID mapping",
             "comparable_date_diff_count": comparison.get("date_diff_count", 0),
             "cross_field_date_diff_count": comparison.get("cross_field_date_diff_count", 0),
             "xml_not_in_azure_remaining": comparison.get("xml_not_in_azure_count", 0),
             "azure_not_in_xml_remaining": comparison.get("azure_not_in_xml_count", 0),
             "historical_window": comparison.get("historical_window", ""),
-            "xml_raw_rows": comparison.get("xml_raw_rows"),
             "xml_lifecycle_rows": comparison.get("xml_lifecycle_rows"),
             "weakest_level": min(winner.scores, key=winner.scores.get) if winner.scores else "",
             "weakest_score": min(winner.scores.values()) if winner.scores else None,
@@ -173,16 +184,27 @@ def export_final_result(
                 "<p><strong>Status mapping:</strong> not reliable (suppressed)</p>"
             )
         else:
-            rates = comparison.get("record_rates") or comparison.get("record_stats", {}).get("rates", {})
+            raw_rates = comparison.get("raw_event_rates") or comparison.get("record_stats", {}).get("rates", {})
+            lifecycle_rates = comparison.get("lifecycle_rates") or comparison.get("record_rates", {})
             extra += (
-                f"<p><strong>Overall accuracy:</strong> {winner.overall_accuracy:.1f}% "
-                f"(record-level weighted; not penalized for file vs maint date)</p>"
-                f"<p><strong>Record match rate:</strong> {rates.get('record_match_rate', 0):.1f}%</p>"
-                f"<p><strong>Status match rate:</strong> {rates.get('status_match_rate', 0):.1f}%</p>"
-                f"<p><strong>Effective date match rate:</strong> {rates.get('effective_date_match_rate', 0):.1f}%</p>"
-                f"<p><strong>File/event month match rate:</strong> {rates.get('file_event_month_match_rate', 0):.1f}%</p>"
+                f"<p><strong>Final business accuracy (lifecycle-based):</strong> "
+                f"{winner.overall_accuracy:.1f}%</p>"
+                "<h3>A) Raw event comparison (diagnostic)</h3>"
+                f"<p>Raw event match rate: {comparison.get('raw_event_match_rate', raw_rates.get('record_match_rate', 0)):.1f}%</p>"
+                f"<p>XML raw rows: {comparison.get('xml_raw_rows', 0):,} | "
+                f"Azure raw rows: {comparison.get('azure_raw_rows', 0):,}</p>"
+                "<h3>B) Lifecycle snapshot comparison (primary)</h3>"
+                f"<p>Lifecycle snapshot match rate: "
+                f"{comparison.get('lifecycle_snapshot_match_rate', lifecycle_rates.get('lifecycle_snapshot_match_rate', 0)):.1f}%</p>"
+                f"<p>Status match rate: {lifecycle_rates.get('status_match_rate', 0):.1f}%</p>"
+                f"<p>XML lifecycle snapshot rows: {comparison.get('xml_lifecycle_snapshot_rows', 0):,} | "
+                f"Azure lifecycle snapshot rows: {comparison.get('azure_lifecycle_snapshot_rows', 0):,}</p>"
+                f"<p>XML lifecycle not in Azure: {comparison.get('xml_not_in_azure_count', 0):,}</p>"
+                f"<p>Azure not in XML: {comparison.get('azure_not_in_xml_count', 0):,}</p>"
             )
-            if comparison.get("relationship_valid") or rates.get("relationship_valid"):
+            if comparison.get("event_explanation"):
+                extra += f"<p><em>{comparison['event_explanation']}</em></p>"
+            if comparison.get("relationship_valid") or lifecycle_rates.get("relationship_valid"):
                 extra += "<p><strong>Relationship:</strong> VALID</p>"
             extra += f"<p><strong>Weakest aggregate level:</strong> {weak}</p>"
     else:

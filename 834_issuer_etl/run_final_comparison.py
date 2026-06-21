@@ -174,6 +174,11 @@ def main() -> None:
         sys.exit(1)
 
     comparison = aggregate_fast_comparisons(per_issuer_comparisons)
+    lifecycle_paths: dict[str, str] = {}
+    for c in per_issuer_comparisons:
+        if c.get("lifecycle_paths"):
+            lifecycle_paths.update(c["lifecycle_paths"])
+    comparison["lifecycle_paths"] = lifecycle_paths
     xml_raw = pd.concat(all_xml_raw, ignore_index=True) if all_xml_raw else pd.DataFrame()
     xml_lifecycle = pd.concat(all_xml_lifecycle, ignore_index=True) if all_xml_lifecycle else pd.DataFrame()
 
@@ -182,13 +187,17 @@ def main() -> None:
     stats["issuers_processed"] = issuers
     stats["azure_raw_rows"] = comparison.get("azure_raw_rows", 0)
     stats["match_count"] = comparison.get("match_count", 0)
-    rates = comparison.get("record_rates") or comparison.get("record_stats", {}).get("rates", {})
-    if rates:
-        stats["record_match_rate"] = rates.get("record_match_rate")
-        stats["status_match_rate"] = rates.get("status_match_rate")
-        stats["effective_date_match_rate"] = rates.get("effective_date_match_rate")
-        stats["file_event_month_match_rate"] = rates.get("file_event_month_match_rate")
-        stats["relationship_valid"] = rates.get("relationship_valid")
+    stats["xml_lifecycle_snapshot_rows"] = comparison.get("xml_lifecycle_snapshot_rows", 0)
+    stats["azure_lifecycle_snapshot_rows"] = comparison.get("azure_lifecycle_snapshot_rows", 0)
+    stats["raw_event_match_rate"] = comparison.get("raw_event_match_rate")
+    stats["lifecycle_snapshot_match_rate"] = comparison.get("lifecycle_snapshot_match_rate")
+    stats["final_business_match_rate"] = comparison.get("final_business_match_rate")
+    lifecycle_rates = comparison.get("lifecycle_rates") or comparison.get("record_rates", {})
+    if lifecycle_rates:
+        stats["status_match_rate"] = lifecycle_rates.get("status_match_rate")
+        stats["effective_date_match_rate"] = lifecycle_rates.get("effective_date_match_rate")
+        stats["file_event_month_match_rate"] = lifecycle_rates.get("file_event_month_match_rate")
+        stats["relationship_valid"] = lifecycle_rates.get("relationship_valid")
     stats["xml_not_in_azure_remaining"] = comparison.get("xml_not_in_azure_count", 0)
     stats["azure_not_in_xml_remaining"] = comparison.get("azure_not_in_xml_count", 0)
     stats["comparable_date_diff_count"] = comparison.get("date_diff_count", 0)

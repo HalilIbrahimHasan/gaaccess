@@ -1,6 +1,0 @@
-join_type,join_keys,match_count,xml_not_in_azure,azure_not_in_xml,status_diff,date_diff
-primary_auto,issuer + exchg_assigned_enrollee_id->healthCoveragePolicyID + subscriber_id->exchgIndivIdentifier + insurance_type + year + month,2615,395,512,51,2615
-issuer_policy_member_insurance,issuer+policy_id+member_id+insurance_type,1845,161,460,,
-issuer_policy_subscriber_insurance,issuer+policy_id+subscriber_id+insurance_type,82,1924,4,,
-issuer_member_insurance,issuer+member_id+insurance_type,1845,161,460,,
-issuer_subscriber_insurance,issuer+subscriber_id+insurance_type,82,1924,4,,
