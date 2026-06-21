@@ -36,6 +36,9 @@ def write_run_config(stats: dict[str, Any]) -> Path:
         f"month_filter={settings.month_filter}",
         f"skip_azure={stats.get('skip_azure')}",
         f"azure_requested={stats.get('azure_requested')}",
+        f"FAST_MODE={settings.fast_mode}",
+        f"ENABLE_FULL_DISCOVERY={settings.enable_full_discovery}",
+        f"USE_FIXED_AZURE_CANDIDATE={settings.use_fixed_azure_candidate}",
     ]
     path = debug_dir() / "run_config.txt"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

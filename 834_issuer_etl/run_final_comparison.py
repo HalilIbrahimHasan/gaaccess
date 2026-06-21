@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Final comparison engine — determine which Azure strategy reproduces XML business logic.
+Final comparison — FAST_MODE by default (834_Inbound_test / Strategy C).
 
-Runs after discovery (read-only). Does NOT modify SFTP, source_data, or XML parser.
-
-Example:
-    python run_final_comparison.py --issuer 13535
+Examples:
+    python run_final_comparison.py --issuer 13535 --fast
+    python run_final_comparison.py --issuer 13535 --full-discovery
 """
 
 from __future__ import annotations
@@ -27,7 +26,7 @@ from azure_reconciliation.final_comparison_engine import (  # noqa: E402
 from azure_reconciliation.final_comparison_exporter import export_final_comparison  # noqa: E402
 from azure_reconciliation.issuer_reports import generate_issuer_reports  # noqa: E402
 from azure_reconciliation.lifecycle_engine import build_all_lifecycle_snapshots  # noqa: E402
-from azure_reconciliation.safe_export import ExportErrors  # noqa: E402
+from azure_reconciliation.safe_export import ExportErrors, write_csv_fallback  # noqa: E402
 from azure_reconciliation.source_coverage import discover_source_coverage  # noqa: E402
 from azure_reconciliation.xml_loader import load_xml_rows  # noqa: E402
 from config.config import log_azure_startup_diagnostics, settings  # noqa: E402
@@ -40,15 +39,30 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Final Azure vs XML business comparison")
     parser.add_argument("--issuer", required=True, help="Issuer to compare")
     parser.add_argument("--parse-source", action="store_true", help="Parse source_data instead of staging")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--fast", action="store_true", help="FAST_MODE — fixed 834_Inbound_test / Strategy C (default)")
+    mode.add_argument("--full-discovery", action="store_true", help="Scan all Azure tables (slow)")
     args = parser.parse_args()
 
     settings.refresh_from_env()
+    if args.full_discovery:
+        settings.enable_full_discovery = True
+        settings.use_fixed_azure_candidate = False
+        settings.fast_mode = False
+    else:
+        settings.apply_fast_mode(True)
+
     log_azure_startup_diagnostics()
     settings.apply_cli_filters(args.issuer, None, None)
     settings.ensure_dirs()
 
     export_errors = ExportErrors()
-    stats: dict = {"azure_requested": True, "skip_azure": False}
+    stats: dict = {
+        "azure_requested": True,
+        "skip_azure": False,
+        "fast_mode": settings.fast_mode,
+        "enable_full_discovery": settings.enable_full_discovery,
+    }
 
     if not settings.azure_enabled:
         logger.error("ENABLE_AZURE must be true for final comparison")
@@ -70,7 +84,11 @@ def main() -> None:
     stats["xml_raw_rows"] = len(xml_raw)
     stats["xml_lifecycle_rows"] = len(xml_lifecycle)
 
-    logger.info("AZURE STAGE STARTED")
+    # CSV fallback first — before any export that might fail
+    write_csv_fallback("xml_raw", xml_raw, export_errors=export_errors)
+    write_csv_fallback("xml_lifecycle", xml_lifecycle, export_errors=export_errors)
+
+    logger.info("AZURE STAGE STARTED (fast_mode=%s)", settings.fast_mode)
     try:
         engine, conn_meta = connect_azure(runner_name="run_final_comparison.py", strict=True)
     except Exception as exc:
@@ -86,15 +104,18 @@ def main() -> None:
         xml_raw=xml_raw,
         xml_lifecycle=xml_lifecycle,
     )
-    comparison["azure_lifecycle_rows"] = 0
-    comparison["azure_raw_rows"] = 0
+    stats["azure_raw_rows"] = comparison.get("azure_raw_rows", 0)
+    stats["match_count"] = comparison.get("match_count", 0)
 
+    paths: dict[str, str] = {}
     try:
         paths = export_final_comparison(comparison, issuer=args.issuer, export_errors=export_errors)
         stats["final_comparison_paths"] = paths
     except Exception as exc:
         export_errors.record(f"export_final_comparison: {exc}")
 
+    comparison["final_comparison_paths"] = paths
+    comparison["output_paths"] = paths
     print_final_result(comparison)
 
     winner = comparison.get("winner")
@@ -110,13 +131,14 @@ def main() -> None:
         for r in comparison.get("results", [])
     ])
 
+    az_raw = pd.DataFrame()
     try:
         generate_issuer_reports(
             issuers=[args.issuer],
             partitions=coverage.partitions,
             xml_raw=xml_raw,
             xml_lifecycle=xml_lifecycle,
-            azure_raw=pd.DataFrame(),
+            azure_raw=az_raw,
             azure_lifecycle=pd.DataFrame(),
             comparison_detail=pd.DataFrame(),
             comparison_summary=pd.DataFrame(),
@@ -136,7 +158,7 @@ def main() -> None:
         validation={"checks": [], "all_passed": winner is not None},
     )
 
-    logger.info("Outputs: %s", stats.get("final_comparison_paths"))
+    logger.info("Outputs: %s", paths)
     if winner is None and not comparison.get("results"):
         sys.exit(1)
 

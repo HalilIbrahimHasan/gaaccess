@@ -88,6 +88,10 @@ def run_intelligence_pipeline(
     dirs = _output_dirs()
     export_errors = ExportErrors()
     azure_requested = settings.azure_enabled and not skip_azure
+    logger.info(
+        "Pipeline mode: fast_mode=%s full_discovery=%s fixed_candidate=%s",
+        settings.fast_mode, settings.enable_full_discovery, settings.use_fixed_azure_candidate,
+    )
     stats: dict[str, Any] = {
         "azure_requested": azure_requested,
         "azure_enabled": settings.azure_enabled,
@@ -339,6 +343,7 @@ def run_intelligence_pipeline(
                     final_comparison, issuer=issuer, export_errors=export_errors,
                 )
                 stats["final_comparison_paths"] = final_paths
+                final_comparison["final_comparison_paths"] = final_paths
             except Exception as exc:
                 export_errors.record(f"final_comparison export failed: {exc}")
             print_final_result(final_comparison)

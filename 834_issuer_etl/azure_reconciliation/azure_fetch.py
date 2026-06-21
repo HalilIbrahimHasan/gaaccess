@@ -23,6 +23,7 @@ from azure_reconciliation.discovery_engine import (
     selection_to_fetch_plan,
 )
 from azure_reconciliation.partition_discovery import Partition
+from config.config import settings
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -56,7 +57,23 @@ def discover_and_select(
     partitions: list[Partition],
     schema: str = DEFAULT_SCHEMA,
 ) -> tuple[AzureFetchPlan, DiscoverySelection]:
-    """Run dynamic discovery and return fetch plan + full selection metadata."""
+    """Run discovery (or FAST_MODE fixed candidate) and return fetch plan."""
+    if settings.use_fixed_azure_candidate and not settings.enable_full_discovery:
+        from azure_reconciliation.fixed_azure_candidate import (
+            build_fixed_profile,
+            fixed_discovery_selection,
+            fixed_fetch_plan,
+            fixed_table_name,
+        )
+        from azure_reconciliation.azure_client import list_table_columns
+
+        cols = list_table_columns(engine, schema, fixed_table_name())
+        profile = build_fixed_profile(cols)
+        selection = fixed_discovery_selection(profile)
+        plan = fixed_fetch_plan()
+        logger.info("FAST_MODE fetch plan: %s / strategy %s", plan.full_name, plan.strategy_id)
+        return plan, selection
+
     selection = evaluate_azure_candidates(engine, issuer=issuer, partitions=partitions, schema=schema)
     plan = selection_to_fetch_plan(selection)
     return plan, selection

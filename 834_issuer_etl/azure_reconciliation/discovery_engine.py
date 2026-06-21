@@ -81,7 +81,13 @@ def _optional_env_list(key: str) -> list[str]:
 
 
 def discover_candidate_tables(engine: Engine, schema: str = DEFAULT_SCHEMA) -> list[str]:
-    """Discover inspectable tables dynamically from Azure + optional env hints."""
+    """Discover inspectable tables — FAST_MODE returns fixed candidate only."""
+    from azure_reconciliation.fixed_azure_candidate import fixed_table_name
+
+    if settings.use_fixed_azure_candidate and not settings.enable_full_discovery:
+        logger.info("FAST_MODE: single candidate table %s.%s", schema, fixed_table_name())
+        return [fixed_table_name()]
+
     available = list_available_tables(engine, schema)
     hints = _optional_env_list("AZURE_TABLE_HINTS")
     from azure_reconciliation.azure_client import AZURE_TABLE_CANDIDATES
@@ -168,9 +174,23 @@ def evaluate_azure_candidates(
     partitions: list[Partition],
     schema: str = DEFAULT_SCHEMA,
 ) -> DiscoverySelection:
-    """
-    Evaluate all candidate tables/strategies and return best selection.
-    """
+    """Evaluate candidate tables/strategies — FAST_MODE uses fixed 834_Inbound_test / C."""
+    if settings.use_fixed_azure_candidate and not settings.enable_full_discovery:
+        from azure_reconciliation.azure_client import list_table_columns
+        from azure_reconciliation.fixed_azure_candidate import (
+            build_fixed_profile,
+            fixed_discovery_selection,
+            fixed_table_name,
+        )
+
+        cols = list_table_columns(engine, schema, fixed_table_name())
+        profile = build_fixed_profile(cols)
+        logger.info(
+            "FAST_MODE discovery: %s strategy C date=%s (skipped %d-table scan)",
+            profile.full_name, "GAA_834_File_Date", 0,
+        )
+        return fixed_discovery_selection(profile)
+
     table_names = discover_candidate_tables(engine, schema)
     xml_raw = load_xml_summaries(issuer)
     xml_totals = xml_monthly_totals(xml_raw)

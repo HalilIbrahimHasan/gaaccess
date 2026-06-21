@@ -34,6 +34,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--month", help="Filter by month")
     p.add_argument("--skip-azure", action="store_true", help="XML lifecycle + metadata only")
     p.add_argument("--parse-source", action="store_true", help="Parse source_data instead of staging SQLite")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--fast", action="store_true", help="FAST_MODE — fixed 834_Inbound_test (default)")
+    mode.add_argument("--full-discovery", action="store_true", help="Scan all Azure tables (slow)")
     return p.parse_args()
 
 
@@ -42,6 +45,12 @@ def main() -> None:
     log_azure_startup_diagnostics()
 
     args = parse_args()
+    if args.full_discovery:
+        settings.enable_full_discovery = True
+        settings.use_fixed_azure_candidate = False
+        settings.fast_mode = False
+    elif args.fast or settings.fast_mode:
+        settings.apply_fast_mode(True)
     settings.apply_cli_filters(args.issuer, args.year, args.month)
     settings.ensure_dirs()
 

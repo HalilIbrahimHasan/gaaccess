@@ -22,14 +22,16 @@ from azure_reconciliation.azure_mirror.discovery.table_inspector import (
     inspect_table,
 )
 from azure_reconciliation.discovery_engine import discover_candidate_tables
+from azure_reconciliation.df_utils import col_series as _col_series, zmonth as _zmonth
 from azure_reconciliation.lifecycle_engine import build_all_lifecycle_snapshots
 from azure_reconciliation.partition_discovery import Partition
 from azure_reconciliation.status_mapper import normalize_insurance_type, normalize_status
+from config.config import settings
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Discovery frozen — final comparison evaluates A/B/C only.
+# Discovery frozen — final comparison evaluates A/B/C only (full mode only).
 FINAL_STRATEGIES = ("A", "B", "C")
 
 LEVEL_WEIGHTS = {
@@ -153,25 +155,12 @@ def historical_window_label(partitions: list[Partition]) -> str:
     return f"{first.year}-{first.month.zfill(2)} through {last.year}-{last.month.zfill(2)}"
 
 
-def _zmonth(m: str) -> str:
-    return str(m).strip().zfill(2)
-
-
-def _pct_match(xml_val: float, az_val: float) -> float:
-    if xml_val == 0 and az_val == 0:
-        return 100.0
-    if xml_val == 0:
-        return 0.0
-    diff = abs(xml_val - az_val)
-    return max(0.0, 100.0 * (1.0 - diff / max(xml_val, az_val)))
-
-
 def _aggregate_monthly(df: pd.DataFrame, *, status_col: str = "canonical_status") -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["year", "month", "enrollment_count", "enrollee_count", "subscriber_count"])
     work = df.copy()
-    work["year"] = work.get("coverage_year", work.get("year", "")).astype(str)
-    work["month"] = work.get("snapshot_month", work.get("month", "")).apply(_zmonth)
+    work["year"] = _col_series(work, "coverage_year", "year").astype(str)
+    work["month"] = _col_series(work, "snapshot_month", "month").astype(str).map(_zmonth)
     if status_col in work.columns:
         work["status"] = work[status_col].astype(str).map(normalize_status)
     else:
@@ -193,13 +182,25 @@ def _aggregate_monthly(df: pd.DataFrame, *, status_col: str = "canonical_status"
     return pd.DataFrame(rows)
 
 
+def _pct_match(xml_val: float, az_val: float) -> float:
+    if xml_val == 0 and az_val == 0:
+        return 100.0
+    if xml_val == 0:
+        return 0.0
+    diff = abs(xml_val - az_val)
+    return max(0.0, 100.0 * (1.0 - diff / max(xml_val, az_val)))
+
+
 def _status_distribution(df: pd.DataFrame, *, status_col: str = "canonical_status") -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["year", "month", "status", "count"])
     work = df.copy()
-    work["year"] = work.get("coverage_year", work.get("year", "")).astype(str)
-    work["month"] = work.get("snapshot_month", work.get("month", "")).apply(_zmonth)
-    work["status"] = work.get(status_col, "UNKNOWN").astype(str).map(normalize_status)
+    work["year"] = _col_series(work, "coverage_year", "year").astype(str)
+    work["month"] = _col_series(work, "snapshot_month", "month").astype(str).map(_zmonth)
+    if status_col in work.columns:
+        work["status"] = work[status_col].astype(str).map(normalize_status)
+    else:
+        work["status"] = _col_series(work, status_col).astype(str).map(normalize_status)
     mem = "enrollee_id" if "enrollee_id" in work.columns else "member_id"
     return (
         work.groupby(["year", "month", "status"], dropna=False)[mem]
@@ -212,10 +213,10 @@ def _member_key_frame(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     work = df.copy()
-    work["join_issuer"] = work.get("issuer", work.get("issuer_id", "")).astype(str)
-    work["join_policy"] = work.get("enrollment_id", work.get("policy_id", "")).astype(str)
-    work["join_member"] = work.get("enrollee_id", work.get("member_id", "")).astype(str)
-    work["join_insurance"] = work.get("insurance_type", work.get("insurance_type_code", "")).apply(normalize_insurance_type)
+    work["join_issuer"] = _col_series(work, "issuer", "issuer_id").astype(str)
+    work["join_policy"] = _col_series(work, "enrollment_id", "policy_id").astype(str)
+    work["join_member"] = _col_series(work, "enrollee_id", "member_id").astype(str)
+    work["join_insurance"] = _col_series(work, "insurance_type", "insurance_type_code").map(normalize_insurance_type)
     work["_join_key"] = (
         work["join_issuer"] + "|" + work["join_policy"] + "|"
         + work["join_member"] + "|" + work["join_insurance"]
@@ -229,8 +230,8 @@ def learn_status_mapping(xml_df: pd.DataFrame, az_df: pd.DataFrame) -> dict[str,
         return {}
     xl = _member_key_frame(xml_df)
     az = _member_key_frame(az_df)
-    xl["xml_status_raw"] = xl.get("canonical_status", xl.get("additional_maint_reason_code", "")).astype(str)
-    az["az_status_raw"] = az.get("canonical_status", az.get("enrollment_status", "")).astype(str)
+    xl["xml_status_raw"] = _col_series(xl, "canonical_status", "additional_maint_reason_code").astype(str)
+    az["az_status_raw"] = _col_series(az, "canonical_status", "enrollment_status").astype(str)
 
     merged = xl.merge(
         az, on="_join_key", how="inner", suffixes=("_xml", "_az"),
@@ -357,10 +358,11 @@ def _issuer_month_accuracy(
 ) -> float:
     scores: list[float] = []
     for part in historical_partitions(partitions):
-        xml_p = xml_lifecycle[
-            (xml_lifecycle.get("coverage_year", xml_lifecycle.get("year", "")).astype(str) == part.year)
-            & (xml_lifecycle.get("snapshot_month", xml_lifecycle.get("month", "")).astype(str).str.zfill(2) == _zmonth(part.month))
-        ] if not xml_lifecycle.empty else pd.DataFrame()
+        if xml_lifecycle.empty:
+            continue
+        yr = _col_series(xml_lifecycle, "coverage_year", "year").astype(str)
+        mo = _col_series(xml_lifecycle, "snapshot_month", "month").astype(str).str.zfill(2)
+        xml_p = xml_lifecycle[(yr == part.year) & (mo == _zmonth(part.month))]
         if xml_p.empty:
             continue
         xm = _aggregate_monthly(xml_p)
@@ -393,7 +395,7 @@ def _strategy_status_dist(strat_df: pd.DataFrame) -> pd.DataFrame:
     work = strat_df.copy()
     work["year"] = work["year"].astype(str)
     work["month"] = work["month"].astype(str).apply(_zmonth)
-    work["status"] = work.get("status", "UNKNOWN").astype(str).map(normalize_status)
+    work["status"] = _col_series(work, "status").astype(str).map(normalize_status)
     return work.groupby(["year", "month", "status"], dropna=False)["enrollee_count"].sum().reset_index(name="count")
 
 
@@ -537,6 +539,103 @@ def compare_strategy(
     )
 
 
+def run_fast_final_comparison(
+    engine: Engine,
+    *,
+    issuer: str,
+    partitions: list[Partition],
+    xml_raw: pd.DataFrame,
+    xml_lifecycle: pd.DataFrame,
+    schema: str = "dbo",
+) -> dict[str, Any]:
+    """FAST_MODE: fixed dbo.834_Inbound_test / Strategy C + record-level comparison."""
+    from azure_reconciliation.azure_client import list_table_columns
+    from azure_reconciliation.fixed_azure_candidate import (
+        FIXED_DATE_COL,
+        FIXED_STRATEGY,
+        build_fixed_profile,
+        fetch_fixed_azure_data,
+        run_fixed_strategy_c,
+        fixed_table_name,
+    )
+    from azure_reconciliation.record_comparison import (
+        build_canonical_azure_records,
+        build_canonical_xml_records,
+        compare_records,
+        export_record_debug_csvs,
+    )
+
+    hist = historical_partitions(partitions)
+    issuer_parts = [p for p in hist if p.issuer == issuer]
+
+    if xml_lifecycle.empty and not xml_raw.empty:
+        xml_lifecycle = build_all_lifecycle_snapshots(xml_raw, issuer_parts)
+
+    meta: dict[str, Any] = {
+        "xml_raw_rows": len(xml_raw),
+        "xml_lifecycle_rows": len(xml_lifecycle),
+        "fast_mode": True,
+        "historical_window": historical_window_label(issuer_parts),
+        "rejected": [],
+    }
+
+    if xml_raw.empty:
+        meta["cannot_calculate_reason"] = "missing XML data"
+        return {"winner": None, "results": [], **meta}
+
+    cols = list_table_columns(engine, schema, fixed_table_name())
+    profile = build_fixed_profile(cols)
+    table_df = fetch_fixed_azure_data(engine, issuer=issuer, partitions=issuer_parts, profile=profile)
+    meta["azure_raw_rows"] = len(table_df)
+
+    if table_df.empty:
+        meta["cannot_calculate_reason"] = "missing Azure data — 834_Inbound_test returned zero rows"
+        return {"winner": None, "results": [], **meta}
+
+    strat_df = run_fixed_strategy_c(table_df, profile, issuer_parts)
+    if strat_df.empty:
+        meta["cannot_calculate_reason"] = "Strategy C produced zero rows on 834_Inbound_test"
+        return {"winner": None, "results": [], **meta}
+
+    try:
+        result = compare_strategy(
+            strategy_id=FIXED_STRATEGY,
+            source_table=profile.full_name,
+            strat_df=strat_df,
+            profile=profile,
+            xml_lifecycle=xml_lifecycle,
+            xml_raw=xml_raw,
+            partitions=issuer_parts,
+            date_column=FIXED_DATE_COL,
+            status_column=profile.status_col or "enrolleeStatus",
+            table_df=table_df,
+        )
+    except Exception as exc:
+        logger.exception("FAST compare_strategy failed: %s", exc)
+        meta["cannot_calculate_reason"] = str(exc)
+        return {"winner": None, "results": [], **meta}
+
+    xml_records = build_canonical_xml_records(xml_raw)
+    az_records = build_canonical_azure_records(table_df, profile, date_col=FIXED_DATE_COL)
+    record_stats = compare_records(xml_records, az_records)
+    record_paths = export_record_debug_csvs(record_stats)
+
+    meta.update({
+        "winner": result,
+        "results": [result],
+        "azure_rows_sampled": len(table_df),
+        "azure_lifecycle_rows": len(az_records),
+        "record_stats": record_stats,
+        "record_paths": record_paths,
+        "match_count": record_stats["match_count"],
+        "xml_not_in_azure_count": record_stats["xml_not_in_azure_count"],
+        "azure_not_in_xml_count": record_stats["azure_not_in_xml_count"],
+        "status_diff_count": record_stats["status_diff_count"],
+        "date_diff_count": record_stats["date_diff_count"],
+    })
+    return meta
+
+
 def run_final_comparison(
     engine: Engine,
     *,
@@ -547,9 +646,20 @@ def run_final_comparison(
     schema: str = "dbo",
 ) -> dict[str, Any]:
     """
-    Evaluate strategies A/B/C across discovered tables using 9 business comparison levels.
-    Discovery table list is read-only (discover_candidate_tables only).
+    Evaluate Azure vs XML. FAST_MODE uses fixed 834_Inbound_test / Strategy C only.
+    Full discovery only when ENABLE_FULL_DISCOVERY=true.
     """
+    if settings.use_fixed_azure_candidate and not settings.enable_full_discovery:
+        logger.info("FAST_MODE final comparison — dbo.834_Inbound_test / Strategy C")
+        return run_fast_final_comparison(
+            engine,
+            issuer=issuer,
+            partitions=partitions,
+            xml_raw=xml_raw,
+            xml_lifecycle=xml_lifecycle,
+            schema=schema,
+        )
+
     hist = historical_partitions(partitions)
     issuer_parts = [p for p in hist if p.issuer == issuer]
     years = sorted({p.year for p in issuer_parts})
@@ -657,9 +767,22 @@ def print_final_result(comparison: dict[str, Any]) -> None:
     winner: ComparisonResult | None = comparison.get("winner")
     lines = ["=" * 51, "FINAL RESULT"]
 
+    if comparison.get("fast_mode"):
+        lines.append("Mode: FAST (dbo.834_Inbound_test / Strategy C)")
+
     lines.append(f"XML rows: {comparison.get('xml_raw_rows', 'n/a')}")
     lines.append(f"XML lifecycle rows: {comparison.get('xml_lifecycle_rows', 'n/a')}")
-    lines.append(f"Azure lifecycle rows (sample): {comparison.get('azure_lifecycle_rows', comparison.get('azure_rows_sampled', 'n/a'))}")
+    lines.append(f"Azure rows: {comparison.get('azure_raw_rows', comparison.get('azure_rows_sampled', 'n/a'))}")
+    lines.append(f"Azure lifecycle rows: {comparison.get('azure_lifecycle_rows', 'n/a')}")
+
+    if "match_count" in comparison:
+        lines.extend([
+            f"MATCH count: {comparison.get('match_count', 0)}",
+            f"XML_NOT_IN_AZURE count: {comparison.get('xml_not_in_azure_count', 0)}",
+            f"AZURE_NOT_IN_XML count: {comparison.get('azure_not_in_xml_count', 0)}",
+            f"STATUS_DIFF count: {comparison.get('status_diff_count', 0)}",
+            f"DATE_DIFF count: {comparison.get('date_diff_count', 0)}",
+        ])
 
     if winner is None:
         reason = comparison.get("cannot_calculate_reason", "unknown")
@@ -670,6 +793,7 @@ def print_final_result(comparison: dict[str, Any]) -> None:
             lines.append("Rejected strategies:")
             for r in rejected[:10]:
                 lines.append(f"  {r.get('source_table', '?')} / {r.get('strategy_id', '?')}: {r.get('reason', '')}")
+        _append_output_paths(lines, comparison)
         lines.append("=" * 51)
         for line in lines:
             print(line)
@@ -705,10 +829,22 @@ def print_final_result(comparison: dict[str, Any]) -> None:
         )
     if winner.overall_accuracy < 90.0:
         lines.append(f"WARNING (below 90%): {winner.low_confidence_reason}")
-    rejected = comparison.get("rejected", [])
-    if rejected:
-        lines.append(f"Rejected strategies: {len(rejected)}")
+    _append_output_paths(lines, comparison)
     lines.append("=" * 51)
     for line in lines:
         print(line)
         logger.info(line)
+
+
+def _append_output_paths(lines: list[str], comparison: dict[str, Any]) -> None:
+    lines.append("Output paths:")
+    for key in ("record_paths", "final_comparison_paths", "output_paths"):
+        paths = comparison.get(key)
+        if isinstance(paths, dict):
+            for k, v in paths.items():
+                lines.append(f"  {k}: {v}")
+    lines.append("  outputs/comparison/final_result.html")
+    lines.append("  outputs/comparison/final_result.xlsx")
+    lines.append("  outputs/comparison/final_result.csv")
+    lines.append("  outputs/debug/final_validation.txt")
+    lines.append("  outputs/issuer_reports/index.html")

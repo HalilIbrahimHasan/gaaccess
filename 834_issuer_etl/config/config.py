@@ -163,6 +163,9 @@ class Settings:
     sqlite_output_enabled: bool = field(default_factory=lambda: _env_bool("ENABLE_SQLITE_OUTPUT", True))
     excel_output_enabled: bool = field(default_factory=lambda: _env_bool("ENABLE_EXCEL_OUTPUT", True))
     html_output_enabled: bool = field(default_factory=lambda: _env_bool("ENABLE_HTML_OUTPUT", True))
+    fast_mode: bool = field(default_factory=lambda: _env_bool("FAST_MODE", True))
+    enable_full_discovery: bool = field(default_factory=lambda: _env_bool("ENABLE_FULL_DISCOVERY", False))
+    use_fixed_azure_candidate: bool = field(default_factory=lambda: _env_bool("USE_FIXED_AZURE_CANDIDATE", True))
     outputs_path: Path = field(
         default_factory=lambda: _path("OUTPUTS_PATH", "outputs")
     )
@@ -208,6 +211,15 @@ class Settings:
         self.sqlite_output_enabled = _env_bool("ENABLE_SQLITE_OUTPUT", True)
         self.excel_output_enabled = _env_bool("ENABLE_EXCEL_OUTPUT", True)
         self.html_output_enabled = _env_bool("ENABLE_HTML_OUTPUT", True)
+        self.fast_mode = _env_bool("FAST_MODE", True)
+        self.enable_full_discovery = _env_bool("ENABLE_FULL_DISCOVERY", False)
+        self.use_fixed_azure_candidate = _env_bool("USE_FIXED_AZURE_CANDIDATE", True)
+
+    def apply_fast_mode(self, enabled: bool = True) -> None:
+        """Enable FAST_MODE — fixed 834_Inbound_test candidate, no table scan."""
+        self.fast_mode = enabled
+        self.use_fixed_azure_candidate = enabled
+        self.enable_full_discovery = not enabled
 
     def apply_cli_filters(
         self,
