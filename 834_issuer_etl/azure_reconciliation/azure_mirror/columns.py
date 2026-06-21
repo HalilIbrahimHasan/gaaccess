@@ -76,6 +76,8 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     ],
     "rating_area": ["rating_area", "ratingarea"],
     "GAA_Load_Date": ["GAA_Load_Date", "gaa_load_date", "load_date"],
+    "benefit_effective_date": ["benefit_effective_date", "benefitEffectiveBeginDate"],
+    "benefit_end_date": ["benefit_end_date", "benefitEffectiveEndDate"],
 }
 
 

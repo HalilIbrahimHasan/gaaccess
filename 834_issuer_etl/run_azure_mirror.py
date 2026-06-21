@@ -26,12 +26,17 @@ def main() -> None:
     parser.add_argument("--issuer", help="Filter to one issuer")
     parser.add_argument("--year", help="Filter to one year")
     parser.add_argument("--month", help="Filter to one month")
+    parser.add_argument(
+        "--no-discovery", action="store_true",
+        help="Skip Azure logic discovery (active coverage reports only)",
+    )
     args = parser.parse_args()
 
     stats = export_azure_mirror_reports(
         issuer_filter=args.issuer,
         year_filter=args.year,
         month_filter=args.month,
+        run_discovery=not args.no_discovery,
     )
     logger.info("Done: %s", stats)
 

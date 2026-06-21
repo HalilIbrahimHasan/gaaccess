@@ -74,6 +74,34 @@ python run_azure_mirror.py --issuer 13535
 
 If Azure connection fails, XML reports are unchanged.
 
+## Active coverage reports
+
+```
+assets/{issuer}/azurevs/active_coverage/
+  excel/     azure_enrollment_summary_{issuer}.xlsx, ...
+  dashboards/ ...
+```
+
+Uses benefit_effective_date / benefit_end_date active window (not GAA_Load_Date).
+
+## Logic discovery (compare strategies vs XML)
+
+```
+assets/{issuer}/azurevs/discovery/
+  azure_table_discovery_{issuer}.xlsx
+  azure_logic_candidates_{issuer}.xlsx
+  azure_event_candidate_summary_{issuer}.html
+  strategy_vs_xml_comparison_{issuer}.xlsx
+```
+
+Run standalone:
+```bash
+python run_azure_discovery.py --issuer 13535
+```
+
+Strategies tested: A=active coverage, B=status snapshot, C=event dates, D=834 inbound, E=CarrierInvoice.
+Scores compared against XML enrollment summaries in assets/{issuer}/.
+
 SQLite tables: `xml_snapshot`, `azure_snapshot`, `comparison_detail`, `comparison_summary`, `issuer_month_summary`
 
 ## Architecture

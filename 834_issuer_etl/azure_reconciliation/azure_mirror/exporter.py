@@ -46,12 +46,15 @@ logger = get_logger(__name__)
 
 def _azurevs_dirs(issuer: str) -> dict[str, Path]:
     base = settings.assets_path / issuer / "azurevs"
+    ac = base / "active_coverage"
     return {
         "base": base,
-        "excel": base / "excel",
-        "html": base / "html",
-        "dashboards": base / "dashboards",
-        "sqlite": base / "sqlite",
+        "active_coverage": ac,
+        "excel": ac / "excel",
+        "html": ac / "html",
+        "dashboards": ac / "dashboards",
+        "sqlite": ac / "sqlite",
+        "discovery": base / "discovery",
     }
 
 
@@ -129,12 +132,14 @@ def export_azure_mirror_reports(
     issuer_filter: str | None = None,
     year_filter: str | None = None,
     month_filter: str | None = None,
+    run_discovery: bool = True,
 ) -> dict[str, Any]:
     stats: dict[str, Any] = {
         "azure_available": False,
         "issuers_processed": 0,
         "partitions_queried": 0,
         "azure_rows_total": 0,
+        "discovery": {},
     }
 
     partitions = discover_partitions(
@@ -366,5 +371,17 @@ def export_azure_mirror_reports(
             "Azure mirror complete issuer %s — base=%d active_mapped=%d method=%s",
             issuer, base_row_total, active_row_total, mapping_method,
         )
+
+    if run_discovery and stats["azure_available"]:
+        try:
+            from azure_reconciliation.azure_mirror.discovery.runner import export_azure_logic_discovery
+
+            stats["discovery"] = export_azure_logic_discovery(
+                issuer_filter=issuer_filter or settings.issuer_filter,
+                year_filter=year_filter or settings.year_filter,
+                month_filter=month_filter or settings.month_filter,
+            )
+        except Exception as exc:
+            logger.warning("Azure logic discovery skipped — %s", exc)
 
     return stats
