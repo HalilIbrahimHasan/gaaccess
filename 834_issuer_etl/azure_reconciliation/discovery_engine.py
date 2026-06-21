@@ -205,17 +205,36 @@ def evaluate_azure_candidates(
             if "source_status_column" in strat_df.columns and not strat_df.empty:
                 status_col = str(strat_df["source_status_column"].iloc[0]) or status_col
 
-            xml_score = score_strategy_vs_xml(
-                strat_df, xml_totals,
-                strategy_id=sid,
-                source_table=profile.full_name,
-                logic_type=meta[1],
-                source_date_column=date_col,
-                source_status_column=status_col,
-                source_policy_column=profile.policy_col or "",
-                source_member_column=profile.member_col or "",
-                missing_column_penalty=len(profile.missing_roles) * 2.0,
-            )
+            try:
+                xml_score = score_strategy_vs_xml(
+                    strat_df, xml_totals,
+                    strategy_id=sid,
+                    source_table=profile.full_name,
+                    logic_type=meta[1],
+                    source_date_column=date_col,
+                    source_status_column=status_col,
+                    source_policy_column=profile.policy_col or "",
+                    source_member_column=profile.member_col or "",
+                    missing_column_penalty=len(profile.missing_roles) * 2.0,
+                    partitions=issuer_parts,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Scoring skipped for %s/%s on %s: %s",
+                    sid, profile.full_name, table, exc,
+                )
+                from azure_reconciliation.azure_mirror.discovery.scoring import _low_confidence_result
+                xml_score = _low_confidence_result(
+                    strategy_id=sid,
+                    source_table=profile.full_name,
+                    logic_type=meta[1],
+                    source_date_column=date_col,
+                    source_status_column=status_col,
+                    source_policy_column=profile.policy_col or "",
+                    source_member_column=profile.member_col or "",
+                    missing_column_penalty=len(profile.missing_roles) * 2.0,
+                    notes=f"Scoring error: {exc}",
+                )
             iss_cov, date_cov, status_cov = _profile_quality(profile, table_df, issuer)
             seed = seed_bonus.get((table, sid), 0.0)
             dynamic = (

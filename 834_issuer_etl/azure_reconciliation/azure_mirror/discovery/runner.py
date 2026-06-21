@@ -172,6 +172,7 @@ def run_azure_logic_discovery(
                 source_policy_column=prof.policy_col if prof else "",
                 source_member_column=prof.member_col if prof else "",
                 missing_column_penalty=penalty,
+                partitions=partitions,
             ))
             logger.info(
                 "Strategy score: %s / %s = %.1f",
@@ -180,7 +181,7 @@ def run_azure_logic_discovery(
 
     scores_df = pd.DataFrame(scores)
     recommendation = build_recommendation(scores_df)
-    closest = closest_match_by_month(all_strategies, xml_totals)
+    closest = closest_match_by_month(all_strategies, xml_totals, partitions=partitions)
 
     if not scores_df.empty:
         best = scores_df.sort_values("confidence_score", ascending=False).iloc[0]
