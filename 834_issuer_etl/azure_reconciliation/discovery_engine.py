@@ -1,8 +1,8 @@
 """
 Dynamic Azure table/strategy discovery engine.
 
-Evaluates candidate tables and strategies on every run.
-Prior discovery reports provide seed ranking only — never hardcoded selection.
+FROZEN — read-only. Do not add discovery logic here.
+Use final_comparison_engine.py for business-level strategy selection.
 """
 
 from __future__ import annotations

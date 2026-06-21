@@ -30,6 +30,8 @@ from azure_reconciliation.comparison_engine import aggregate_level_stats, compar
 from azure_reconciliation.dashboard import generate_reconciliation_dashboard
 from azure_reconciliation.discovery_engine import DiscoverySelection
 from azure_reconciliation.excel_exporter import build_comparison_workbook, write_excel_report
+from azure_reconciliation.final_comparison_engine import print_final_result, run_final_comparison
+from azure_reconciliation.final_comparison_exporter import export_final_comparison
 from azure_reconciliation.lifecycle_engine import build_all_lifecycle_snapshots, replay_lifecycle
 from azure_reconciliation.mapping_report import write_column_mapping_html
 from azure_reconciliation.metadata_engine import generate_metadata
@@ -367,6 +369,35 @@ def run_intelligence_pipeline(
             run_stats=stats,
         )
         stats.update(meta_paths)
+
+    # Final comparison — determine best Azure strategy vs XML business logic
+    if azure_requested and engine and stats.get("azure_available") and settings.xml_lifecycle_enabled:
+        final_paths: dict[str, str] = {}
+        for issuer in coverage.issuers:
+            issuer_xml = (
+                xml_raw[xml_raw["issuer"].astype(str) == str(issuer)]
+                if not xml_raw.empty and "issuer" in xml_raw.columns else xml_raw
+            )
+            issuer_lc = (
+                xml_lifecycle[xml_lifecycle["issuer"].astype(str) == str(issuer)]
+                if not xml_lifecycle.empty and "issuer" in xml_lifecycle.columns else xml_lifecycle
+            )
+            comparison = run_final_comparison(
+                engine,
+                issuer=issuer,
+                partitions=partitions,
+                xml_raw=issuer_xml,
+                xml_lifecycle=issuer_lc,
+            )
+            final_paths = export_final_comparison(comparison, issuer=issuer)
+            print_final_result(comparison)
+            winner = comparison.get("winner")
+            if winner:
+                stats["final_selected_table"] = winner.source_table
+                stats["final_selected_strategy"] = winner.strategy_id
+                stats["final_overall_accuracy"] = winner.overall_accuracy
+                stats["final_confidence_score"] = winner.overall_accuracy
+        stats["final_comparison_paths"] = final_paths
 
     stats["execution_seconds"] = round(time.perf_counter() - t0, 2)
     require_azure = bool(stats.get("azure_requested"))
