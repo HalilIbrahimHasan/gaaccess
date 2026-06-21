@@ -155,37 +155,101 @@ def get_engine() -> Engine:
     return create_engine(build_connection_url(), future=True)
 
 
-def verify_azure_connection() -> tuple[Engine | None, dict[str, Any]]:
-    """
-    Test Azure connectivity via ActiveDirectoryInteractive.
+def print_azure_connection_diagnostics(runner_name: str) -> dict[str, Any]:
+    """Print connection settings (no secrets) before attempting Azure login."""
+    cfg = _azure_settings()
+    meta = {
+        "runner_name": runner_name,
+        "server_present": bool(cfg["server"]),
+        "database_present": bool(cfg["database"]),
+        "username_present": bool(cfg["username"]),
+        "driver": cfg["driver"],
+        "authentication_mode": AUTH_MODE,
+        "connection_timeout": _connection_timeout(),
+    }
+    lines = [
+        f"runner name: {runner_name}",
+        f"server present: {meta['server_present']}",
+        f"database present: {meta['database_present']}",
+        f"username present: {meta['username_present']}",
+        f"driver: {meta['driver']}",
+        f"authentication mode: {meta['authentication_mode']}",
+        f"connection timeout: {meta['connection_timeout']} seconds",
+    ]
+    for line in lines:
+        print(line)
+        logger.info("Azure connection diagnostic — %s", line)
+    return meta
 
-    Logs connection mode and success/failure details. Never raises.
+
+def test_azure_connection_query(engine: Engine) -> None:
+    """Force ODBC connect + interactive login via a real query."""
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1 AS connection_test"))
+
+
+def connect_azure(
+    *,
+    runner_name: str = "azure",
+    strict: bool = False,
+) -> tuple[Engine | None, dict[str, Any]]:
     """
-    meta = get_connection_meta()
+    Shared Azure connection entry point for all runners.
+
+    Uses ActiveDirectoryInteractive + SELECT 1 AS connection_test to trigger login.
+
+    When strict=True, prints full exception and exits with code 1 on failure.
+    When strict=False, logs and returns (None, meta) on failure (mirror pipeline).
+    """
+    import sys
+
+    meta = print_azure_connection_diagnostics(runner_name)
+    meta["connection_mode"] = AUTH_MODE
+
     if not azure_configured():
         meta["connected"] = False
         meta["error"] = "SERVER, DATABASE, and USERNAME required"
-        log_connection_failure(meta, meta["error"])
+        msg = meta["error"]
+        if strict:
+            print(f"Azure connection failed: {msg}", file=sys.stderr)
+            sys.exit(1)
+        log_connection_failure(meta, msg)
         return None, meta
 
     logger.info("Azure connection mode: %s", AUTH_MODE)
     logger.info(
         "Azure connection timeout: %s seconds (complete browser sign-in within this window)",
-        meta.get("connection_timeout", _connection_timeout()),
+        meta["connection_timeout"],
     )
 
     try:
         engine = get_engine()
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
+        test_azure_connection_query(engine)
         meta["connected"] = True
         logger.info("Azure connection successful")
+        print("Azure connection successful")
         return engine, meta
     except Exception as exc:
         meta["connected"] = False
         meta["error"] = str(exc)
+        if strict:
+            import traceback
+
+            print(f"Azure connection failed: {exc}", file=sys.stderr)
+            traceback.print_exc()
+            logger.exception("Azure connection failed")
+            sys.exit(1)
         log_connection_failure(meta, exc)
         return None, meta
+
+
+def verify_azure_connection() -> tuple[Engine | None, dict[str, Any]]:
+    """
+    Test Azure connectivity via ActiveDirectoryInteractive.
+
+    Delegates to connect_azure (non-strict). Never raises.
+    """
+    return connect_azure(runner_name="verify_azure_connection", strict=False)
 
 
 def list_table_columns(engine: Engine, schema: str, table: str) -> list[str]:

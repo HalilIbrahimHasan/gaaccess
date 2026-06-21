@@ -8,7 +8,7 @@ from typing import Any
 import pandas as pd
 from sqlalchemy.engine import Engine
 
-from azure_reconciliation.azure_client import DEFAULT_SCHEMA, verify_azure_connection
+from azure_reconciliation.azure_client import DEFAULT_SCHEMA, connect_azure
 from azure_reconciliation.azure_mirror.discovery.scoring import (
     build_recommendation,
     closest_match_by_month,
@@ -288,8 +288,15 @@ def export_azure_logic_discovery(
     issuer_filter: str | None = None,
     year_filter: str | None = None,
     month_filter: str | None = None,
+    engine: Engine | None = None,
 ) -> dict[str, Any]:
     """Standalone discovery export — requires working Azure connection."""
+    # Connect first (same path as run_azure_mirror) so interactive login always triggers.
+    if engine is None:
+        engine, meta = connect_azure(runner_name="export_azure_logic_discovery", strict=False)
+        if engine is None:
+            return {"issuers": 0, "connection": meta}
+
     partitions = discover_partitions(
         issuer_filter=issuer_filter or settings.issuer_filter,
         year_filter=year_filter or settings.year_filter,
@@ -297,14 +304,8 @@ def export_azure_logic_discovery(
     )
     if not partitions:
         logger.info("No source_data partitions for discovery")
-        return {"issuers": 0}
+        return {"issuers": 0, "connection": {"connected": True}}
 
-    engine, meta = verify_azure_connection()
-    if engine is None:
-        logger.warning("Azure discovery skipped — connection failed")
-        return {"issuers": 0, "connection": meta}
-
-    logger.info("Azure connection successful")
     issuers = sorted({p.issuer for p in partitions})
     results = []
     for issuer in issuers:

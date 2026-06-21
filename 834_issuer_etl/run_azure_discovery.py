@@ -11,6 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from azure_reconciliation.azure_client import connect_azure  # noqa: E402
 from azure_reconciliation.azure_mirror.discovery.runner import export_azure_logic_discovery  # noqa: E402
 from utils.logger import get_logger  # noqa: E402
 
@@ -24,10 +25,13 @@ def main() -> None:
     parser.add_argument("--month", help="Filter to one month")
     args = parser.parse_args()
 
+    engine, _meta = connect_azure(runner_name="run_azure_discovery.py", strict=True)
+
     stats = export_azure_logic_discovery(
         issuer_filter=args.issuer,
         year_filter=args.year,
         month_filter=args.month,
+        engine=engine,
     )
     logger.info("Discovery complete: %s", stats)
 
