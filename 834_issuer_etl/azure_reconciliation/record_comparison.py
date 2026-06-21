@@ -26,6 +26,7 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 PRIMARY_JOIN = ["issuer", "policy_id", "member_id", "insurance_type", "year", "month"]
+LIFECYCLE_PRIMARY_JOIN = ["issuer", "policy_id", "member_id", "insurance_type"]
 
 XML_ID_CANDIDATES = [
     "policy_id",
@@ -485,12 +486,28 @@ def _compute_record_rates(
     if mc == 0:
         return rates
 
-    # Partition year/month (XML source) vs Azure file-event year/month — already in join key
-    xml_ym = matched["year"].astype(str) + "-" + matched["month"].astype(str).str.zfill(2)
+    # Month alignment on matched rows — use join month or file-event month columns
+    if "year" in matched.columns and "month" in matched.columns:
+        xml_ym = matched["year"].astype(str) + "-" + matched["month"].astype(str).str.zfill(2)
+    elif "file_event_year_month_xml" in matched.columns:
+        xml_ym = matched["file_event_year_month_xml"].astype(str)
+    elif "file_event_year_month" in matched.columns:
+        xml_ym = matched["file_event_year_month"].astype(str)
+    else:
+        xml_ym = pd.Series([""] * mc, index=matched.index)
+
     az_ym_col = "file_event_date_az" if "file_event_date_az" in matched.columns else None
     if az_ym_col:
         az_dt = pd.to_datetime(matched[az_ym_col], errors="coerce")
         az_ym = az_dt.dt.year.astype(str) + "-" + az_dt.dt.month.astype(str).str.zfill(2)
+    elif "file_event_year_month_az" in matched.columns:
+        az_ym = matched["file_event_year_month_az"].astype(str)
+    elif "file_event_year_month" in matched.columns:
+        az_ym = matched["file_event_year_month"].astype(str)
+    else:
+        az_ym = xml_ym
+
+    if xml_ym.str.strip().any() and az_ym.str.strip().any():
         rates["file_event_month_match_rate"] = _pct(int((xml_ym == az_ym).sum()), mc)
     else:
         rates["file_event_month_match_rate"] = 100.0
@@ -590,7 +607,9 @@ def compare_records(
     az_records: pd.DataFrame,
     *,
     join_mapping: JoinMapping | None = None,
+    join_keys: list[str] | None = None,
 ) -> dict[str, Any]:
+    keys = join_keys or PRIMARY_JOIN
     empty_stats: dict[str, Any] = {
         "match_count": 0,
         "xml_not_in_azure_count": 0,
@@ -608,6 +627,7 @@ def compare_records(
         "cross_field_date_diff": pd.DataFrame(),
         "summary_rows": [],
         "join_mapping": join_mapping,
+        "join_keys": keys,
         "status_mapping_reliable": False,
         "status_mapping": {},
         "rates": {},
@@ -616,7 +636,7 @@ def compare_records(
         return empty_stats
 
     merged = xml_records.merge(
-        az_records, on=PRIMARY_JOIN, how="outer", suffixes=("_xml", "_az"), indicator=True,
+        az_records, on=keys, how="outer", suffixes=("_xml", "_az"), indicator=True,
     )
     matched = merged[merged["_merge"] == "both"].copy()
     xml_only = merged[merged["_merge"] == "left_only"].copy()
@@ -644,10 +664,10 @@ def compare_records(
         status_diff_count=len(status_diff),
     )
 
-    join_label = join_mapping.label() if join_mapping else "+".join(PRIMARY_JOIN)
+    join_label = join_mapping.label() if join_mapping else "+".join(keys)
     summary_rows = [{
         "join_type": "primary_auto" if join_mapping else "primary",
-        "join_keys": join_label,
+        "join_keys": join_label if join_mapping else "+".join(keys),
         "match_count": len(matched),
         "xml_not_in_azure": len(xml_only),
         "azure_not_in_xml": len(az_only),
@@ -693,6 +713,7 @@ def compare_records(
         "cross_field_date_diff": cross_field_date_diff,
         "summary_rows": summary_rows,
         "join_mapping": join_mapping,
+        "join_keys": keys,
         "status_mapping_reliable": reliable,
         "status_mapping": status_mapping if reliable else {},
         "rates": rates,

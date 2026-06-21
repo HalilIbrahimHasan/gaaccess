@@ -813,6 +813,12 @@ def run_fast_final_comparison(
         "lifecycle_snapshot_match_rate": rates.get("lifecycle_snapshot_match_rate", 0) if rates else 0,
         "final_business_match_rate": lifecycle_result.get("latest_rates", {}).get("final_business_match_rate", 0),
         "event_explanation": lifecycle_result.get("event_explanation", ""),
+        "best_month_basis": lifecycle_result.get("best_month_basis", ""),
+        "month_basis_diff_count": lifecycle_result.get("month_basis_diff_count", 0),
+        "match_rate_without_month": (lifecycle_rates or {}).get("match_rate_join_without_month"),
+        "match_rate_file_event_month": (lifecycle_rates or {}).get("match_rate_join_file_event_month"),
+        "match_rate_benefit_month": (lifecycle_rates or {}).get("match_rate_join_benefit_effective_month"),
+        "match_rate_maint_month": (lifecycle_rates or {}).get("match_rate_join_member_maint_month"),
     })
     return meta
 
@@ -974,6 +980,13 @@ def print_final_result(comparison: dict[str, Any]) -> None:
 
     lines.append("")
     lines.append("--- B) Lifecycle snapshot comparison (primary) ---")
+    if comparison.get("best_month_basis"):
+        lines.append(f"Best month basis selected: {comparison.get('best_month_basis')}")
+        lines.append(f"Match rate without month: {comparison.get('match_rate_without_month', 'n/a')}%")
+        lines.append(f"Match rate file/event month: {comparison.get('match_rate_file_event_month', 'n/a')}%")
+        lines.append(f"Match rate benefit month: {comparison.get('match_rate_benefit_month', 'n/a')}%")
+        lines.append(f"Match rate maintenance month: {comparison.get('match_rate_maint_month', 'n/a')}%")
+        lines.append(f"MONTH_BASIS_DIFF count: {comparison.get('month_basis_diff_count', 0)}")
     if "match_count" in comparison:
         lines.extend([
             f"Lifecycle match count: {comparison.get('match_count', 0)}",
@@ -1077,6 +1090,8 @@ def _append_output_paths(lines: list[str], comparison: dict[str, Any]) -> None:
     lines.append("  outputs/comparison/final_result.csv")
     lines.append("  outputs/debug/final_validation.txt")
     lines.append("  outputs/comparison/final_lifecycle_result.html")
+    lines.append("  outputs/debug/month_basis_comparison.csv")
+    lines.append("  outputs/debug/month_basis_diff.csv")
     lines.append("  outputs/debug/lifecycle_match_summary.csv")
     lines.append("  outputs/debug/xml_lifecycle_snapshot.csv")
     lines.append("  outputs/debug/azure_lifecycle_snapshot.csv")

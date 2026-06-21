@@ -192,6 +192,12 @@ def main() -> None:
     stats["raw_event_match_rate"] = comparison.get("raw_event_match_rate")
     stats["lifecycle_snapshot_match_rate"] = comparison.get("lifecycle_snapshot_match_rate")
     stats["final_business_match_rate"] = comparison.get("final_business_match_rate")
+    stats["best_month_basis"] = comparison.get("best_month_basis")
+    stats["month_basis_diff_count"] = comparison.get("month_basis_diff_count")
+    stats["match_rate_without_month"] = comparison.get("match_rate_without_month")
+    stats["match_rate_file_event_month"] = comparison.get("match_rate_file_event_month")
+    stats["match_rate_benefit_month"] = comparison.get("match_rate_benefit_month")
+    stats["match_rate_maint_month"] = comparison.get("match_rate_maint_month")
     lifecycle_rates = comparison.get("lifecycle_rates") or comparison.get("record_rates", {})
     if lifecycle_rates:
         stats["status_match_rate"] = lifecycle_rates.get("status_match_rate")
