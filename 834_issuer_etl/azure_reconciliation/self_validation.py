@@ -27,8 +27,17 @@ def validate_run(stats: dict[str, Any], *, require_azure: bool = False) -> dict[
 
     if require_azure:
         _check("azure_connected", stats.get("azure_available", False), stats.get("azure_error", ""))
-        _check("azure_table_selected", bool(stats.get("azure_selected_table")), "")
-        _check("azure_rows_fetched", stats.get("azure_raw_rows", 0) > 0, "Zero rows — see fallback logs")
+        table = stats.get("azure_selected_table")
+        _check(
+            "azure_table_selected",
+            bool(table) and str(table).lower() not in ("n/a", "none", ""),
+            f"table={table!r}",
+        )
+        _check(
+            "azure_rows_fetched",
+            stats.get("azure_raw_rows", 0) > 0,
+            f"azure_raw_rows={stats.get('azure_raw_rows', 0)}",
+        )
 
     if stats.get("excel_output_enabled", True):
         _check("excel_output", bool(stats.get("output_excel_path")), "")

@@ -221,6 +221,8 @@ def connect_azure(
         "Azure connection timeout: %s seconds (complete browser sign-in within this window)",
         meta["connection_timeout"],
     )
+    print("CONNECTING TO AZURE")
+    logger.info("CONNECTING TO AZURE")
 
     try:
         engine = get_engine()

@@ -68,9 +68,13 @@ def run_intelligence_pipeline(
 ) -> dict[str, Any]:
     """Execute complete Azure intelligence pipeline (13 steps)."""
     t0 = time.perf_counter()
+    settings.refresh_from_env()
     dirs = _output_dirs()
+    azure_requested = settings.azure_enabled and not skip_azure
     stats: dict[str, Any] = {
-        "azure_available": settings.azure_enabled and azure_configured() and not skip_azure,
+        "azure_requested": azure_requested,
+        "azure_enabled": settings.azure_enabled,
+        "skip_azure": skip_azure,
     }
 
     # 1. Read source_data coverage
@@ -90,7 +94,10 @@ def run_intelligence_pipeline(
     })
     if not partitions:
         logger.warning("No source_data partitions — stopping")
+        stats["validation"] = validate_run(stats, require_azure=azure_requested)
         print_final_validation(stats)
+        if azure_requested:
+            raise RuntimeError("ENABLE_AZURE=true but no source_data partitions discovered")
         return stats
 
     # 2–3. XML profile + lifecycle
@@ -114,62 +121,92 @@ def run_intelligence_pipeline(
     azure_cols: list[str] = []
 
     # 4–6. Azure connect + discover + select
-    if stats["azure_available"]:
-        engine, conn_meta = connect_azure(runner_name="run_intelligence_pipeline", strict=False)
-        if engine is None:
+    if azure_requested:
+        logger.info("AZURE STAGE STARTED")
+        print("AZURE STAGE STARTED")
+        if not azure_configured():
+            msg = (
+                "ENABLE_AZURE=true but Azure credentials missing — "
+                "set SERVER, DATABASE, and USERNAME in .env"
+            )
+            logger.error(msg)
+            stats["azure_error"] = msg
             stats["azure_available"] = False
-            stats["azure_error"] = conn_meta.get("error", "connection failed")
+            stats["execution_seconds"] = round(time.perf_counter() - t0, 2)
+            stats["validation"] = validate_run(stats, require_azure=True)
+            print_final_validation(stats)
+            raise RuntimeError(msg)
+
+        engine, conn_meta = connect_azure(runner_name="run_intelligence_pipeline", strict=True)
+        stats["azure_available"] = True
+        stats["connection"] = conn_meta
+
+        for issuer in coverage.issuers:
+            plan, selection = discover_and_select(engine, issuer=issuer, partitions=partitions)
+            plans_by_issuer[issuer] = plan
+            discovery_by_issuer[issuer] = selection
+            if not azure_cols and plan.table:
+                azure_cols = list_table_columns(engine, plan.schema, plan.table)
+
+        primary = next(iter(plans_by_issuer.values()), None)
+        if primary and primary.table:
+            stats["azure_selected_table"] = primary.full_name
+            stats["azure_selected_strategy"] = primary.strategy_id
+            stats["azure_confidence_score"] = primary.confidence_score
         else:
-            for issuer in coverage.issuers:
-                plan, selection = discover_and_select(engine, issuer=issuer, partitions=partitions)
-                plans_by_issuer[issuer] = plan
-                discovery_by_issuer[issuer] = selection
-                if not azure_cols and plan.table:
-                    azure_cols = list_table_columns(engine, plan.schema, plan.table)
+            msg = "Azure discovery did not select any table — no usable Azure candidates"
+            logger.error(msg)
+            stats["azure_error"] = msg
+            stats["execution_seconds"] = round(time.perf_counter() - t0, 2)
+            stats["validation"] = validate_run(stats, require_azure=True)
+            print_final_validation(stats)
+            raise RuntimeError(msg)
 
-            primary = next(iter(plans_by_issuer.values()), None)
-            if primary:
-                stats["azure_selected_table"] = primary.full_name
-                stats["azure_selected_strategy"] = primary.strategy_id
-                stats["azure_confidence_score"] = primary.confidence_score
+        # 7–8. Extract Azure + build lifecycle
+        raw_frames: list[pd.DataFrame] = []
+        for issuer in coverage.issuers:
+            plan = plans_by_issuer.get(issuer)
+            if not plan or not plan.table:
+                continue
+            years = sorted({p.year for p in partitions if p.issuer == issuer})
+            bulk = fetch_issuer_year_bulk(engine, plan, issuer=issuer, years=years)
+            if bulk.empty:
+                for part in [p for p in partitions if p.issuer == issuer]:
+                    part_df, used_plan, _ = fetch_with_full_fallback(
+                        engine, part, partitions=partitions, primary_plan=plan,
+                        selection=discovery_by_issuer.get(issuer),
+                    )
+                    if not part_df.empty:
+                        bulk = pd.concat([bulk, part_df], ignore_index=True) if not bulk.empty else part_df
+                        plans_by_issuer[issuer] = used_plan
+            if not bulk.empty:
+                bulk["_fetch_issuer"] = issuer
+                raw_frames.append(bulk)
 
-            # 7–8. Extract Azure + build lifecycle
-            raw_frames: list[pd.DataFrame] = []
-            for issuer in coverage.issuers:
-                plan = plans_by_issuer.get(issuer)
-                if not plan or not plan.table:
-                    continue
-                years = sorted({p.year for p in partitions if p.issuer == issuer})
-                bulk = fetch_issuer_year_bulk(engine, plan, issuer=issuer, years=years)
-                if bulk.empty:
-                    for part in [p for p in partitions if p.issuer == issuer]:
-                        part_df, used_plan, _ = fetch_with_full_fallback(
-                            engine, part, partitions=partitions, primary_plan=plan,
-                            selection=discovery_by_issuer.get(issuer),
-                        )
-                        if not part_df.empty:
-                            bulk = pd.concat([bulk, part_df], ignore_index=True) if not bulk.empty else part_df
-                            plans_by_issuer[issuer] = used_plan
-                if not bulk.empty:
-                    bulk["_fetch_issuer"] = issuer
-                    raw_frames.append(bulk)
+        if raw_frames:
+            azure_raw = pd.concat(raw_frames, ignore_index=True)
+        stats["azure_raw_rows"] = len(azure_raw)
 
-            if raw_frames:
-                azure_raw = pd.concat(raw_frames, ignore_index=True)
-            stats["azure_raw_rows"] = len(azure_raw)
+        if stats["azure_raw_rows"] == 0:
+            msg = "Azure stage completed but zero rows fetched — check table/strategy selection and source_data scope"
+            logger.error(msg)
+            stats["azure_error"] = msg
 
-            mapping_pre = build_column_mapping(xml_column_inventory(xml_raw), azure_cols)
-            if settings.azure_lifecycle_enabled and not azure_raw.empty:
-                primary = next(iter(plans_by_issuer.values()))
-                az_events = normalize_azure_events(
-                    azure_raw, mapping_pre,
-                    date_col=primary.date_col if primary else None,
-                    source_table=primary.full_name if primary else "",
-                )
-                azure_lifecycle = build_all_azure_lifecycle_snapshots(
-                    az_events, partitions, date_col=primary.date_col if primary else None,
-                )
-            stats["azure_lifecycle_rows"] = len(azure_lifecycle)
+        mapping_pre = build_column_mapping(xml_column_inventory(xml_raw), azure_cols)
+        if settings.azure_lifecycle_enabled and not azure_raw.empty:
+            primary = next(iter(plans_by_issuer.values()))
+            az_events = normalize_azure_events(
+                azure_raw, mapping_pre,
+                date_col=primary.date_col if primary else None,
+                source_table=primary.full_name if primary else "",
+            )
+            azure_lifecycle = build_all_azure_lifecycle_snapshots(
+                az_events, partitions, date_col=primary.date_col if primary else None,
+            )
+        stats["azure_lifecycle_rows"] = len(azure_lifecycle)
+    else:
+        stats["azure_available"] = False
+        logger.info("Azure stage skipped (azure_enabled=%s skip_azure=%s)", settings.azure_enabled, skip_azure)
 
     mapping = build_column_mapping(xml_column_inventory(xml_raw), azure_cols)
 
@@ -191,7 +228,7 @@ def run_intelligence_pipeline(
             ].copy()
             az_snap = azure_final_snapshot(azure_lifecycle, part)
 
-        if engine and stats["azure_available"]:
+        if engine and stats.get("azure_available"):
             plan = plans_by_issuer.get(part.issuer)
             if plan:
                 az_events_part, _, _ = fetch_with_full_fallback(
@@ -332,6 +369,12 @@ def run_intelligence_pipeline(
         stats.update(meta_paths)
 
     stats["execution_seconds"] = round(time.perf_counter() - t0, 2)
-    stats["validation"] = validate_run(stats, require_azure=stats["azure_available"])
+    require_azure = bool(stats.get("azure_requested"))
+    stats["validation"] = validate_run(stats, require_azure=require_azure)
     print_final_validation(stats)
+
+    if require_azure and not stats["validation"].get("all_passed", True):
+        err = stats.get("azure_error") or "Azure validation failed — see logs"
+        raise RuntimeError(err)
+
     return stats

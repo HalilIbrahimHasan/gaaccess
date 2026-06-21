@@ -15,6 +15,60 @@ ENV_FILE = PROJECT_ROOT / ".env"
 # override=True: project .env wins over pre-set shell variables (e.g. PROCESSING_MODE=local)
 ENV_LOADED = load_dotenv(ENV_FILE, override=True)
 
+_TRUTHY = frozenset({"true", "1", "yes", "y"})
+
+
+def reload_env() -> bool:
+    """Reload .env from project root (834_issuer_etl/.env)."""
+    global ENV_LOADED
+    ENV_LOADED = load_dotenv(ENV_FILE, override=True)
+    return ENV_LOADED
+
+
+def _env_bool(key: str, default: bool = False) -> bool:
+    raw = os.getenv(key)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in _TRUTHY
+
+
+def _env_present(*keys: str) -> bool:
+    for key in keys:
+        val = os.getenv(key)
+        if val is not None and str(val).strip().strip('"').strip("'"):
+            return True
+    return False
+
+
+def azure_startup_diagnostics() -> dict[str, str | bool | None]:
+    """Log-friendly snapshot of Azure-related env after reload."""
+    reload_env()
+    return {
+        "env_file": str(ENV_FILE),
+        "env_file_exists": ENV_FILE.is_file(),
+        "env_loaded": ENV_LOADED,
+        "ENABLE_AZURE_raw": os.getenv("ENABLE_AZURE"),
+        "azure_enabled_parsed": _env_bool("ENABLE_AZURE", False),
+        "server_present": _env_present("SERVER", "AZURE_SQL_SERVER"),
+        "database_present": _env_present("DATABASE", "AZURE_SQL_DATABASE"),
+        "username_present": _env_present("USERNAME", "AZURE_SQL_USERNAME"),
+        "driver_present": _env_present("DRIVER", "AZURE_SQL_DRIVER"),
+        "driver_value": os.getenv("DRIVER") or os.getenv("AZURE_SQL_DRIVER") or "",
+    }
+
+
+def log_azure_startup_diagnostics() -> dict[str, str | bool | None]:
+    """Print and log Azure startup diagnostics."""
+    from utils.logger import get_logger
+
+    diag = azure_startup_diagnostics()
+    logger = get_logger("config")
+    for key, val in diag.items():
+        line = f"{key}: {val}"
+        print(line)
+        logger.info("Startup diagnostic — %s", line)
+    return diag
+
 
 def env_diagnostics() -> dict[str, str | bool | None]:
     """Return which .env path was used and whether PROCESSING_MODE was read."""
@@ -71,9 +125,7 @@ class Settings:
     cancellation_window_days: int = field(
         default_factory=lambda: int(os.getenv("CANCELLATION_WINDOW_DAYS", "90"))
     )
-    clean_on_start: bool = field(
-        default_factory=lambda: os.getenv("CLEAN_ON_START", "true").lower() == "true"
-    )
+    clean_on_start: bool = field(default_factory=lambda: _env_bool("CLEAN_ON_START", True))
     ftp_host: str = field(default_factory=lambda: os.getenv("FTP_HOST", ""))
     ftp_port: int = field(default_factory=lambda: int(os.getenv("FTP_PORT", "21")))
     ftp_user: str = field(
@@ -94,69 +146,23 @@ class Settings:
     sftp_remote_path: str = field(
         default_factory=lambda: os.getenv("SFTP_REMOTE_PATH", "/")
     )
-    sftp_audit_only: bool = field(
-        default_factory=lambda: os.getenv("SFTP_AUDIT_ONLY", "false").lower() == "true"
-    )
-    force_download: bool = field(
-        default_factory=lambda: os.getenv("FORCE_DOWNLOAD", "false").lower() == "true"
-    )
-    keep_compressed: bool = field(
-        default_factory=lambda: os.getenv("KEEP_COMPRESSED", "false").lower() == "true"
-    )
+    sftp_audit_only: bool = field(default_factory=lambda: _env_bool("SFTP_AUDIT_ONLY", False))
+    force_download: bool = field(default_factory=lambda: _env_bool("FORCE_DOWNLOAD", False))
+    keep_compressed: bool = field(default_factory=lambda: _env_bool("KEEP_COMPRESSED", False))
     # Azure intelligence (additive — XML pipeline unchanged when disabled)
-    azure_enabled: bool = field(
-        default_factory=lambda: os.getenv("ENABLE_AZURE", "false").lower() == "true"
-    )
+    azure_enabled: bool = field(default_factory=lambda: _env_bool("ENABLE_AZURE", False))
     azure_reconciliation_enabled: bool = field(
-        default_factory=lambda: os.getenv(
-            "ENABLE_AZURE_RECONCILIATION", "false"
-        ).lower() == "true"
+        default_factory=lambda: _env_bool("ENABLE_AZURE_RECONCILIATION", False)
     )
-    azure_mirror_enabled: bool = field(
-        default_factory=lambda: os.getenv(
-            "ENABLE_AZURE_MIRROR", "true"
-        ).lower() == "true"
-    )
-    azure_discovery_enabled: bool = field(
-        default_factory=lambda: os.getenv(
-            "ENABLE_AZURE_DISCOVERY", "true"
-        ).lower() == "true"
-    )
-    azure_lifecycle_enabled: bool = field(
-        default_factory=lambda: os.getenv(
-            "ENABLE_AZURE_LIFECYCLE", "true"
-        ).lower() == "true"
-    )
-    xml_lifecycle_enabled: bool = field(
-        default_factory=lambda: os.getenv(
-            "ENABLE_XML_LIFECYCLE", "true"
-        ).lower() == "true"
-    )
-    metadata_enabled: bool = field(
-        default_factory=lambda: os.getenv(
-            "ENABLE_METADATA", "true"
-        ).lower() == "true"
-    )
-    business_dashboard_enabled: bool = field(
-        default_factory=lambda: os.getenv(
-            "ENABLE_BUSINESS_DASHBOARD", "true"
-        ).lower() == "true"
-    )
-    sqlite_output_enabled: bool = field(
-        default_factory=lambda: os.getenv(
-            "ENABLE_SQLITE_OUTPUT", "true"
-        ).lower() == "true"
-    )
-    excel_output_enabled: bool = field(
-        default_factory=lambda: os.getenv(
-            "ENABLE_EXCEL_OUTPUT", "true"
-        ).lower() == "true"
-    )
-    html_output_enabled: bool = field(
-        default_factory=lambda: os.getenv(
-            "ENABLE_HTML_OUTPUT", "true"
-        ).lower() == "true"
-    )
+    azure_mirror_enabled: bool = field(default_factory=lambda: _env_bool("ENABLE_AZURE_MIRROR", True))
+    azure_discovery_enabled: bool = field(default_factory=lambda: _env_bool("ENABLE_AZURE_DISCOVERY", True))
+    azure_lifecycle_enabled: bool = field(default_factory=lambda: _env_bool("ENABLE_AZURE_LIFECYCLE", True))
+    xml_lifecycle_enabled: bool = field(default_factory=lambda: _env_bool("ENABLE_XML_LIFECYCLE", True))
+    metadata_enabled: bool = field(default_factory=lambda: _env_bool("ENABLE_METADATA", True))
+    business_dashboard_enabled: bool = field(default_factory=lambda: _env_bool("ENABLE_BUSINESS_DASHBOARD", True))
+    sqlite_output_enabled: bool = field(default_factory=lambda: _env_bool("ENABLE_SQLITE_OUTPUT", True))
+    excel_output_enabled: bool = field(default_factory=lambda: _env_bool("ENABLE_EXCEL_OUTPUT", True))
+    html_output_enabled: bool = field(default_factory=lambda: _env_bool("ENABLE_HTML_OUTPUT", True))
     outputs_path: Path = field(
         default_factory=lambda: _path("OUTPUTS_PATH", "outputs")
     )
@@ -187,6 +193,21 @@ class Settings:
                 k, v = part.split("=", 1)
                 out[k.strip()] = int(v.strip())
         return out
+
+    def refresh_from_env(self) -> None:
+        """Re-read .env and refresh feature flags (call at runner startup)."""
+        reload_env()
+        self.azure_enabled = _env_bool("ENABLE_AZURE", False)
+        self.azure_reconciliation_enabled = _env_bool("ENABLE_AZURE_RECONCILIATION", False)
+        self.azure_mirror_enabled = _env_bool("ENABLE_AZURE_MIRROR", True)
+        self.azure_discovery_enabled = _env_bool("ENABLE_AZURE_DISCOVERY", True)
+        self.azure_lifecycle_enabled = _env_bool("ENABLE_AZURE_LIFECYCLE", True)
+        self.xml_lifecycle_enabled = _env_bool("ENABLE_XML_LIFECYCLE", True)
+        self.metadata_enabled = _env_bool("ENABLE_METADATA", True)
+        self.business_dashboard_enabled = _env_bool("ENABLE_BUSINESS_DASHBOARD", True)
+        self.sqlite_output_enabled = _env_bool("ENABLE_SQLITE_OUTPUT", True)
+        self.excel_output_enabled = _env_bool("ENABLE_EXCEL_OUTPUT", True)
+        self.html_output_enabled = _env_bool("ENABLE_HTML_OUTPUT", True)
 
     def apply_cli_filters(
         self,
