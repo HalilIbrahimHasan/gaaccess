@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from azure_reconciliation.safe_export import ExportErrors, safe_write_excel
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -14,14 +15,13 @@ logger = get_logger(__name__)
 def write_excel_report(
     output_path: Path,
     sheets: dict[str, pd.DataFrame],
-) -> Path:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        for name, df in sheets.items():
-            safe = name[:31]
-            (df if not df.empty else pd.DataFrame()).to_excel(writer, sheet_name=safe, index=False)
-    logger.info("Wrote Excel report: %s (%d sheets)", output_path, len(sheets))
-    return output_path
+    *,
+    export_errors: ExportErrors | None = None,
+) -> Path | None:
+    ok = safe_write_excel(output_path, sheets, export_errors=export_errors)
+    if ok:
+        return output_path
+    return None
 
 
 def build_comparison_workbook(

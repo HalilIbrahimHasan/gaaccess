@@ -15,6 +15,7 @@ import pandas as pd
 
 from azure_reconciliation.discovery_engine import DiscoverySelection
 from azure_reconciliation.excel_exporter import write_excel_report
+from azure_reconciliation.safe_export import safe_write_sqlite
 from azure_reconciliation.source_coverage import CoverageReport, coverage_to_dataframes
 from config.config import settings
 from utils.logger import get_logger
@@ -81,7 +82,7 @@ def _write_sqlite(path: Path, tables: dict[str, pd.DataFrame]) -> None:
         for name, df in tables.items():
             if df.empty:
                 continue
-            df.to_sql(name, conn, if_exists="replace", index=False)
+            safe_write_sqlite(conn, name, df)
     logger.info("Metadata SQLite: %s (%d tables)", path, len(tables))
 
 

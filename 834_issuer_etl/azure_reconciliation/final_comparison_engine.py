@@ -57,6 +57,87 @@ class ComparisonResult:
     overall_accuracy: float
     detail_rows: list[dict[str, Any]] = field(default_factory=list)
     low_confidence_reason: str = ""
+    behavior_penalty: float = 0.0
+    behavior_bonus: float = 0.0
+    behavior_notes: str = ""
+    rejected: bool = False
+    rejection_reason: str = ""
+
+
+def _strategy_behavior_adjustment(
+    *,
+    strategy_id: str,
+    strat_df: pd.DataFrame,
+    profile: TableProfile,
+    table_df: pd.DataFrame,
+    date_column: str,
+) -> tuple[float, float, str]:
+    """
+    Penalize snapshot-like behavior; reward event-like tables (e.g. 834_Inbound_test).
+    Returns (penalty, bonus, notes).
+    """
+    penalty = 0.0
+    bonus = 0.0
+    notes: list[str] = []
+    monthly = _strategy_monthly(strat_df)
+
+    if len(monthly) >= 2:
+        for col in ("enrollee_count", "enrollment_count"):
+            if col in monthly.columns:
+                vals = monthly[col].astype(float).tolist()
+                if vals and len(set(vals)) == 1:
+                    penalty += 12.0
+                    notes.append(f"same {col} repeated every month (static snapshot)")
+                    break
+
+    if not date_column and not profile.file_date_col and not profile.event_date_cols:
+        penalty += 8.0
+        notes.append("no event/date column detected")
+
+    if not profile.status_col and not profile.action_col:
+        penalty += 8.0
+        notes.append("no status/action lifecycle fields")
+
+    if strategy_id == "A":
+        penalty += 6.0
+        notes.append("Strategy A is active-coverage snapshot logic")
+
+    if strategy_id == "B" and len(monthly) >= 2:
+        enrollee_std = monthly["enrollee_count"].astype(float).std()
+        if enrollee_std == 0 or pd.isna(enrollee_std):
+            penalty += 5.0
+            notes.append("Strategy B shows no monthly enrollee movement")
+
+    # Event-like bonus — especially 834_Inbound_test
+    table_l = profile.table.lower()
+    cols_l = {c.lower() for c in table_df.columns}
+    inbound_markers = {
+        "gaa_834_file_date", "actioncode", "enrolleestatus",
+        "exchgassignedpolicyid", "exchgindividentifier",
+    }
+    if "834_inbound" in table_l:
+        present = inbound_markers & cols_l
+        if len(present) >= 4:
+            bonus += 8.0
+            notes.append(f"834 inbound event candidate (+{len(present)} key columns)")
+        elif present:
+            bonus += 4.0
+            notes.append("834 inbound partial event columns")
+
+    if date_column or profile.file_date_col or profile.event_date_cols:
+        bonus += 3.0
+    if profile.status_col or profile.action_col:
+        bonus += 2.0
+    if strategy_id == "C":
+        bonus += 4.0
+        notes.append("Strategy C event-date logic preferred")
+
+    if len(monthly) >= 3:
+        spread = monthly["enrollee_count"].astype(float).max() - monthly["enrollee_count"].astype(float).min()
+        if spread > 0:
+            bonus += min(5.0, spread / max(1.0, monthly["enrollee_count"].astype(float).mean()) * 10)
+
+    return penalty, bonus, "; ".join(notes)
 
 
 def historical_partitions(partitions: list[Partition]) -> list[Partition]:
@@ -397,6 +478,14 @@ def compare_strategy(
         ) / 2.0
 
     overall = sum(scores[k] * LEVEL_WEIGHTS.get(k, 0) for k in scores)
+    penalty, bonus, behavior_notes = _strategy_behavior_adjustment(
+        strategy_id=strategy_id,
+        strat_df=strat_df,
+        profile=profile,
+        table_df=table_df if table_df is not None else pd.DataFrame(),
+        date_column=date_column,
+    )
+    overall = overall - penalty + bonus
     overall = round(min(100.0, max(0.0, overall)), 2)
 
     reason = ""
@@ -405,8 +494,11 @@ def compare_strategy(
         reason = (
             f"Overall below 90% — weakest levels: "
             + ", ".join(f"{k}={v:.1f}%" for k, v in weak)
-            + ". Azure may be snapshot-based or use different event dates than XML lifecycle."
         )
+        if behavior_notes:
+            reason += f"; behavior: {behavior_notes}"
+        if penalty > 0:
+            reason += f"; snapshot penalty={penalty:.1f}%"
 
     detail = []
     xml_by_ym = {
@@ -439,6 +531,9 @@ def compare_strategy(
         overall_accuracy=overall,
         detail_rows=detail,
         low_confidence_reason=reason,
+        behavior_penalty=penalty,
+        behavior_bonus=bonus,
+        behavior_notes=behavior_notes,
     )
 
 
@@ -464,6 +559,18 @@ def run_final_comparison(
 
     table_names = discover_candidate_tables(engine, schema)
     results: list[ComparisonResult] = []
+    rejected: list[dict[str, str]] = []
+
+    if xml_raw.empty:
+        return {
+            "winner": None,
+            "results": [],
+            "rejected": [{"reason": "missing XML data"}],
+            "historical_window": historical_window_label(issuer_parts),
+            "xml_raw_rows": 0,
+            "xml_lifecycle_rows": len(xml_lifecycle),
+            "cannot_calculate_reason": "missing XML data",
+        }
 
     for table in table_names:
         profile = inspect_table(engine, schema, table)
@@ -476,6 +583,11 @@ def run_final_comparison(
             if not df.empty:
                 parts.append(df)
         if not parts:
+            rejected.append({
+                "source_table": profile.full_name,
+                "strategy_id": "all",
+                "reason": "Azure table returned zero rows for issuer/years",
+            })
             continue
         table_df = pd.concat(parts, ignore_index=True)
         all_strategies = run_applicable_strategies(table_df, profile, issuer_parts)
@@ -483,6 +595,11 @@ def run_final_comparison(
         for sid in FINAL_STRATEGIES:
             strat_df = all_strategies.get(sid)
             if strat_df is None or strat_df.empty:
+                rejected.append({
+                    "source_table": profile.full_name,
+                    "strategy_id": sid,
+                    "reason": "strategy produced zero rows",
+                })
                 continue
             date_col = ""
             status_col = profile.status_col or profile.action_col or ""
@@ -508,25 +625,51 @@ def run_final_comparison(
                 results.append(result)
             except Exception as exc:
                 logger.warning("Comparison skipped %s/%s: %s", sid, profile.full_name, exc)
+                rejected.append({
+                    "source_table": profile.full_name,
+                    "strategy_id": sid,
+                    "reason": str(exc),
+                })
 
-    if not results:
-        return {"winner": None, "results": [], "historical_window": historical_window_label(issuer_parts)}
-
-    winner = max(results, key=lambda r: r.overall_accuracy)
-    return {
-        "winner": winner,
-        "results": results,
+    meta = {
+        "xml_raw_rows": len(xml_raw),
+        "xml_lifecycle_rows": len(xml_lifecycle),
+        "azure_rows_sampled": sum(len(r.detail_rows) for r in results),
+        "rejected": rejected,
         "historical_window": historical_window_label(issuer_parts),
         "all_results_count": len(results),
     }
+
+    if not results:
+        reason = "missing Azure data"
+        if not table_names:
+            reason = "no Azure candidate tables discovered"
+        elif rejected:
+            reason = rejected[0].get("reason", reason)
+        return {"winner": None, "results": [], "cannot_calculate_reason": reason, **meta}
+
+    winner = max(results, key=lambda r: r.overall_accuracy)
+    return {"winner": winner, "results": results, **meta}
 
 
 def print_final_result(comparison: dict[str, Any]) -> None:
     """Print acceptance-criteria final result block."""
     winner: ComparisonResult | None = comparison.get("winner")
     lines = ["=" * 51, "FINAL RESULT"]
+
+    lines.append(f"XML rows: {comparison.get('xml_raw_rows', 'n/a')}")
+    lines.append(f"XML lifecycle rows: {comparison.get('xml_lifecycle_rows', 'n/a')}")
+    lines.append(f"Azure lifecycle rows (sample): {comparison.get('azure_lifecycle_rows', comparison.get('azure_rows_sampled', 'n/a'))}")
+
     if winner is None:
-        lines.append("No strategy comparison results — check Azure tables and XML lifecycle")
+        reason = comparison.get("cannot_calculate_reason", "unknown")
+        lines.append("Overall Accuracy: cannot calculate")
+        lines.append(f"Reason: {reason}")
+        rejected = comparison.get("rejected", [])
+        if rejected:
+            lines.append("Rejected strategies:")
+            for r in rejected[:10]:
+                lines.append(f"  {r.get('source_table', '?')} / {r.get('strategy_id', '?')}: {r.get('reason', '')}")
         lines.append("=" * 51)
         for line in lines:
             print(line)
@@ -549,13 +692,22 @@ def print_final_result(comparison: dict[str, Any]) -> None:
         f"Historical Window: {comparison.get('historical_window', 'n/a')}",
         f"Enrollment Match: {s.get('enrollment_match', 0):.1f}%",
         f"Enrollee Match: {s.get('enrollee_match', 0):.1f}%",
-        f"Lifecycle Match: {s.get('lifecycle_match', 0):.1f}%",
+        f"Subscriber Match: {s.get('subscriber_match', 0):.1f}%",
         f"Status Match: {s.get('status_match', 0):.1f}%",
+        f"Lifecycle Match: {s.get('lifecycle_match', 0):.1f}%",
         f"Timeline Match: {s.get('timeline_match', 0):.1f}%",
         f"Overall Accuracy: {winner.overall_accuracy:.1f}%",
     ])
-    if winner.overall_accuracy < 90.0 and winner.low_confidence_reason:
-        lines.append(f"Below 90%: {winner.low_confidence_reason}")
+    if winner.behavior_penalty or winner.behavior_bonus:
+        lines.append(
+            f"Behavior adjustment: penalty={winner.behavior_penalty:.1f}% "
+            f"bonus={winner.behavior_bonus:.1f}% ({winner.behavior_notes})"
+        )
+    if winner.overall_accuracy < 90.0:
+        lines.append(f"WARNING (below 90%): {winner.low_confidence_reason}")
+    rejected = comparison.get("rejected", [])
+    if rejected:
+        lines.append(f"Rejected strategies: {len(rejected)}")
     lines.append("=" * 51)
     for line in lines:
         print(line)

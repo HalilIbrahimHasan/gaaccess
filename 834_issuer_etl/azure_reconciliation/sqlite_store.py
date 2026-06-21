@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from azure_reconciliation.safe_export import ExportErrors, safe_write_sqlite
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -54,8 +55,9 @@ CREATE TABLE IF NOT EXISTS issuer_month_summary (
 
 
 class ReconciliationStore:
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, export_errors: ExportErrors | None = None) -> None:
         self.db_path = db_path
+        self.export_errors = export_errors or ExportErrors()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init()
 
@@ -71,14 +73,19 @@ class ReconciliationStore:
             logger.warning("Skipping empty write to %s", table)
             return 0
         with self._conn() as conn:
-            conn.execute(f"DELETE FROM {table}")
-            df.to_sql(table, conn, if_exists="append", index=False)
-        logger.info("Wrote %d row(s) to %s", len(df), table)
-        return len(df)
+            ok = safe_write_sqlite(
+                conn, table, df, if_exists="replace", export_errors=self.export_errors,
+            )
+        if ok:
+            logger.info("Wrote %d row(s) to %s", len(df), table)
+            return len(df)
+        return 0
 
     def append_table(self, table: str, df: pd.DataFrame) -> int:
         if df.empty:
             return 0
         with self._conn() as conn:
-            df.to_sql(table, conn, if_exists="append", index=False)
-        return len(df)
+            ok = safe_write_sqlite(
+                conn, table, df, if_exists="append", export_errors=self.export_errors,
+            )
+        return len(df) if ok else 0

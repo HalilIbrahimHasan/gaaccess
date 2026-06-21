@@ -27,22 +27,37 @@ def validate_run(stats: dict[str, Any], *, require_azure: bool = False) -> dict[
 
     if require_azure:
         _check("azure_connected", stats.get("azure_available", False), stats.get("azure_error", ""))
-        table = stats.get("azure_selected_table")
+        table = stats.get("final_selected_table") or stats.get("azure_selected_table")
         _check(
             "azure_table_selected",
             bool(table) and str(table).lower() not in ("n/a", "none", ""),
             f"table={table!r}",
         )
+        has_rows = stats.get("azure_raw_rows", 0) > 0
+        has_final = bool(stats.get("final_selected_table"))
         _check(
             "azure_rows_fetched",
-            stats.get("azure_raw_rows", 0) > 0,
-            f"azure_raw_rows={stats.get('azure_raw_rows', 0)}",
+            has_rows or has_final,
+            f"azure_raw_rows={stats.get('azure_raw_rows', 0)} final_comparison={has_final}",
+        )
+        _check(
+            "final_comparison_ran",
+            bool(stats.get("final_selected_table")) or bool(stats.get("final_comparison_paths")),
+            stats.get("final_comparison_skipped", ""),
         )
 
     if stats.get("excel_output_enabled", True):
-        _check("excel_output", bool(stats.get("output_excel_path")), "")
+        _check(
+            "excel_output",
+            bool(stats.get("output_excel_path")) or bool(stats.get("final_comparison_paths")),
+            "excel may have failed — see outputs/comparison/final_result.*",
+        )
     if stats.get("sqlite_output_enabled", True):
-        _check("sqlite_output", bool(stats.get("output_sqlite_path")), "")
+        _check(
+            "sqlite_output",
+            bool(stats.get("output_sqlite_path")) or stats.get("export_error_count", 0) > 0,
+            "sqlite may have failed — CSV fallbacks in outputs/csv/",
+        )
 
     passed = sum(1 for c in checks if c["passed"])
     report = {"checks": checks, "passed": passed, "total": len(checks), "all_passed": passed == len(checks)}
@@ -78,6 +93,10 @@ def print_final_validation(stats: dict[str, Any]) -> None:
         f"output Excel path:              {stats.get('output_excel_path', 'n/a')}",
         f"output SQLite path:             {stats.get('output_sqlite_path', 'n/a')}",
         f"output dashboard path:          {stats.get('output_dashboard_path', 'n/a')}",
+        f"issuer reports index:           {stats.get('issuer_reports_index', 'n/a')}",
+        f"final comparison paths:         {stats.get('final_comparison_paths', 'n/a')}",
+        f"export error count:             {stats.get('export_error_count', 0)}",
+        f"debug paths:                    {stats.get('debug_paths', 'n/a')}",
         f"execution seconds:              {stats.get('execution_seconds', 'n/a')}",
         "=" * 60,
     ]

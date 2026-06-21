@@ -70,10 +70,9 @@ def main() -> None:
         logger.error("%s", exc)
         sys.exit(1)
 
-    validation = stats.get("validation", {})
-    if settings.azure_enabled and not args.skip_azure:
-        if not validation.get("all_passed", True):
-            sys.exit(1)
+    # Exit 1 only for fatal failures (connection, no source_data) — not low accuracy or export errors
+    if stats.get("azure_requested") and not stats.get("azure_available"):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

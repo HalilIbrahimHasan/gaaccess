@@ -28,14 +28,17 @@ from azure_reconciliation.business_dashboard import generate_business_dashboard
 from azure_reconciliation.column_mapper import build_column_mapping, mapping_report_sheets
 from azure_reconciliation.comparison_engine import aggregate_level_stats, compare_at_level
 from azure_reconciliation.dashboard import generate_reconciliation_dashboard
+from azure_reconciliation.debug_outputs import write_all_debug_outputs
 from azure_reconciliation.discovery_engine import DiscoverySelection
 from azure_reconciliation.excel_exporter import build_comparison_workbook, write_excel_report
 from azure_reconciliation.final_comparison_engine import print_final_result, run_final_comparison
 from azure_reconciliation.final_comparison_exporter import export_final_comparison
+from azure_reconciliation.issuer_reports import generate_issuer_reports
 from azure_reconciliation.lifecycle_engine import build_all_lifecycle_snapshots, replay_lifecycle
 from azure_reconciliation.mapping_report import write_column_mapping_html
 from azure_reconciliation.metadata_engine import generate_metadata
 from azure_reconciliation.reconciler import issuer_month_summary
+from azure_reconciliation.safe_export import ExportErrors, write_csv_fallback
 from azure_reconciliation.self_validation import print_final_validation, validate_run
 from azure_reconciliation.source_coverage import discover_source_coverage, coverage_summary_dict
 from azure_reconciliation.sqlite_store import ReconciliationStore
@@ -54,10 +57,21 @@ def _output_dirs() -> dict[str, Path]:
         "sqlite": root / "sqlite",
         "dashboard": root / "dashboard",
         "reports": root / "reports",
+        "csv": root / "csv",
+        "debug": root / "debug",
+        "comparison": root / "comparison",
+        "issuer_reports": root / "issuer_reports",
     }
     for d in dirs.values():
         d.mkdir(parents=True, exist_ok=True)
     return dirs
+
+
+def _coverage_dataframe(partitions: list) -> pd.DataFrame:
+    return pd.DataFrame([
+        {"issuer": p.issuer, "year": p.year, "month": p.month, "label": p.label()}
+        for p in partitions
+    ])
 
 
 def run_intelligence_pipeline(
@@ -72,6 +86,7 @@ def run_intelligence_pipeline(
     t0 = time.perf_counter()
     settings.refresh_from_env()
     dirs = _output_dirs()
+    export_errors = ExportErrors()
     azure_requested = settings.azure_enabled and not skip_azure
     stats: dict[str, Any] = {
         "azure_requested": azure_requested,
@@ -96,8 +111,15 @@ def run_intelligence_pipeline(
     })
     if not partitions:
         logger.warning("No source_data partitions — stopping")
+        stats["execution_seconds"] = round(time.perf_counter() - t0, 2)
         stats["validation"] = validate_run(stats, require_azure=azure_requested)
         print_final_validation(stats)
+        write_all_debug_outputs(
+            stats=stats,
+            coverage_df=_coverage_dataframe(partitions),
+            export_errors=export_errors,
+            validation=stats["validation"],
+        )
         if azure_requested:
             raise RuntimeError("ENABLE_AZURE=true but no source_data partitions discovered")
         return stats
@@ -290,89 +312,10 @@ def run_intelligence_pipeline(
         stats["xml_not_in_azure_count"] = 0
         stats["azure_not_in_xml_count"] = 0
 
-    # 10–12. Outputs
-    store_path = dirs["sqlite"] / "intelligence.db"
-    if settings.sqlite_output_enabled:
-        store = ReconciliationStore(store_path)
-        if not xml_lifecycle.empty:
-            store.replace_table("xml_snapshot", xml_lifecycle)
-        if not azure_lifecycle.empty:
-            store.replace_table("azure_snapshot", azure_lifecycle)
-        if not detail_df.empty:
-            store.replace_table("comparison_detail", detail_df.head(5000))
-        if not summary_df.empty:
-            store.replace_table("comparison_summary", summary_df)
-        stats["output_sqlite_path"] = str(store_path)
-
-    excel_path = dirs["excel"] / "azure_xml_comparison.xlsx"
-    if settings.excel_output_enabled:
-        mapping_sheets = mapping_report_sheets(mapping)
-        workbook = build_comparison_workbook(
-            final_summary=summary_df,
-            status_summary=level_stats,
-            issuer_month=issuer_month_summary(summary_df) if not summary_df.empty else pd.DataFrame(),
-            xml_summary=xml_lifecycle.head(1000) if not xml_lifecycle.empty else pd.DataFrame(),
-            azure_summary=azure_lifecycle.head(1000) if not azure_lifecycle.empty else pd.DataFrame(),
-            match_sample=detail_df.head(500),
-            status_diff=detail_df[detail_df.get("status_match") == False] if "status_match" in detail_df.columns else pd.DataFrame(),  # noqa: E712
-            xml_not_in_azure=detail_df[detail_df.get("match_type") == "XML_ONLY"] if "match_type" in detail_df.columns else pd.DataFrame(),
-            azure_not_in_xml=detail_df[detail_df.get("match_type") == "AZURE_ONLY"] if "match_type" in detail_df.columns else pd.DataFrame(),
-            detailed=detail_df,
-            lifecycle_summary=xml_lifecycle.groupby(
-                [c for c in ["issuer", "coverage_year", "snapshot_month", "canonical_status"] if c in xml_lifecycle.columns],
-                dropna=False,
-            ).size().reset_index(name="count") if not xml_lifecycle.empty else pd.DataFrame(),
-            column_mapping=mapping_sheets.get("mappings", pd.DataFrame()),
-        )
-        write_excel_report(excel_path, workbook)
-        if settings.excel_output_enabled:
-            write_excel_report(dirs["excel"] / "column_mapping_report.xlsx", mapping_sheets)
-        stats["output_excel_path"] = str(excel_path)
-
-    recon_dash = dirs["dashboard"] / "reconciliation_dashboard.html"
-    life_dash = dirs["dashboard"] / "lifecycle_dashboard.html"
-    biz_dash = dirs["dashboard"] / "business_dashboard.html"
-
-    if settings.html_output_enabled:
-        write_column_mapping_html(
-            dirs["reports"] / "column_mapping_report.html",
-            mapping,
-            xml_row_count=len(xml_raw),
-            azure_row_count=len(azure_raw),
-        )
-        generate_reconciliation_dashboard(summary_df, level_stats, recon_dash)
-        generate_reconciliation_dashboard(
-            xml_lifecycle if not xml_lifecycle.empty else summary_df,
-            level_stats, life_dash, title="Lifecycle Dashboard",
-        )
-        generate_business_dashboard(
-            xml_lifecycle=xml_lifecycle,
-            azure_lifecycle=azure_lifecycle,
-            comparison_summary=summary_df,
-            level_stats=level_stats,
-            output_path=biz_dash,
-        )
-        stats["output_dashboard_path"] = str(biz_dash)
-        stats["reconciliation_dashboard_path"] = str(recon_dash)
-        stats["lifecycle_dashboard_path"] = str(life_dash)
-
-    # Metadata
-    primary_discovery = next(iter(discovery_by_issuer.values()), None) if discovery_by_issuer else None
-    if settings.metadata_enabled:
-        meta_paths = generate_metadata(
-            coverage=coverage,
-            xml_raw=xml_raw,
-            xml_lifecycle=xml_lifecycle,
-            azure_raw=azure_raw,
-            azure_lifecycle=azure_lifecycle,
-            discovery=primary_discovery,
-            run_stats=stats,
-        )
-        stats.update(meta_paths)
-
-    # Final comparison — determine best Azure strategy vs XML business logic
+    # Final comparison FIRST — must run even if later exports fail
+    final_comparison: dict[str, Any] = {}
+    strategy_scores_df = pd.DataFrame()
     if azure_requested and engine and stats.get("azure_available") and settings.xml_lifecycle_enabled:
-        final_paths: dict[str, str] = {}
         for issuer in coverage.issuers:
             issuer_xml = (
                 xml_raw[xml_raw["issuer"].astype(str) == str(issuer)]
@@ -382,30 +325,180 @@ def run_intelligence_pipeline(
                 xml_lifecycle[xml_lifecycle["issuer"].astype(str) == str(issuer)]
                 if not xml_lifecycle.empty and "issuer" in xml_lifecycle.columns else xml_lifecycle
             )
-            comparison = run_final_comparison(
+            final_comparison = run_final_comparison(
                 engine,
                 issuer=issuer,
                 partitions=partitions,
                 xml_raw=issuer_xml,
                 xml_lifecycle=issuer_lc,
             )
-            final_paths = export_final_comparison(comparison, issuer=issuer)
-            print_final_result(comparison)
-            winner = comparison.get("winner")
+            final_comparison["azure_lifecycle_rows"] = len(azure_lifecycle)
+            final_comparison["azure_raw_rows"] = len(azure_raw)
+            try:
+                final_paths = export_final_comparison(
+                    final_comparison, issuer=issuer, export_errors=export_errors,
+                )
+                stats["final_comparison_paths"] = final_paths
+            except Exception as exc:
+                export_errors.record(f"final_comparison export failed: {exc}")
+            print_final_result(final_comparison)
+            winner = final_comparison.get("winner")
             if winner:
                 stats["final_selected_table"] = winner.source_table
                 stats["final_selected_strategy"] = winner.strategy_id
                 stats["final_overall_accuracy"] = winner.overall_accuracy
                 stats["final_confidence_score"] = winner.overall_accuracy
-        stats["final_comparison_paths"] = final_paths
+            strategy_scores_df = pd.DataFrame([
+                {"strategy_id": r.strategy_id, "source_table": r.source_table,
+                 "overall_accuracy": r.overall_accuracy, **r.scores}
+                for r in final_comparison.get("results", [])
+            ])
+    elif azure_requested and not stats.get("azure_available"):
+        stats["final_comparison_skipped"] = "Azure not available"
+    else:
+        stats["final_comparison_skipped"] = "Azure not requested or XML lifecycle disabled"
 
+    # Per-issuer inspectable reports (always when we have XML)
+    try:
+        index_path = generate_issuer_reports(
+            issuers=[str(i) for i in coverage.issuers],
+            partitions=partitions,
+            xml_raw=xml_raw,
+            xml_lifecycle=xml_lifecycle,
+            azure_raw=azure_raw,
+            azure_lifecycle=azure_lifecycle,
+            comparison_detail=detail_df,
+            comparison_summary=summary_df,
+            export_errors=export_errors,
+        )
+        stats["issuer_reports_index"] = str(index_path)
+    except Exception as exc:
+        export_errors.record(f"issuer_reports failed: {exc}")
+
+    # CSV fallbacks for major frames
+    write_csv_fallback("xml_lifecycle", xml_lifecycle, export_errors=export_errors)
+    write_csv_fallback("azure_lifecycle", azure_lifecycle, export_errors=export_errors)
+    write_csv_fallback("comparison_detail", detail_df, export_errors=export_errors)
+    write_csv_fallback("comparison_summary", summary_df, export_errors=export_errors)
+
+    # SQLite / Excel / HTML — non-blocking
+    store_path = dirs["sqlite"] / "intelligence.db"
+    if settings.sqlite_output_enabled:
+        try:
+            store = ReconciliationStore(store_path, export_errors=export_errors)
+            if not xml_lifecycle.empty:
+                store.replace_table("xml_snapshot", xml_lifecycle)
+            if not azure_lifecycle.empty:
+                store.replace_table("azure_snapshot", azure_lifecycle)
+            if not detail_df.empty:
+                store.replace_table("comparison_detail", detail_df.head(5000))
+            if not summary_df.empty:
+                store.replace_table("comparison_summary", summary_df)
+            stats["output_sqlite_path"] = str(store_path)
+        except Exception as exc:
+            export_errors.record(f"intelligence SQLite bundle failed: {exc}")
+
+    excel_path = dirs["excel"] / "azure_xml_comparison.xlsx"
+    if settings.excel_output_enabled:
+        try:
+            mapping_sheets = mapping_report_sheets(mapping)
+            workbook = build_comparison_workbook(
+                final_summary=summary_df,
+                status_summary=level_stats,
+                issuer_month=issuer_month_summary(summary_df) if not summary_df.empty else pd.DataFrame(),
+                xml_summary=xml_lifecycle.head(1000) if not xml_lifecycle.empty else pd.DataFrame(),
+                azure_summary=azure_lifecycle.head(1000) if not azure_lifecycle.empty else pd.DataFrame(),
+                match_sample=detail_df.head(500),
+                status_diff=detail_df[detail_df.get("status_match") == False] if "status_match" in detail_df.columns else pd.DataFrame(),  # noqa: E712
+                xml_not_in_azure=detail_df[detail_df.get("match_type") == "XML_ONLY"] if "match_type" in detail_df.columns else pd.DataFrame(),
+                azure_not_in_xml=detail_df[detail_df.get("match_type") == "AZURE_ONLY"] if "match_type" in detail_df.columns else pd.DataFrame(),
+                detailed=detail_df,
+                lifecycle_summary=xml_lifecycle.groupby(
+                    [c for c in ["issuer", "coverage_year", "snapshot_month", "canonical_status"] if c in xml_lifecycle.columns],
+                    dropna=False,
+                ).size().reset_index(name="count") if not xml_lifecycle.empty else pd.DataFrame(),
+                column_mapping=mapping_sheets.get("mappings", pd.DataFrame()),
+            )
+            if write_excel_report(excel_path, workbook, export_errors=export_errors):
+                stats["output_excel_path"] = str(excel_path)
+            write_excel_report(
+                dirs["excel"] / "column_mapping_report.xlsx",
+                mapping_sheets,
+                export_errors=export_errors,
+            )
+        except Exception as exc:
+            export_errors.record(f"Excel export failed: {exc}")
+
+    recon_dash = dirs["dashboard"] / "reconciliation_dashboard.html"
+    life_dash = dirs["dashboard"] / "lifecycle_dashboard.html"
+    biz_dash = dirs["dashboard"] / "business_dashboard.html"
+
+    if settings.html_output_enabled:
+        try:
+            write_column_mapping_html(
+                dirs["reports"] / "column_mapping_report.html",
+                mapping,
+                xml_row_count=len(xml_raw),
+                azure_row_count=len(azure_raw),
+            )
+            generate_reconciliation_dashboard(summary_df, level_stats, recon_dash)
+            generate_reconciliation_dashboard(
+                xml_lifecycle if not xml_lifecycle.empty else summary_df,
+                level_stats, life_dash, title="Lifecycle Dashboard",
+            )
+            generate_business_dashboard(
+                xml_lifecycle=xml_lifecycle,
+                azure_lifecycle=azure_lifecycle,
+                comparison_summary=summary_df,
+                level_stats=level_stats,
+                output_path=biz_dash,
+            )
+            stats["output_dashboard_path"] = str(biz_dash)
+            stats["reconciliation_dashboard_path"] = str(recon_dash)
+            stats["lifecycle_dashboard_path"] = str(life_dash)
+        except Exception as exc:
+            export_errors.record(f"HTML dashboard export failed: {exc}")
+
+    # Metadata
+    primary_discovery = next(iter(discovery_by_issuer.values()), None) if discovery_by_issuer else None
+    if settings.metadata_enabled:
+        try:
+            meta_paths = generate_metadata(
+                coverage=coverage,
+                xml_raw=xml_raw,
+                xml_lifecycle=xml_lifecycle,
+                azure_raw=azure_raw,
+                azure_lifecycle=azure_lifecycle,
+                discovery=primary_discovery,
+                run_stats=stats,
+            )
+            stats.update(meta_paths)
+        except Exception as exc:
+            export_errors.record(f"metadata export failed: {exc}")
+
+    stats["export_error_count"] = len(export_errors.errors)
     stats["execution_seconds"] = round(time.perf_counter() - t0, 2)
     require_azure = bool(stats.get("azure_requested"))
     stats["validation"] = validate_run(stats, require_azure=require_azure)
     print_final_validation(stats)
 
-    if require_azure and not stats["validation"].get("all_passed", True):
-        err = stats.get("azure_error") or "Azure validation failed — see logs"
-        raise RuntimeError(err)
+    debug_paths = write_all_debug_outputs(
+        stats=stats,
+        coverage_df=_coverage_dataframe(partitions),
+        export_errors=export_errors,
+        strategy_scores=strategy_scores_df,
+        validation=stats["validation"],
+    )
+    stats["debug_paths"] = debug_paths
+
+    # Fatal only: connection / no source_data / final comparison produced nothing
+    if require_azure:
+        if stats.get("azure_error") and not stats.get("azure_available"):
+            raise RuntimeError(stats["azure_error"])
+        if final_comparison and not final_comparison.get("winner") and not final_comparison.get("results"):
+            reason = final_comparison.get("cannot_calculate_reason", "final comparison produced no output")
+            logger.warning("Final comparison warning: %s (outputs still written)", reason)
+        elif not final_comparison and stats.get("azure_available"):
+            logger.warning("Final comparison did not run — check ENABLE_XML_LIFECYCLE")
 
     return stats
