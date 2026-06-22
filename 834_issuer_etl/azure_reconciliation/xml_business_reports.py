@@ -236,25 +236,35 @@ def _latest_state_per_business_month(df: pd.DataFrame) -> pd.DataFrame:
 def _build_model_h_lifecycle_input(
     canonical: pd.DataFrame,
     lifecycle_snap: pd.DataFrame,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, Any]:
     """
-    Model H input: latest-state per PK + business month from deduped canonical.
+    Model H input: deduped canonical with business transaction collapse applied.
 
     Does not stack all partition lifecycle snapshots or re-apply business month basis
     to replay output (that path multiplied rows across months).
     """
+    from azure_reconciliation.business_transaction_collapse import (
+        CollapseResult,
+        apply_business_transaction_collapse,
+    )
+
     deduped = _dedupe_transactions(canonical)
     if not deduped.empty:
-        return _latest_state_per_business_month(deduped)
+        collapse_result = apply_business_transaction_collapse(
+            deduped,
+            fallback_latest_state_fn=_latest_state_per_business_month,
+        )
+        return collapse_result.collapsed, collapse_result
 
+    empty_result = CollapseResult(collapsed=pd.DataFrame(), applied=False)
     if lifecycle_snap.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), empty_result
 
     mapped = lifecycle_snapshots_to_model_input(lifecycle_snap)
     dedupe_keys = [k for k in PK + ["year", "month"] if k in mapped.columns]
     if dedupe_keys:
-        return mapped.drop_duplicates(subset=dedupe_keys, keep="last")
-    return mapped
+        return mapped.drop_duplicates(subset=dedupe_keys, keep="last"), empty_result
+    return mapped, empty_result
 
 
 def lifecycle_snapshots_to_model_input(snapshots: pd.DataFrame) -> pd.DataFrame:
@@ -423,6 +433,7 @@ class IssuerBusinessResult:
     business_monthly: pd.DataFrame = field(default_factory=pd.DataFrame)
     business_yearly: pd.DataFrame = field(default_factory=pd.DataFrame)
     business_rollup: pd.DataFrame = field(default_factory=pd.DataFrame)
+    collapse_result: Any = None
 
 
 def process_issuer_xml_business(
@@ -447,9 +458,24 @@ def process_issuer_xml_business(
     lifecycle_snap = build_all_lifecycle_snapshots(xml_raw, partitions)
     result.lifecycle_snapshots = lifecycle_snap
 
-    lifecycle_input = _build_model_h_lifecycle_input(canonical, lifecycle_snap)
+    lifecycle_input, collapse_result = _build_model_h_lifecycle_input(canonical, lifecycle_snap)
+    result.collapse_result = collapse_result
+    if collapse_result is not None and not collapse_result.before_model_h_input.empty:
+        collapse_result.before_model_h_input = _attach_canonical_subscriber_columns(
+            collapse_result.before_model_h_input, canonical,
+        )
     lifecycle_input = _attach_canonical_subscriber_columns(lifecycle_input, canonical)
+    if collapse_result is not None:
+        collapse_result.collapsed = lifecycle_input.copy()
     result.lifecycle_input = lifecycle_input
+
+    if collapse_result is not None:
+        try:
+            from azure_reconciliation.business_transaction_collapse import write_collapse_audits
+
+            write_collapse_audits(collapse_result, issuer=issuer, partitions=partitions)
+        except Exception as exc:
+            logger.warning("Collapse audit export skipped — %s", exc)
 
     if issuer == "15105" and any(p.year == "2026" and _zmonth(p.month) == "01" for p in partitions):
         try:
