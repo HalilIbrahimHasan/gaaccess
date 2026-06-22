@@ -19,6 +19,7 @@ from azure_reconciliation.record_comparison import (
     compare_records,
     join_key_series,
 )
+from azure_reconciliation.df_utils import find_col, normalize_id_series
 from azure_reconciliation.safe_export import safe_write_csv, safe_write_html_report
 from azure_reconciliation.status_mapper import normalize_status
 from config.config import settings
@@ -30,6 +31,28 @@ PK = LIFECYCLE_PRIMARY_JOIN
 DASHBOARD_GROUP_KEYS = ["issuer", "year", "month", "insurance_type", "status"]
 ACTIVE_STATUSES = frozenset({"ENROLLED", "ACTIVE", "EFFECTUATED", "CONFIRMED"})
 MAINT_ACTION_PREFIXES = frozenset({"001", "021", "024", "030", "032", "33", "34", "XN"})
+
+XML_ENROLLMENT_ID_COLS = [
+    "policy_id", "enrollment_id", "exchg_assigned_policy_id",
+    "health_coverage_policy_no", "healthCoveragePolicyID",
+]
+XML_ENROLLEE_ID_COLS = [
+    "member_id", "enrollee_id", "exchg_indiv_identifier",
+    "issuer_indiv_identifier", "exchg_assigned_enrollee_id",
+]
+XML_SUBSCRIBER_ID_COLS = [
+    "subscriber_id", "exchg_subscriber_identifier", "issuer_subscriber_identifier",
+]
+AZURE_ENROLLMENT_ID_COLS = [
+    "policy_id", "exchgAssignedPolicyID", "exchg_assigned_policy_id",
+    "healthCoveragePolicyID", "health_coverage_policy_no",
+]
+AZURE_ENROLLEE_ID_COLS = [
+    "member_id", "exchgIndivIdentifier", "exchg_indiv_identifier",
+]
+AZURE_SUBSCRIBER_ID_COLS = [
+    "subscriber_id", "exchgSubscriberIdentifier", "exchg_subscriber_identifier",
+]
 
 AZURE_ONLY_REASONS = [
     "POLICY_EXISTS_XML_MEMBER_DIFF",
@@ -362,6 +385,70 @@ def _final_status_replay(df: pd.DataFrame) -> pd.DataFrame:
     return collapse_to_snapshot(df, PK)
 
 
+def _coalesce_id_series(df: pd.DataFrame, candidates: list[str]) -> pd.Series:
+    """First non-empty normalized ID per row across candidate columns."""
+    if df.empty:
+        return pd.Series(dtype=str)
+    out = pd.Series([""] * len(df), index=df.index, dtype=str)
+    for name in candidates:
+        col = find_col(df, name)
+        if not col:
+            continue
+        vals = normalize_id_series(df[col])
+        empty = out.astype(str).str.strip() == ""
+        has_val = vals.astype(str).str.strip() != ""
+        out = out.where(~(empty & has_val), vals)
+    return out
+
+
+def _nunique_nonempty(series: pd.Series) -> int:
+    valid = series.astype(str).str.strip()
+    valid = valid[valid != ""]
+    return int(valid.nunique())
+
+
+def _columns_with_data(df: pd.DataFrame, candidates: list[str]) -> list[str]:
+    found: list[str] = []
+    for name in candidates:
+        col = find_col(df, name)
+        if not col:
+            continue
+        if int((normalize_id_series(df[col]).astype(str).str.strip() != "").sum()) > 0:
+            found.append(col)
+    return found
+
+
+def build_model_h_count_column_audit(
+    xml_canonical: pd.DataFrame,
+    az_canonical: pd.DataFrame,
+) -> pd.DataFrame:
+    """Document which canonical columns supply Model H distinct counts."""
+    rows: list[dict[str, Any]] = []
+    for source, df, enroll_cols, enrollee_cols, sub_cols in (
+        ("xml", xml_canonical, XML_ENROLLMENT_ID_COLS, XML_ENROLLEE_ID_COLS, XML_SUBSCRIBER_ID_COLS),
+        ("azure", az_canonical, AZURE_ENROLLMENT_ID_COLS, AZURE_ENROLLEE_ID_COLS, AZURE_SUBSCRIBER_ID_COLS),
+    ):
+        for count_type, candidates in (
+            ("enrollment_count", enroll_cols),
+            ("enrollee_count", enrollee_cols),
+            ("subscriber_count", sub_cols),
+        ):
+            used = _columns_with_data(df, candidates)
+            coalesced = _coalesce_id_series(df, candidates)
+            nonempty = int((coalesced.astype(str).str.strip() != "").sum())
+            rows.append({
+                "source": source,
+                "count_type": count_type,
+                "candidate_columns": ";".join(candidates),
+                "columns_with_data": ";".join(used),
+                "primary_column": used[0] if used else "",
+                "rows_with_id": nonempty,
+                "rows_total": len(df),
+                "nonempty_rate_pct": round(100.0 * nonempty / max(len(df), 1), 2),
+            })
+    return pd.DataFrame(rows)
+
+
 def _chandra_dashboard(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
     """Model H — enrollment/enrollee/subscriber counts by issuer/month/status."""
     if df.empty:
@@ -372,13 +459,24 @@ def _chandra_dashboard(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
     work["status"] = _status_series(work)
     work["insurance_type"] = _col(work, "insurance_type")
     work["issuer"] = _col(work, "issuer")
-    sub_col = "subscriber_id" if "subscriber_id" in work.columns else "member_id"
-    agg = work.groupby(
-        DASHBOARD_GROUP_KEYS, dropna=False,
-    ).agg(
-        enrollment_count=("policy_id", "nunique"),
-        enrollee_count=("member_id", "nunique"),
-        subscriber_count=(sub_col, "nunique"),
+
+    if source == "xml":
+        enroll_cols, enrollee_cols, sub_cols = (
+            XML_ENROLLMENT_ID_COLS, XML_ENROLLEE_ID_COLS, XML_SUBSCRIBER_ID_COLS,
+        )
+    else:
+        enroll_cols, enrollee_cols, sub_cols = (
+            AZURE_ENROLLMENT_ID_COLS, AZURE_ENROLLEE_ID_COLS, AZURE_SUBSCRIBER_ID_COLS,
+        )
+
+    work["_enrollment_id"] = _coalesce_id_series(work, enroll_cols)
+    work["_enrollee_id"] = _coalesce_id_series(work, enrollee_cols)
+    work["_subscriber_id"] = _coalesce_id_series(work, sub_cols)
+
+    agg = work.groupby(DASHBOARD_GROUP_KEYS, dropna=False).agg(
+        enrollment_count=("_enrollment_id", _nunique_nonempty),
+        enrollee_count=("_enrollee_id", _nunique_nonempty),
+        subscriber_count=("_subscriber_id", _nunique_nonempty),
     ).reset_index()
     agg["source"] = source
     return agg
@@ -820,6 +918,9 @@ def finalize_model_h_business_output(
 
     xml_dash = _chandra_dashboard(xml_canonical, source="xml")
     az_dash = _chandra_dashboard(az_canonical, source="azure")
+    count_audit = build_model_h_count_column_audit(xml_canonical, az_canonical)
+    p_audit = dbg / "model_h_count_column_audit.csv"
+    safe_write_csv(p_audit, count_audit, table_name="model_h_count_column_audit", drop_duplicate_value_columns=False)
     h_scores = score_model_h(xml_dash, az_dash)
     detail = h_scores["detail"]
     xml_only_df = build_model_h_xml_not_in_azure(detail, az_dash)
@@ -921,8 +1022,14 @@ def finalize_model_h_business_output(
             "final_business_result_html": str(html_path),
             "model_h_xml_vs_azure_detail": str(p_detail),
             "model_h_xml_not_in_azure": str(p_xml_only),
+            "model_h_count_column_audit": str(p_audit),
             "final_executive_summary": str(p_exec),
         },
+        "detail_df": detail_out,
+        "xml_only_df": xml_only_df,
+        "count_audit_df": count_audit,
+        "xml_dash": xml_dash,
+        "az_dash": az_dash,
     }
     _write_executive_summary(p_exec, issuer=issuer, model_h=model_h_result, xml_raw_rows=xml_raw_rows)
     return model_h_result

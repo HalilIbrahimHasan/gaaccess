@@ -34,7 +34,10 @@ from azure_reconciliation.final_comparison_engine import (  # noqa: E402
     run_final_comparison,
 )
 from azure_reconciliation.final_comparison_exporter import export_final_comparison  # noqa: E402
-from azure_reconciliation.issuer_reports import generate_issuer_reports  # noqa: E402
+from azure_reconciliation.partitioned_reports import (
+    generate_partitioned_reports,
+    generate_partitioned_reports_for_issuer,
+)  # noqa: E402
 from azure_reconciliation.lifecycle_engine import build_all_lifecycle_snapshots  # noqa: E402
 from azure_reconciliation.safe_export import ExportErrors, write_csv_fallback  # noqa: E402
 from azure_reconciliation.source_coverage import discover_source_coverage  # noqa: E402
@@ -116,6 +119,7 @@ def main() -> None:
     stats["connection"] = conn_meta
 
     per_issuer_comparisons: list[dict] = []
+    partitioned_contexts: list[dict] = []
     all_xml_raw: list[pd.DataFrame] = []
     all_xml_lifecycle: list[pd.DataFrame] = []
     all_azure_raw: list[pd.DataFrame] = []
@@ -155,6 +159,24 @@ def main() -> None:
             all_azure_lifecycle.append(az_lifecycle)
 
         try:
+            lifecycle_result = comparison.get("lifecycle_result", {}) or {}
+            xml_canonical = lifecycle_result.get("xml_canonical", pd.DataFrame())
+            az_canonical = lifecycle_result.get("azure_canonical", pd.DataFrame())
+            model_h = comparison.get("model_h") or lifecycle_result.get("model_h") or {}
+            ctx = generate_partitioned_reports_for_issuer(
+                issuer=issuer,
+                partitions=parts,
+                xml_canonical=xml_canonical if isinstance(xml_canonical, pd.DataFrame) else pd.DataFrame(),
+                az_canonical=az_canonical if isinstance(az_canonical, pd.DataFrame) else pd.DataFrame(),
+                model_h=model_h if isinstance(model_h, dict) else {},
+                export_errors=export_errors,
+            )
+            partitioned_contexts.append(ctx)
+        except Exception as exc:
+            export_errors.record(f"partitioned_reports_{issuer}: {exc}")
+
+        try:
+            from azure_reconciliation.issuer_reports import generate_issuer_reports
             generate_issuer_reports(
                 issuers=[issuer],
                 partitions=parts,
@@ -253,6 +275,17 @@ def main() -> None:
     )
     audit_path = write_data_source_audit()
     stats["data_source_audit"] = str(audit_path)
+
+    try:
+        index_path = generate_partitioned_reports(
+            issuer_contexts=partitioned_contexts,
+            partitions=coverage.partitions,
+            export_errors=export_errors,
+        )
+        stats["partitioned_reports_index"] = str(index_path)
+        logger.info("Partitioned reports: %s", index_path)
+    except Exception as exc:
+        export_errors.record(f"partitioned_reports_index: {exc}")
 
     logger.info("Outputs: %s", paths)
     if winner is None and not comparison.get("results"):

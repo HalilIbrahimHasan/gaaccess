@@ -252,6 +252,7 @@ def safe_write_excel(
     sheets: dict[str, pd.DataFrame],
     *,
     export_errors: ExportErrors | None = None,
+    drop_duplicate_value_columns: bool = True,
 ) -> bool:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -261,7 +262,10 @@ def safe_write_excel(
                 if df.empty:
                     pd.DataFrame().to_excel(writer, sheet_name=safe_name, index=False)
                     continue
-                safe = safe_dataframe_for_export(df, table_name=f"excel:{name}")
+                safe = safe_dataframe_for_export(
+                    df, table_name=f"excel:{name}",
+                    drop_duplicate_value_columns=drop_duplicate_value_columns,
+                )
                 if len(safe) > EXCEL_MAX_ROWS:
                     _summary_dataframe(safe).to_excel(
                         writer, sheet_name=f"{safe_name[:25]}_sum"[:31], index=False,
