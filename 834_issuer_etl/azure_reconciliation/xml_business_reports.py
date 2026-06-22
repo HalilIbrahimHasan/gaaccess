@@ -222,6 +222,41 @@ def identify_cleanup_diagnostics(
     return duplicate_df, maintenance_df, superseded_df, summary
 
 
+def _latest_state_per_business_month(df: pd.DataFrame) -> pd.DataFrame:
+    """Latest lifecycle state per PK within each business year/month — no cross-month stack."""
+    if df.empty:
+        return df
+    work = _sort_chronological(_dedupe_transactions(df))
+    group_keys = [k for k in PK + ["year", "month"] if k in work.columns]
+    if len(group_keys) <= len([k for k in PK if k in work.columns]):
+        return collapse_to_snapshot(work, PK)
+    return work.groupby(group_keys, dropna=False, as_index=False).last()
+
+
+def _build_model_h_lifecycle_input(
+    canonical: pd.DataFrame,
+    lifecycle_snap: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Model H input: latest-state per PK + business month from deduped canonical.
+
+    Does not stack all partition lifecycle snapshots or re-apply business month basis
+    to replay output (that path multiplied rows across months).
+    """
+    deduped = _dedupe_transactions(canonical)
+    if not deduped.empty:
+        return _latest_state_per_business_month(deduped)
+
+    if lifecycle_snap.empty:
+        return pd.DataFrame()
+
+    mapped = lifecycle_snapshots_to_model_input(lifecycle_snap)
+    dedupe_keys = [k for k in PK + ["year", "month"] if k in mapped.columns]
+    if dedupe_keys:
+        return mapped.drop_duplicates(subset=dedupe_keys, keep="last")
+    return mapped
+
+
 def lifecycle_snapshots_to_model_input(snapshots: pd.DataFrame) -> pd.DataFrame:
     """Map lifecycle replay output to Model H-compatible canonical shape."""
     if snapshots.empty:
@@ -266,7 +301,20 @@ def _attach_canonical_subscriber_columns(
     canon_pick = collapse_to_snapshot(canonical, PK)
     pick = merge_keys + sub_cols
     canon_sub = canon_pick[pick].drop_duplicates(subset=merge_keys, keep="last")
-    merged = lifecycle_input.merge(canon_sub, on=merge_keys, how="left")
+    if canon_sub.duplicated(subset=merge_keys).any():
+        canon_sub = canon_sub.drop_duplicates(subset=merge_keys, keep="last")
+    before = len(lifecycle_input)
+    merged = lifecycle_input.merge(
+        canon_sub,
+        on=merge_keys,
+        how="left",
+        validate="many_to_one",
+    )
+    if len(merged) != before:
+        logger.error(
+            "Subscriber attach changed row count %d → %d (merge_keys=%s)",
+            before, len(merged), merge_keys,
+        )
     attached = sum(
         int((normalize_id_series(merged[c]).astype(str).str.strip() != "").sum())
         for c in sub_cols if c in merged.columns
@@ -399,15 +447,17 @@ def process_issuer_xml_business(
     lifecycle_snap = build_all_lifecycle_snapshots(xml_raw, partitions)
     result.lifecycle_snapshots = lifecycle_snap
 
-    deduped = _dedupe_transactions(canonical)
-    lifecycle_collapsed = collapse_to_snapshot(deduped, PK)
-    if not lifecycle_snap.empty:
-        lifecycle_input = lifecycle_snapshots_to_model_input(lifecycle_snap)
-        lifecycle_input, _ = apply_business_month_basis(lifecycle_input)
-    else:
-        lifecycle_input = lifecycle_collapsed
+    lifecycle_input = _build_model_h_lifecycle_input(canonical, lifecycle_snap)
     lifecycle_input = _attach_canonical_subscriber_columns(lifecycle_input, canonical)
     result.lifecycle_input = lifecycle_input
+
+    if issuer == "15105" and any(p.year == "2026" and _zmonth(p.month) == "01" for p in partitions):
+        try:
+            from azure_reconciliation.lineage_audit import write_lineage_audit
+
+            write_lineage_audit(xml_raw, partitions, issuer="15105", year="2026", month="01")
+        except Exception as exc:
+            logger.warning("Lineage audit skipped — %s", exc)
 
     model_h = _chandra_dashboard(lifecycle_input, source="xml")
     result.model_h_monthly = model_h
