@@ -467,27 +467,35 @@ def export_issuer_reports(
         lifecycle_snapshot_export_df,
         processing_summary_html,
     )
+    from azure_reconciliation.chandra_business_format import (
+        chandra_year_rollup,
+        to_chandra_business_summary,
+        write_chandra_business_html,
+        write_chandra_business_xlsx,
+        write_model_h_month_html,
+    )
 
     root = xml_business_reports_root() / result.issuer
     root.mkdir(parents=True, exist_ok=True)
     issuer_proc = processing_summary_html(build_business_processing_summary(result))
+    chandra_monthly = to_chandra_business_summary(result.business_monthly)
+    chandra_yearly = chandra_year_rollup(chandra_monthly)
 
     safe_write_excel(
         root / "issuer_summary.xlsx",
         {
-            "processing_summary": build_business_processing_summary(result),
-            "issuer_summary": result.business_rollup,
-            "yearly": result.business_yearly,
+            "Enrollment_Summary": chandra_monthly,
+            "Year_Rollup": chandra_yearly,
+            "Processing_Diagnostics": build_business_processing_summary(result),
+            "Technical_Internal": result.business_monthly,
         },
         drop_duplicate_value_columns=False,
         export_errors=export_errors,
     )
-    safe_write_html_report(
+    write_chandra_business_html(
         root / "issuer_summary.html",
-        title=f"Issuer {result.issuer} — XML business summary",
-        summary_df=result.business_rollup,
-        extra_html=issuer_proc,
-        export_errors=export_errors,
+        chandra_monthly,
+        title=f"Issuer {result.issuer} — Enrollment Summary",
     )
 
     diag = root / "diagnostics"
@@ -511,46 +519,74 @@ def export_issuer_reports(
     safe_write_csv(diag / "month_basis_audit.csv", result.month_basis_audit, export_errors=export_errors)
 
     rollup_dir = root / "rollup"
-    _write_bundle(
-        rollup_dir, "xml_all_months",
-        result.business_rollup, result.lifecycle_input,
-        export_errors=export_errors,
-        processing_html=issuer_proc,
+    write_chandra_business_xlsx(rollup_dir / "xml_all_months_summary.xlsx", chandra_monthly)
+    write_chandra_business_html(
+        rollup_dir / "xml_all_months_summary.html",
+        chandra_monthly,
+        title=f"Issuer {result.issuer} — All Months Enrollment Summary",
     )
+    safe_write_csv(rollup_dir / "xml_all_months_detail.csv", result.lifecycle_input, export_errors=export_errors)
 
     for year in sorted({p.year for p in result.partitions}):
         year_sum = result.business_monthly[
             result.business_monthly["year"].astype(str) == str(year)
         ]
+        chandra_year_sum = chandra_year_rollup(to_chandra_business_summary(year_sum))
         year_detail = result.lifecycle_input[
             result.lifecycle_input["year"].astype(str) == str(year)
         ]
         year_dir = root / "yearly" / str(year)
-        year_parts = [p for p in result.partitions if p.year == year]
-        year_proc = processing_summary_html(
-            build_business_processing_summary(result, year_parts[0] if len(year_parts) == 1 else None)
+        year_dir.mkdir(parents=True, exist_ok=True)
+        write_chandra_business_xlsx(year_dir / "xml_year_summary.xlsx", chandra_year_sum)
+        write_chandra_business_html(
+            year_dir / "xml_year_summary.html",
+            chandra_year_sum,
+            title=f"Issuer {result.issuer} {year} — Year Enrollment Summary",
         )
-        _write_bundle(
-            year_dir, "xml_year", year_sum, year_detail,
-            export_errors=export_errors, processing_html=year_proc,
-        )
+        safe_write_csv(year_dir / "xml_year_detail.csv", year_detail, export_errors=export_errors)
 
         for part in sorted(
             (p for p in result.partitions if p.year == year),
             key=lambda p: p.month,
         ):
-            month_sum = year_sum[
+            month_internal = year_sum[
                 year_sum["month"].astype(str).map(_zmonth) == _zmonth(part.month)
             ]
+            chandra_month = to_chandra_business_summary(month_internal)
             month_detail = _filter_year_month_lifecycle(result.lifecycle_input, year, part.month)
             month_dir = root / "monthly" / str(year) / _zmonth(part.month)
+            month_dir.mkdir(parents=True, exist_ok=True)
             month_proc = processing_summary_html(
                 build_business_processing_summary(result, part),
             )
-            _write_bundle(
-                month_dir, "xml_month", month_sum, month_detail,
-                export_errors=export_errors, processing_html=month_proc,
+            write_chandra_business_xlsx(
+                month_dir / "enrollment_summary.xlsx",
+                chandra_month,
             )
+            write_chandra_business_html(
+                month_dir / "enrollment_summary.html",
+                chandra_month,
+                title=f"{result.issuer}/{year}/{_zmonth(part.month)} — Enrollment Summary",
+            )
+            write_model_h_month_html(
+                month_dir / "model_h_month_summary.html",
+                business_df=chandra_month,
+                processing_html=month_proc,
+                title=f"{result.issuer}/{year}/{_zmonth(part.month)} — Model H Month Summary",
+            )
+            safe_write_excel(
+                month_dir / "model_h_month_summary.xlsx",
+                {
+                    "Enrollment_Summary": chandra_month,
+                    "Processing_Diagnostics": build_business_processing_summary(result, part),
+                    "Technical_Internal": month_internal,
+                },
+                drop_duplicate_value_columns=False,
+                export_errors=export_errors,
+            )
+            diag = month_dir / "diagnostics"
+            diag.mkdir(parents=True, exist_ok=True)
+            safe_write_csv(diag / "lifecycle_detail.csv", month_detail, export_errors=export_errors)
 
     logger.info("Wrote XML business reports for issuer %s → %s", result.issuer, root)
     return root
@@ -562,15 +598,33 @@ def export_all_issuers_reports(
     export_errors: ExportErrors | None = None,
 ) -> Path:
     """Cross-issuer monthly/yearly rollups."""
+    from azure_reconciliation.chandra_business_format import (
+        chandra_year_rollup,
+        to_chandra_business_summary,
+        write_chandra_business_html,
+        write_chandra_business_xlsx,
+    )
+
     all_dir = xml_business_reports_root() / "all_issuers"
     all_dir.mkdir(parents=True, exist_ok=True)
 
-    monthly = pd.concat([r.business_monthly for r in results if not r.business_monthly.empty], ignore_index=True)
-    yearly = pd.concat([r.business_yearly for r in results if not r.business_yearly.empty], ignore_index=True)
+    monthly_internal = pd.concat(
+        [r.business_monthly for r in results if not r.business_monthly.empty], ignore_index=True,
+    )
+    monthly_chandra = to_chandra_business_summary(monthly_internal)
+    yearly_chandra = chandra_year_rollup(monthly_chandra)
     detail = pd.concat([r.lifecycle_input for r in results if not r.lifecycle_input.empty], ignore_index=True)
 
-    _write_bundle(all_dir, "all_issuers_monthly", monthly, detail, export_errors=export_errors)
-    _write_bundle(all_dir, "all_issuers_yearly", yearly, detail, export_errors=export_errors)
+    write_chandra_business_xlsx(all_dir / "all_issuers_monthly_summary.xlsx", monthly_chandra)
+    write_chandra_business_html(
+        all_dir / "all_issuers_monthly_summary.html", monthly_chandra,
+        title="All Issuers — Monthly Enrollment Summary",
+    )
+    write_chandra_business_xlsx(all_dir / "all_issuers_yearly_summary.xlsx", yearly_chandra)
+    write_chandra_business_html(
+        all_dir / "all_issuers_yearly_summary.html", yearly_chandra,
+        title="All Issuers — Yearly Enrollment Summary",
+    )
     safe_write_csv(all_dir / "all_issuers_detail.csv", detail, export_errors=export_errors)
     return all_dir
 
@@ -585,10 +639,22 @@ def write_index_reports(
         build_business_processing_summary,
         processing_summary_html,
     )
+    from azure_reconciliation.chandra_business_format import (
+        chandra_all_years_rollup,
+        chandra_year_rollup,
+        to_chandra_business_summary,
+    )
 
     root = xml_business_reports_root()
-    monthly = pd.concat([r.business_monthly for r in results if not r.business_monthly.empty], ignore_index=True)
-    yearly = pd.concat([r.business_yearly for r in results if not r.business_yearly.empty], ignore_index=True)
+    monthly_internal = pd.concat(
+        [r.business_monthly for r in results if not r.business_monthly.empty], ignore_index=True,
+    )
+    yearly_internal = pd.concat(
+        [r.business_yearly for r in results if not r.business_yearly.empty], ignore_index=True,
+    )
+    monthly_chandra = to_chandra_business_summary(monthly_internal)
+    yearly_chandra = chandra_year_rollup(to_chandra_business_summary(monthly_internal))
+    all_years_chandra = chandra_all_years_rollup(monthly_chandra)
     issuer_rows = []
     for r in results:
         issuer_rows.append({
@@ -612,7 +678,7 @@ def write_index_reports(
         "mode": "XML_ONLY_BUSINESS",
         "issuer_count": len(results),
         "total_raw_xml_rows": sum(len(r.xml_raw) for r in results),
-        "total_model_h_groups": len(monthly),
+        "total_model_h_groups": len(monthly_chandra),
         "azure_connection": "DISABLED",
     }]
     executive = pd.DataFrame(exec_rows)
@@ -621,11 +687,14 @@ def write_index_reports(
         root / "index.xlsx",
         {
             "Executive_Summary": executive,
-            "All_Issuers_Monthly": monthly,
-            "All_Issuers_Yearly": yearly,
+            "All_Issuers_Monthly": monthly_chandra,
+            "All_Issuers_Yearly": yearly_chandra,
             "Issuer_Summary": issuer_summary,
-            "Model_H_Monthly": monthly,
-            "Model_H_Yearly": yearly,
+            "Model_H_Monthly": monthly_chandra,
+            "Model_H_Yearly": yearly_chandra,
+            "Model_H_All_Years": all_years_chandra,
+            "Technical_Monthly_Internal": monthly_internal,
+            "Technical_Yearly_Internal": yearly_internal,
             "Cleanup_Diagnostics": cleanup,
             "Count_Audit": count_audit,
             "Month_Basis_Audit": month_audit,
@@ -673,8 +742,12 @@ def write_sqlite_db(
 
     canonical = pd.concat([r.canonical for r in results if not r.canonical.empty], ignore_index=True)
     lifecycle = pd.concat([r.lifecycle_snapshots for r in results if not r.lifecycle_snapshots.empty], ignore_index=True)
-    monthly = pd.concat([r.business_monthly for r in results if not r.business_monthly.empty], ignore_index=True)
-    yearly = pd.concat([r.business_yearly for r in results if not r.business_yearly.empty], ignore_index=True)
+    monthly_internal = pd.concat([r.business_monthly for r in results if not r.business_monthly.empty], ignore_index=True)
+    yearly_internal = pd.concat([r.business_yearly for r in results if not r.business_yearly.empty], ignore_index=True)
+    from azure_reconciliation.chandra_business_format import to_chandra_business_summary
+
+    monthly = to_chandra_business_summary(monthly_internal)
+    yearly = to_chandra_business_summary(yearly_internal)
     all_issuers = monthly.copy()
     cleanup = pd.concat([
         r.cleanup_summary.assign(issuer=r.issuer) for r in results
@@ -740,14 +813,6 @@ def run_xml_business_reporting(
     if not results:
         raise RuntimeError("No XML data processed for any issuer")
 
-    export_all_issuers_reports(results, export_errors=export_errors)
-    write_index_reports(results, export_errors=export_errors)
-    db_path = write_sqlite_db(results, export_errors=export_errors)
-
-    from azure_reconciliation.assets_style_reports import export_assets_style_reports
-
-    assets_root = export_assets_style_reports(results, export_errors=export_errors)
-
     from azure_reconciliation.business_output_validation import (
         write_business_validation_md,
         write_subscriber_mapping_audit,
@@ -755,6 +820,14 @@ def run_xml_business_reporting(
 
     write_subscriber_mapping_audit(results)
     write_business_validation_md(results)
+
+    export_all_issuers_reports(results, export_errors=export_errors)
+    write_index_reports(results, export_errors=export_errors)
+    db_path = write_sqlite_db(results, export_errors=export_errors)
+
+    from azure_reconciliation.assets_style_reports import export_assets_style_reports
+
+    assets_root = export_assets_style_reports(results, export_errors=export_errors)
 
     return {
         "issuers": [r.issuer for r in results],

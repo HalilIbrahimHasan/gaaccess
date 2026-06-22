@@ -42,6 +42,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    settings.refresh_from_env()
+    if settings.xml_only_business_mode:
+        settings.apply_xml_only_business_mode(True)
     settings.apply_cli_filters(args.issuer, args.year, args.month)
     if args.no_clean:
         settings.clean_on_start = False

@@ -124,14 +124,18 @@ class Pipeline:
                 issuer=issuer or settings.issuer_filter,
                 parse_source=False,
                 export_errors=ExportErrors(),
-                disable_azure=False,
+                disable_azure=True,
             )
             stats["xml_business_reports"] = xml_stats
             logger.info("XML business + assets-style reports: %s", xml_stats.get("output_root"))
         except Exception as exc:
             logger.warning("XML business reports skipped — %s", exc)
 
-        if settings.azure_enabled and settings.azure_reconciliation_enabled:
+        if (
+            not settings.xml_only_business_mode
+            and settings.azure_enabled
+            and settings.azure_reconciliation_enabled
+        ):
             try:
                 from azure_reconciliation.intelligence_pipeline import run_intelligence_pipeline
 

@@ -17,9 +17,11 @@ from azure_reconciliation.df_utils import find_col, normalize_id_series
 from azure_reconciliation.partition_discovery import Partition
 from azure_reconciliation.reconciliation_analysis import (
     XML_ENROLLMENT_ID_COLS,
+    XML_ENROLLEE_ID_COLS,
     XML_SUBSCRIBER_ID_COLS,
 )
-from azure_reconciliation.safe_export import safe_write_excel
+from azure_reconciliation.safe_export import ExportErrors, safe_write_excel, safe_write_html_report
+from azure_reconciliation.status_mapper import normalize_insurance_type, normalize_status
 from config.config import settings
 from utils.logger import get_logger
 
@@ -161,6 +163,15 @@ def _filter_partition_df(
     return df[mask].copy()
 
 
+def _filter_year_df(df: pd.DataFrame, issuer: str, year: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    mask = df.get("issuer", pd.Series(dtype=str)).astype(str) == str(issuer)
+    if "year" in df.columns:
+        mask &= df["year"].astype(str) == str(year)
+    return df[mask].copy()
+
+
 def build_business_processing_summary(
     result: IssuerBusinessResult,
     partition: Partition | None = None,
@@ -236,6 +247,248 @@ def lifecycle_snapshot_export_df(snapshots: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _coalesce_nonempty_count(df: pd.DataFrame, candidates: list[str]) -> int:
+    if df.empty:
+        return 0
+    out = pd.Series([""] * len(df), index=df.index, dtype=str)
+    for name in candidates:
+        col = find_col(df, name)
+        if not col:
+            continue
+        vals = normalize_id_series(df[col])
+        empty = out.astype(str).str.strip() == ""
+        has_val = vals.astype(str).str.strip() != ""
+        out = out.where(~(empty & has_val), vals)
+    return int((out.astype(str).str.strip() == "").sum())
+
+
+def _audit_count_columns(count_audit: pd.DataFrame, count_type: str) -> str:
+    if count_audit.empty:
+        return ""
+    rows = count_audit[
+        (count_audit["source"] == "xml") & (count_audit["count_type"] == count_type)
+    ]
+    if rows.empty:
+        return ""
+    r = rows.iloc[0]
+    return str(r.get("columns_with_data") or r.get("primary_column") or "")
+
+
+def _subscriber_mapping_status(
+    result: IssuerBusinessResult,
+    partition: Partition | None = None,
+    *,
+    year: str | None = None,
+) -> str:
+    if partition:
+        canon = _filter_partition_df(result.canonical, partition)
+        monthly = result.business_monthly
+        if not monthly.empty:
+            monthly = monthly[
+                (monthly["year"].astype(str) == str(partition.year))
+                & (monthly["month"].astype(str).str.zfill(2) == str(partition.month).zfill(2))
+            ]
+        xml_raw = _filter_partition_df(result.xml_raw, partition, kind="xml_raw")
+        life = _filter_partition_df(result.lifecycle_input, partition)
+    elif year:
+        canon = _filter_year_df(result.canonical, result.issuer, year)
+        monthly = _filter_year_df(result.business_monthly, result.issuer, year)
+        year_parts = [p for p in result.partitions if p.year == year]
+        xml_raw = pd.concat(
+            [_filter_partition_df(result.xml_raw, p, kind="xml_raw") for p in year_parts],
+            ignore_index=True,
+        ) if year_parts else pd.DataFrame()
+        life = _filter_year_df(result.lifecycle_input, result.issuer, year)
+    else:
+        canon = result.canonical
+        monthly = result.business_monthly
+        xml_raw = result.xml_raw
+        life = result.lifecycle_input
+
+    audit = build_subscriber_mapping_audit(
+        xml_raw,
+        canon,
+        life,
+        issuer=result.issuer,
+    )
+    canon_sub = audit[
+        (audit["source_frame"] == "canonical") & (audit["non_null_count"] > 0)
+    ]
+    if canon_sub.empty:
+        return "NO_SUBSCRIBER_IDS_IN_XML"
+
+    sub_total = 0
+    if not monthly.empty and "Subscriber_Count" in monthly.columns:
+        sub_total = int(pd.to_numeric(monthly["Subscriber_Count"], errors="coerce").fillna(0).sum())
+
+    on_input = audit[audit["used_by_model_h"].astype(str).str.startswith("Yes")]
+    if not on_input.empty and sub_total == 0:
+        return "SUBSCRIBER_MAPPING_WARNING"
+    if not on_input.empty:
+        return "OK"
+    return "SUBSCRIBER_MAPPING_WARNING"
+
+
+def build_data_quality_summary(
+    result: IssuerBusinessResult,
+    partition: Partition | None = None,
+    *,
+    scope_label: str = "",
+    year: str | None = None,
+) -> pd.DataFrame:
+    """XML-only data quality metrics — no Azure fields."""
+    if partition:
+        raw = _filter_partition_df(result.xml_raw, partition, kind="xml_raw")
+        canon = _filter_partition_df(result.canonical, partition)
+        life = _filter_partition_df(result.lifecycle_input, partition)
+        dup = _filter_partition_df(result.duplicate_df, partition)
+        maint = _filter_partition_df(result.maintenance_df, partition)
+        sup = _filter_partition_df(result.superseded_df, partition)
+        monthly = result.business_monthly
+        if not monthly.empty:
+            monthly = monthly[
+                (monthly["year"].astype(str) == str(partition.year))
+                & (monthly["month"].astype(str).str.zfill(2) == str(partition.month).zfill(2))
+            ]
+        label = scope_label or partition.label()
+    elif year:
+        year_parts = [p for p in result.partitions if p.year == year]
+        raw = pd.concat(
+            [_filter_partition_df(result.xml_raw, p, kind="xml_raw") for p in year_parts],
+            ignore_index=True,
+        ) if year_parts else pd.DataFrame()
+        canon = pd.concat(
+            [_filter_partition_df(result.canonical, p) for p in year_parts],
+            ignore_index=True,
+        ) if year_parts else pd.DataFrame()
+        life = _filter_year_df(result.lifecycle_input, result.issuer, year)
+        dup = pd.concat(
+            [_filter_partition_df(result.duplicate_df, p) for p in year_parts],
+            ignore_index=True,
+        ) if year_parts else pd.DataFrame()
+        maint = pd.concat(
+            [_filter_partition_df(result.maintenance_df, p) for p in year_parts],
+            ignore_index=True,
+        ) if year_parts else pd.DataFrame()
+        sup = pd.concat(
+            [_filter_partition_df(result.superseded_df, p) for p in year_parts],
+            ignore_index=True,
+        ) if year_parts else pd.DataFrame()
+        monthly = _filter_year_df(result.business_monthly, result.issuer, year)
+        label = scope_label or f"issuer {result.issuer} year {year}"
+    else:
+        raw, canon, life = result.xml_raw, result.canonical, result.lifecycle_input
+        dup, maint, sup = result.duplicate_df, result.maintenance_df, result.superseded_df
+        monthly = result.business_monthly
+        label = scope_label or f"issuer {result.issuer}"
+
+    month_basis = ""
+    if not result.month_basis_audit.empty:
+        top = result.month_basis_audit.sort_values("row_count", ascending=False).iloc[0]
+        month_basis = str(top.get("month_basis_used", ""))
+
+    unknown_status = 0
+    unknown_insurance = 0
+    if not canon.empty:
+        if "normalized_status" in canon.columns:
+            unknown_status = int((canon["normalized_status"].astype(str).map(normalize_status) == "UNKNOWN").sum())
+        elif "status" in canon.columns:
+            unknown_status = int((canon["status"].astype(str).map(normalize_status) == "UNKNOWN").sum())
+        ins_col = find_col(canon, "insurance_type", "insurance_type_code")
+        if ins_col:
+            unknown_insurance = int(
+                (canon[ins_col].astype(str).map(normalize_insurance_type) == "UNKNOWN").sum()
+            )
+
+    rows = [
+        ("scope", label),
+        ("mode", "XML_ONLY"),
+        ("raw_xml_row_count", len(raw)),
+        ("canonical_row_count", len(canon)),
+        ("latest_state_record_count", len(life)),
+        ("dashboard_group_count", len(monthly)),
+        ("duplicate_transaction_count", len(dup)),
+        ("maintenance_only_event_count", len(maint)),
+        ("superseded_event_count", len(sup)),
+        ("unknown_status_count", unknown_status),
+        ("unknown_insurance_type_count", unknown_insurance),
+        ("missing_policy_enrollment_id_count", _coalesce_nonempty_count(canon, XML_ENROLLMENT_ID_COLS)),
+        ("missing_member_enrollee_id_count", _coalesce_nonempty_count(canon, XML_ENROLLEE_ID_COLS)),
+        ("missing_subscriber_id_count", _coalesce_nonempty_count(canon, XML_SUBSCRIBER_ID_COLS)),
+        ("subscriber_mapping_status", _subscriber_mapping_status(result, partition, year=year)),
+        ("month_basis_used", month_basis),
+        (
+            "enrollment_count_columns_used",
+            _audit_count_columns(result.count_column_audit, "enrollment_count"),
+        ),
+        (
+            "enrollee_count_columns_used",
+            _audit_count_columns(result.count_column_audit, "enrollee_count"),
+        ),
+        (
+            "subscriber_count_columns_used",
+            _audit_count_columns(result.count_column_audit, "subscriber_count"),
+        ),
+    ]
+    return pd.DataFrame(rows, columns=["metric", "value"])
+
+
+def write_data_quality_diagnostics(
+    diag_dir: Path,
+    summary: pd.DataFrame,
+    *,
+    title: str,
+    export_errors: ExportErrors | None = None,
+) -> None:
+    diag_dir.mkdir(parents=True, exist_ok=True)
+    safe_write_excel(
+        diag_dir / "data_quality_summary.xlsx",
+        {"data_quality_summary": summary},
+        drop_duplicate_value_columns=False,
+        export_errors=export_errors,
+    )
+    safe_write_html_report(
+        diag_dir / "data_quality_summary.html",
+        title=title,
+        summary_df=summary,
+        export_errors=export_errors,
+    )
+
+
+def business_safe_detail_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Detail export without technical/debug columns."""
+    if df.empty:
+        return df
+    drop = {
+        "benefit_effective_date", "benefit_end_date", "member_maint_effective_date",
+        "source_file", "raw_xml_path", "file_name", "event_count",
+        "lifecycle_replayed_event_count", "month_basis_used",
+        "Canonical_Row_Count", "Latest_State_Record_Count",
+        "Duplicate_Count", "Maintenance_Only_Count", "Superseded_Count",
+    }
+    keep = [c for c in df.columns if c not in drop]
+    return df[keep].copy()
+
+
+def write_subscriber_audit_copy(
+    dest: Path,
+    result: IssuerBusinessResult,
+    partition: Partition | None = None,
+) -> None:
+    if partition:
+        audit = build_subscriber_mapping_audit(
+            _filter_partition_df(result.xml_raw, partition, kind="xml_raw"),
+            _filter_partition_df(result.canonical, partition),
+            _filter_partition_df(result.lifecycle_input, partition),
+            issuer=result.issuer,
+        )
+    else:
+        audit = build_subscriber_mapping_audit(
+            result.xml_raw, result.canonical, result.lifecycle_input, issuer=result.issuer,
+        )
+    safe_write_excel(dest, {"subscriber_mapping_audit": audit}, drop_duplicate_value_columns=False)
+
+
 def write_subscriber_mapping_audit(
     results: list[IssuerBusinessResult],
 ) -> Path:
@@ -256,6 +509,20 @@ def write_subscriber_mapping_audit(
             "count": len(life_used),
             "detail": "; ".join(life_used["column_name"].tolist()) if not life_used.empty else "none",
         }])
+        warnings = []
+        for r in results:
+            status = _subscriber_mapping_status(r)
+            if status == "SUBSCRIBER_MAPPING_WARNING":
+                warnings.append(r.issuer)
+        if warnings:
+            findings = pd.concat([
+                findings,
+                pd.DataFrame([{
+                    "finding": "SUBSCRIBER_MAPPING_WARNING",
+                    "count": len(warnings),
+                    "detail": "; ".join(warnings),
+                }]),
+            ], ignore_index=True)
     safe_write_excel(
         path,
         {"subscriber_mapping_audit": audit, "findings": findings},
