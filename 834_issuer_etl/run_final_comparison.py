@@ -34,6 +34,11 @@ from azure_reconciliation.final_comparison_engine import (  # noqa: E402
     run_final_comparison,
 )
 from azure_reconciliation.final_comparison_exporter import export_final_comparison  # noqa: E402
+from azure_reconciliation.model_h_export import (
+    export_model_h_for_issuer,
+    validate_model_h_outputs_for_issuer,
+    write_all_issuers_business_result_html,
+)
 from azure_reconciliation.partitioned_reports import (
     generate_partitioned_reports,
     generate_partitioned_reports_for_issuer,
@@ -120,6 +125,7 @@ def main() -> None:
 
     per_issuer_comparisons: list[dict] = []
     partitioned_contexts: list[dict] = []
+    issuer_model_h: list[tuple[str, dict]] = []
     all_xml_raw: list[pd.DataFrame] = []
     all_xml_lifecycle: list[pd.DataFrame] = []
     all_azure_raw: list[pd.DataFrame] = []
@@ -151,6 +157,20 @@ def main() -> None:
         )
         per_issuer_comparisons.append(comparison)
 
+        model_h: dict = {}
+        try:
+            model_h = export_model_h_for_issuer(
+                issuer=issuer,
+                comparison=comparison,
+                xml_raw=xml_raw,
+                partitions=parts,
+                export_errors=export_errors,
+            )
+            issuer_model_h.append((issuer, model_h))
+        except Exception as exc:
+            export_errors.record(f"model_h_export_{issuer}: {exc}")
+            logger.exception("MODEL H export wrapper failed for issuer %s", issuer)
+
         az_raw = comparison.get("azure_raw", pd.DataFrame())
         az_lifecycle = comparison.get("azure_lifecycle", pd.DataFrame())
         if isinstance(az_raw, pd.DataFrame) and not az_raw.empty:
@@ -162,13 +182,18 @@ def main() -> None:
             lifecycle_result = comparison.get("lifecycle_result", {}) or {}
             xml_canonical = lifecycle_result.get("xml_canonical", pd.DataFrame())
             az_canonical = lifecycle_result.get("azure_canonical", pd.DataFrame())
-            model_h = comparison.get("model_h") or lifecycle_result.get("model_h") or {}
+            if (not isinstance(xml_canonical, pd.DataFrame) or xml_canonical.empty) and model_h:
+                from azure_reconciliation.model_h_export import resolve_canonical_for_model_h
+                xml_canonical, az_canonical = resolve_canonical_for_model_h(
+                    comparison, xml_raw, parts,
+                )
+            mh_for_reports = model_h or comparison.get("model_h") or {}
             ctx = generate_partitioned_reports_for_issuer(
                 issuer=issuer,
                 partitions=parts,
                 xml_canonical=xml_canonical if isinstance(xml_canonical, pd.DataFrame) else pd.DataFrame(),
                 az_canonical=az_canonical if isinstance(az_canonical, pd.DataFrame) else pd.DataFrame(),
-                model_h=model_h if isinstance(model_h, dict) else {},
+                model_h=mh_for_reports if isinstance(mh_for_reports, dict) else {},
                 export_errors=export_errors,
             )
             partitioned_contexts.append(ctx)
@@ -287,7 +312,30 @@ def main() -> None:
     except Exception as exc:
         export_errors.record(f"partitioned_reports_index: {exc}")
 
+    if len(issuers) > 1:
+        try:
+            all_path = write_all_issuers_business_result_html(issuer_model_h, export_errors=export_errors)
+            if all_path:
+                stats["final_business_result_all_issuers"] = str(all_path)
+        except Exception as exc:
+            export_errors.record(f"final_business_result_all_issuers: {exc}")
+
+    validation_failures: list[str] = []
+    for issuer in issuers:
+        missing = validate_model_h_outputs_for_issuer(issuer)
+        if missing:
+            validation_failures.extend(missing)
+            for path in missing:
+                logger.error("MODEL H validation missing for issuer %s: %s", issuer, path)
+    if validation_failures:
+        export_errors.record(
+            f"model_h_validation: {len(validation_failures)} required output(s) missing"
+        )
+        stats["model_h_validation_failures"] = validation_failures
+
     logger.info("Outputs: %s", paths)
+    if validation_failures:
+        sys.exit(1)
     if winner is None and not comparison.get("results"):
         sys.exit(1)
 

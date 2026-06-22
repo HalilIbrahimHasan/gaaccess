@@ -490,6 +490,22 @@ def build_model_h_detail(
     keys = DASHBOARD_GROUP_KEYS
     if xml_dash.empty and az_dash.empty:
         return pd.DataFrame()
+
+    def _one_sided(dash: pd.DataFrame, side: str, status: str) -> pd.DataFrame:
+        work = dash.copy()
+        for col in ("enrollment_count", "enrollee_count", "subscriber_count"):
+            work[f"{col}_{side}"] = pd.to_numeric(work[col], errors="coerce").fillna(0).astype(int)
+            other = "az" if side == "xml" else "xml"
+            work[f"{col}_{other}"] = 0
+        work["match_status"] = status
+        work["count_match_pct"] = 0.0
+        return work.sort_values(keys).reset_index(drop=True)
+
+    if xml_dash.empty:
+        return _one_sided(az_dash, "az", "AZURE_ONLY")
+    if az_dash.empty:
+        return _one_sided(xml_dash, "xml", "XML_ONLY")
+
     merged = xml_dash.merge(az_dash, on=keys, how="outer", suffixes=("_xml", "_az"))
     for col in ("enrollment_count", "enrollee_count", "subscriber_count"):
         for side in ("xml", "az"):
@@ -858,6 +874,17 @@ def _write_executive_summary(
     az_only = int(mh.get("azure_not_in_xml", 0))
     status_mr = mh.get("status_match_rate", 0)
 
+    if xml_g == 0 and az_g == 0:
+        conclusion = "No Model H groups were generated for this issuer."
+    else:
+        conclusion = (
+            f"At raw event level XML contains many maintenance/duplicate/superseded "
+            f"transactions ({xml_raw_rows:,} raw rows). At Chandra-like dashboard "
+            f"aggregation level, Azure and XML match on **{matched} of {xml_g}** groups; "
+            f"Azure has **{'no' if az_only == 0 else str(az_only)}** extra groups. "
+            f"Remaining mismatch is **{xml_only}** XML-only aggregated groups."
+        )
+
     lines = [
         "# Final Executive Summary",
         "",
@@ -866,13 +893,7 @@ def _write_executive_summary(
         "",
         "## Primary conclusion",
         "",
-        (
-            f"At raw event level XML contains many maintenance/duplicate/superseded "
-            f"transactions ({xml_raw_rows:,} raw rows). At Chandra-like dashboard "
-            f"aggregation level, Azure and XML match on **{matched} of {xml_g}** groups; "
-            f"Azure has **{'no' if az_only == 0 else str(az_only)}** extra groups. "
-            f"Remaining mismatch is **{xml_only}** XML-only aggregated groups."
-        ),
+        conclusion,
         "",
         "## Model H dashboard metrics",
         "",
@@ -904,12 +925,60 @@ def _write_executive_summary(
     logger.info("Wrote executive summary: %s", path)
 
 
+def _model_h_detail_out(detail: pd.DataFrame) -> pd.DataFrame:
+    """Normalize Model H detail to export column names."""
+    cols = [
+        "issuer", "year", "month", "insurance_type", "status",
+        "enrollment_count_xml", "enrollee_count_xml", "subscriber_count_xml",
+        "enrollment_count_az", "enrollee_count_az", "subscriber_count_az",
+        "match_status", "count_match_pct",
+    ]
+    if detail.empty:
+        return pd.DataFrame(columns=[
+            "issuer", "year", "month", "insurance_type", "status",
+            "xml_enrollment_count", "xml_enrollee_count", "xml_subscriber_count",
+            "azure_enrollment_count", "azure_enrollee_count", "azure_subscriber_count",
+            "match_status", "count_match_pct",
+        ])
+    available = [c for c in cols if c in detail.columns]
+    out = detail[available].rename(columns={
+        "enrollment_count_xml": "xml_enrollment_count",
+        "enrollee_count_xml": "xml_enrollee_count",
+        "subscriber_count_xml": "xml_subscriber_count",
+        "enrollment_count_az": "azure_enrollment_count",
+        "enrollee_count_az": "azure_enrollee_count",
+        "subscriber_count_az": "azure_subscriber_count",
+    })
+    return out
+
+
+def _write_csv_both(
+    dbg: Path,
+    issuer: str,
+    basename: str,
+    df: pd.DataFrame,
+) -> tuple[Path, Path]:
+    """Write issuer-specific and latest-alias CSV paths."""
+    issuer_path = dbg / f"{issuer}_{basename}"
+    alias_path = dbg / basename
+    safe_write_csv(
+        issuer_path, df, table_name=f"{issuer}_{basename.replace('.csv', '')}",
+        drop_duplicate_value_columns=False,
+    )
+    safe_write_csv(
+        alias_path, df, table_name=basename.replace(".csv", ""),
+        drop_duplicate_value_columns=False,
+    )
+    return issuer_path, alias_path
+
+
 def finalize_model_h_business_output(
     *,
     issuer: str,
     xml_canonical: pd.DataFrame,
     az_canonical: pd.DataFrame,
     xml_raw_rows: int,
+    write_per_issuer_paths: bool = False,
 ) -> dict[str, Any]:
     """Promote Model H as primary business result and export reports."""
     dbg = _dbg()
@@ -919,35 +988,21 @@ def finalize_model_h_business_output(
     xml_dash = _chandra_dashboard(xml_canonical, source="xml")
     az_dash = _chandra_dashboard(az_canonical, source="azure")
     count_audit = build_model_h_count_column_audit(xml_canonical, az_canonical)
-    p_audit = dbg / "model_h_count_column_audit.csv"
-    safe_write_csv(p_audit, count_audit, table_name="model_h_count_column_audit", drop_duplicate_value_columns=False)
     h_scores = score_model_h(xml_dash, az_dash)
     detail = h_scores["detail"]
     xml_only_df = build_model_h_xml_not_in_azure(detail, az_dash)
+    detail_out = _model_h_detail_out(detail)
 
-    p_detail = dbg / "model_h_xml_vs_azure_detail.csv"
-    detail_out = detail[[
-        "issuer", "year", "month", "insurance_type", "status",
-        "enrollment_count_xml", "enrollee_count_xml", "subscriber_count_xml",
-        "enrollment_count_az", "enrollee_count_az", "subscriber_count_az",
-        "match_status", "count_match_pct",
-    ]].rename(columns={
-        "enrollment_count_xml": "xml_enrollment_count",
-        "enrollee_count_xml": "xml_enrollee_count",
-        "subscriber_count_xml": "xml_subscriber_count",
-        "enrollment_count_az": "azure_enrollment_count",
-        "enrollee_count_az": "azure_enrollee_count",
-        "subscriber_count_az": "azure_subscriber_count",
-    })
-    safe_write_csv(
-        p_detail, detail_out, table_name="model_h_xml_vs_azure_detail",
-        drop_duplicate_value_columns=False,
+    p_detail_issuer, p_detail = _write_csv_both(
+        dbg, issuer, "model_h_xml_vs_azure_detail.csv", detail_out,
     )
 
-    p_xml_only = dbg / "model_h_xml_not_in_azure.csv"
-    safe_write_csv(
-        p_xml_only, xml_only_df, table_name="model_h_xml_not_in_azure",
-        drop_duplicate_value_columns=False,
+    p_xml_only_issuer, p_xml_only = _write_csv_both(
+        dbg, issuer, "model_h_xml_not_in_azure.csv", xml_only_df,
+    )
+
+    p_audit_issuer, p_audit = _write_csv_both(
+        dbg, issuer, "model_h_count_column_audit.csv", count_audit,
     )
 
     summary_df = pd.DataFrame([{
@@ -970,37 +1025,46 @@ def finalize_model_h_business_output(
     xml_only = int(h_scores["xml_not_in_azure"])
     az_only = int(h_scores["azure_not_in_xml"])
 
-    extra = (
-        "<p><strong>Primary business model:</strong> Model H — Chandra-like dashboard aggregation</p>"
-        f"<p>At raw event level XML contains many maintenance/duplicate/superseded transactions "
-        f"({xml_raw_rows:,} raw rows). At Chandra-like dashboard aggregation level, Azure and XML "
-        f"match on <strong>{matched} of {xml_g}</strong> groups; Azure has "
-        f"<strong>{'no' if az_only == 0 else az_only}</strong> extra groups. "
-        f"Remaining mismatch is <strong>{xml_only}</strong> XML-only aggregated groups.</p>"
-        "<h3>Model H metrics</h3>"
-        f"<ul>"
-        f"<li>XML dashboard groups: {xml_g}</li>"
-        f"<li>Azure dashboard groups: {h_scores['azure_output_count']}</li>"
-        f"<li>Matched groups: {matched}</li>"
-        f"<li>XML not in Azure: {xml_only}</li>"
-        f"<li>Azure not in XML: {az_only}</li>"
-        f"<li>Group match rate: {h_scores['group_match_rate']}%</li>"
-        f"<li>Status match rate: {h_scores['status_match_rate']}%</li>"
-        f"</ul>"
-        "<h3>Diagnostic (not primary)</h3>"
-        "<p>Raw event and lifecycle record comparisons are available under outputs/debug/ "
-        "for transaction-level analysis only.</p>"
-    )
+    if xml_g == 0 and int(h_scores["azure_output_count"]) == 0:
+        extra = (
+            "<p><strong>Primary business model:</strong> Model H — Chandra-like dashboard aggregation</p>"
+            "<p><strong>No Model H groups were generated for this issuer.</strong></p>"
+        )
+    else:
+        extra = (
+            "<p><strong>Primary business model:</strong> Model H — Chandra-like dashboard aggregation</p>"
+            f"<p>At raw event level XML contains many maintenance/duplicate/superseded transactions "
+            f"({xml_raw_rows:,} raw rows). At Chandra-like dashboard aggregation level, Azure and XML "
+            f"match on <strong>{matched} of {xml_g}</strong> groups; Azure has "
+            f"<strong>{'no' if az_only == 0 else az_only}</strong> extra groups. "
+            f"Remaining mismatch is <strong>{xml_only}</strong> XML-only aggregated groups.</p>"
+            "<h3>Model H metrics</h3>"
+            f"<ul>"
+            f"<li>XML dashboard groups: {xml_g}</li>"
+            f"<li>Azure dashboard groups: {h_scores['azure_output_count']}</li>"
+            f"<li>Matched groups: {matched}</li>"
+            f"<li>XML not in Azure: {xml_only}</li>"
+            f"<li>Azure not in XML: {az_only}</li>"
+            f"<li>Group match rate: {h_scores['group_match_rate']}%</li>"
+            f"<li>Status match rate: {h_scores['status_match_rate']}%</li>"
+            f"</ul>"
+            "<h3>Diagnostic (not primary)</h3>"
+            "<p>Raw event and lifecycle record comparisons are available under outputs/debug/ "
+            "for transaction-level analysis only.</p>"
+        )
 
-    html_path = cmp_dir / "final_business_result.html"
-    safe_write_html_report(
-        html_path,
-        title=f"Final Business Result (Model H) — issuer {issuer}",
-        summary_df=summary_df,
-        detail_df=detail_out.head(500) if not detail_out.empty else pd.DataFrame(),
-        extra_html=extra,
-    )
+    html_issuer = cmp_dir / f"{issuer}_final_business_result.html"
+    html_alias = cmp_dir / "final_business_result.html"
+    for html_path in (html_issuer, html_alias):
+        safe_write_html_report(
+            html_path,
+            title=f"Final Business Result (Model H) — issuer {issuer}",
+            summary_df=summary_df,
+            detail_df=detail_out.head(500) if not detail_out.empty else pd.DataFrame(),
+            extra_html=extra,
+        )
 
+    p_exec_issuer = dbg / f"{issuer}_final_executive_summary.md"
     p_exec = dbg / "final_executive_summary.md"
     model_h_result = {
         "model_id": "H",
@@ -1019,11 +1083,16 @@ def finalize_model_h_business_output(
             and float(h_scores["group_match_rate"]) >= settings.relationship_min_record_match_rate
         ),
         "paths": {
-            "final_business_result_html": str(html_path),
+            "final_business_result_html": str(html_alias),
+            f"{issuer}_final_business_result_html": str(html_issuer),
             "model_h_xml_vs_azure_detail": str(p_detail),
+            f"{issuer}_model_h_xml_vs_azure_detail": str(p_detail_issuer),
             "model_h_xml_not_in_azure": str(p_xml_only),
+            f"{issuer}_model_h_xml_not_in_azure": str(p_xml_only_issuer),
             "model_h_count_column_audit": str(p_audit),
+            f"{issuer}_model_h_count_column_audit": str(p_audit_issuer),
             "final_executive_summary": str(p_exec),
+            f"{issuer}_final_executive_summary": str(p_exec_issuer),
         },
         "detail_df": detail_out,
         "xml_only_df": xml_only_df,
@@ -1031,6 +1100,7 @@ def finalize_model_h_business_output(
         "xml_dash": xml_dash,
         "az_dash": az_dash,
     }
+    _write_executive_summary(p_exec_issuer, issuer=issuer, model_h=model_h_result, xml_raw_rows=xml_raw_rows)
     _write_executive_summary(p_exec, issuer=issuer, model_h=model_h_result, xml_raw_rows=xml_raw_rows)
     return model_h_result
 
