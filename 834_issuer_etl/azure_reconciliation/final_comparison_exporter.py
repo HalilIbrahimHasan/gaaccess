@@ -94,6 +94,14 @@ def _build_final_result_frames(
             "effective_date_match_rate": lifecycle_rates.get("effective_date_match_rate"),
             "file_event_month_match_rate": lifecycle_rates.get("file_event_month_match_rate"),
             "final_business_match_rate": comparison.get("final_business_match_rate"),
+            "model_h_xml_groups": comparison.get("model_h_xml_groups"),
+            "model_h_azure_groups": comparison.get("model_h_azure_groups"),
+            "model_h_matched_groups": comparison.get("model_h_matched_groups"),
+            "model_h_xml_not_in_azure": comparison.get("model_h_xml_not_in_azure"),
+            "model_h_azure_not_in_xml": comparison.get("model_h_azure_not_in_xml"),
+            "model_h_group_match_rate": comparison.get("model_h_group_match_rate"),
+            "model_h_status_match_rate": comparison.get("model_h_status_match_rate"),
+            "primary_business_model": "H",
             "lifecycle_match_count": comparison.get("match_count", 0),
             "lifecycle_xml_not_in_azure": comparison.get("xml_not_in_azure_count", 0),
             "lifecycle_azure_not_in_xml": comparison.get("azure_not_in_xml_count", 0),
@@ -186,14 +194,36 @@ def export_final_result(
         else:
             raw_rates = comparison.get("raw_event_rates") or comparison.get("record_stats", {}).get("rates", {})
             lifecycle_rates = comparison.get("lifecycle_rates") or comparison.get("record_rates", {})
+            model_h = comparison.get("model_h") or {}
+            if model_h:
+                xml_g = int(model_h.get("xml_output_count", 0))
+                matched_g = int(model_h.get("match_count", 0))
+                xml_only_g = int(model_h.get("xml_not_in_azure", 0))
+                az_only_g = int(model_h.get("azure_not_in_xml", 0))
+                extra += (
+                    "<h3>PRIMARY: Model H dashboard aggregation</h3>"
+                    f"<p><strong>Final business accuracy (Model H):</strong> "
+                    f"{winner.overall_accuracy:.1f}%</p>"
+                    f"<p>XML dashboard groups: {xml_g} | Azure dashboard groups: "
+                    f"{model_h.get('azure_output_count', 0)} | Matched: {matched_g}</p>"
+                    f"<p>At raw event level XML contains many maintenance/duplicate/superseded "
+                    f"transactions. At Chandra-like dashboard aggregation level, Azure and XML "
+                    f"match on <strong>{matched_g} of {xml_g}</strong> groups; Azure has "
+                    f"<strong>{'no' if az_only_g == 0 else az_only_g}</strong> extra groups. "
+                    f"Remaining mismatch is <strong>{xml_only_g}</strong> XML-only aggregated groups.</p>"
+                    "<p>See <code>outputs/comparison/final_business_result.html</code></p>"
+                )
+            else:
+                extra += (
+                    f"<p><strong>Final business accuracy (lifecycle-based):</strong> "
+                    f"{winner.overall_accuracy:.1f}%</p>"
+                )
             extra += (
-                f"<p><strong>Final business accuracy (lifecycle-based):</strong> "
-                f"{winner.overall_accuracy:.1f}%</p>"
-                "<h3>A) Raw event comparison (diagnostic)</h3>"
+                "<h3>A) Raw event comparison (diagnostic only)</h3>"
                 f"<p>Raw event match rate: {comparison.get('raw_event_match_rate', raw_rates.get('record_match_rate', 0)):.1f}%</p>"
                 f"<p>XML raw rows: {comparison.get('xml_raw_rows', 0):,} | "
                 f"Azure raw rows: {comparison.get('azure_raw_rows', 0):,}</p>"
-                "<h3>B) Lifecycle snapshot comparison (primary)</h3>"
+                "<h3>B) Lifecycle snapshot comparison (diagnostic only)</h3>"
                 f"<p>Lifecycle snapshot match rate: "
                 f"{comparison.get('lifecycle_snapshot_match_rate', lifecycle_rates.get('lifecycle_snapshot_match_rate', 0)):.1f}%</p>"
                 f"<p>Status match rate: {lifecycle_rates.get('status_match_rate', 0):.1f}%</p>"

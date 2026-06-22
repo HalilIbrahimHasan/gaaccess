@@ -19,7 +19,7 @@ from azure_reconciliation.record_comparison import (
     compare_records,
     join_key_series,
 )
-from azure_reconciliation.safe_export import safe_write_csv
+from azure_reconciliation.safe_export import safe_write_csv, safe_write_html_report
 from azure_reconciliation.status_mapper import normalize_status
 from config.config import settings
 from utils.logger import get_logger
@@ -27,6 +27,7 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 PK = LIFECYCLE_PRIMARY_JOIN
+DASHBOARD_GROUP_KEYS = ["issuer", "year", "month", "insurance_type", "status"]
 ACTIVE_STATUSES = frozenset({"ENROLLED", "ACTIVE", "EFFECTUATED", "CONFIRMED"})
 MAINT_ACTION_PREFIXES = frozenset({"001", "021", "024", "030", "032", "33", "34", "XN"})
 
@@ -373,7 +374,7 @@ def _chandra_dashboard(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
     work["issuer"] = _col(work, "issuer")
     sub_col = "subscriber_id" if "subscriber_id" in work.columns else "member_id"
     agg = work.groupby(
-        ["issuer", "year", "month", "insurance_type", "status"], dropna=False,
+        DASHBOARD_GROUP_KEYS, dropna=False,
     ).agg(
         enrollment_count=("policy_id", "nunique"),
         enrollee_count=("member_id", "nunique"),
@@ -383,31 +384,148 @@ def _chandra_dashboard(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
     return agg
 
 
-def _score_dashboard(xml_dash: pd.DataFrame, az_dash: pd.DataFrame) -> dict[str, float]:
-    if xml_dash.empty or az_dash.empty:
-        return {"match_rate": 0.0, "status_match_rate": 0.0, "effective_date_match_rate": 0.0, "overall_match_rate": 0.0}
-    keys = ["issuer", "year", "month", "insurance_type", "status"]
-    merged = xml_dash.merge(az_dash, on=keys, how="outer", suffixes=("_xml", "_az")).fillna(0)
-    if merged.empty:
-        return {"match_rate": 0.0, "status_match_rate": 0.0, "effective_date_match_rate": 0.0, "overall_match_rate": 0.0}
-    matched = merged[(merged["enrollee_count_xml"] > 0) & (merged["enrollee_count_az"] > 0)]
-    match_rate = 100.0 * len(matched) / max(len(xml_dash), 1)
-    scores = []
+def build_model_h_detail(
+    xml_dash: pd.DataFrame,
+    az_dash: pd.DataFrame,
+) -> pd.DataFrame:
+    """Full outer join of XML vs Azure dashboard groups."""
+    keys = DASHBOARD_GROUP_KEYS
+    if xml_dash.empty and az_dash.empty:
+        return pd.DataFrame()
+    merged = xml_dash.merge(az_dash, on=keys, how="outer", suffixes=("_xml", "_az"))
     for col in ("enrollment_count", "enrollee_count", "subscriber_count"):
-        xv, av = f"{col}_xml", f"{col}_az"
-        if xv in merged.columns and av in merged.columns:
-            for _, r in merged.iterrows():
-                x, a = float(r[xv]), float(r[av])
-                if x == 0 and a == 0:
-                    scores.append(100.0)
-                elif max(x, a) > 0:
-                    scores.append(max(0.0, 100.0 * (1 - abs(x - a) / max(x, a))))
-    overall = sum(scores) / len(scores) if scores else match_rate
+        for side in ("xml", "az"):
+            c = f"{col}_{side}"
+            if c in merged.columns:
+                merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0).astype(int)
+            else:
+                merged[c] = 0
+
+    x_present = merged["enrollee_count_xml"] > 0
+    a_present = merged["enrollee_count_az"] > 0
+    merged["match_status"] = "UNMATCHED"
+    merged.loc[x_present & a_present, "match_status"] = "MATCHED"
+    merged.loc[x_present & ~a_present, "match_status"] = "XML_ONLY"
+    merged.loc[~x_present & a_present, "match_status"] = "AZURE_ONLY"
+
+    def _count_pct(row: pd.Series) -> float:
+        if row["match_status"] != "MATCHED":
+            return 0.0
+        scores = []
+        for col in ("enrollment_count", "enrollee_count", "subscriber_count"):
+            x, a = float(row[f"{col}_xml"]), float(row[f"{col}_az"])
+            if x == 0 and a == 0:
+                scores.append(100.0)
+            elif max(x, a) > 0:
+                scores.append(max(0.0, 100.0 * (1 - abs(x - a) / max(x, a))))
+        return round(sum(scores) / len(scores), 2) if scores else 0.0
+
+    merged["count_match_pct"] = merged.apply(_count_pct, axis=1)
+    return merged.sort_values(keys).reset_index(drop=True)
+
+
+def _reason_for_xml_only_group(row: pd.Series, az_dash: pd.DataFrame) -> str:
+    """Classify why an XML dashboard group has no Azure counterpart."""
+    if az_dash.empty:
+        return "XML_ONLY_AGGREGATE_GROUP"
+    issuer = str(row.get("issuer", ""))
+    year = str(row.get("year", ""))
+    month = str(row.get("month", "")).zfill(2)
+    ins = str(row.get("insurance_type", ""))
+    status = str(row.get("status", ""))
+    az_same_month = az_dash[
+        (az_dash["issuer"].astype(str) == issuer)
+        & (az_dash["year"].astype(str) == year)
+        & (az_dash["month"].astype(str).str.zfill(2) == month)
+        & (az_dash["insurance_type"].astype(str) == ins)
+    ]
+    if az_same_month.empty:
+        return "AZURE_MISSING_MONTH_PARTITION"
+    if status not in az_same_month["status"].astype(str).values:
+        return "AZURE_HAS_SAME_MONTH_DIFFERENT_STATUS"
+    return "XML_ONLY_AGGREGATE_GROUP"
+
+
+def build_model_h_xml_not_in_azure(
+    detail: pd.DataFrame,
+    az_dash: pd.DataFrame,
+) -> pd.DataFrame:
+    """XML-only dashboard groups with counts and difference reason."""
+    if detail.empty:
+        return pd.DataFrame()
+    xml_only = detail[detail["match_status"] == "XML_ONLY"].copy()
+    if xml_only.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    for _, row in xml_only.iterrows():
+        rows.append({
+            "issuer": row["issuer"],
+            "year": row["year"],
+            "month": row["month"],
+            "insurance_type": row["insurance_type"],
+            "status": row["status"],
+            "xml_enrollment_count": int(row["enrollment_count_xml"]),
+            "xml_enrollee_count": int(row["enrollee_count_xml"]),
+            "xml_subscriber_count": int(row["subscriber_count_xml"]),
+            "azure_enrollment_count": int(row["enrollment_count_az"]),
+            "azure_enrollee_count": int(row["enrollee_count_az"]),
+            "azure_subscriber_count": int(row["subscriber_count_az"]),
+            "difference_reason": _reason_for_xml_only_group(row, az_dash),
+        })
+    return pd.DataFrame(rows)
+
+
+def score_model_h(xml_dash: pd.DataFrame, az_dash: pd.DataFrame) -> dict[str, Any]:
+    """Score Model H from dashboard group merge."""
+    detail = build_model_h_detail(xml_dash, az_dash)
+    if detail.empty:
+        return {
+            "xml_output_count": 0,
+            "azure_output_count": 0,
+            "match_count": 0,
+            "xml_not_in_azure": 0,
+            "azure_not_in_xml": 0,
+            "status_diff": 0,
+            "match_rate": 0.0,
+            "status_match_rate": 0.0,
+            "effective_date_match_rate": 0.0,
+            "overall_match_rate": 0.0,
+            "group_match_rate": 0.0,
+            "detail": detail,
+        }
+    matched = detail[detail["match_status"] == "MATCHED"]
+    xml_only = detail[detail["match_status"] == "XML_ONLY"]
+    az_only = detail[detail["match_status"] == "AZURE_ONLY"]
+    xml_n = len(xml_dash)
+    az_n = len(az_dash)
+    match_n = len(matched)
+    group_match_rate = round(100.0 * match_n / max(xml_n, 1), 2)
+    count_scores = matched["count_match_pct"].tolist() if not matched.empty else []
+    count_accuracy = round(sum(count_scores) / len(count_scores), 2) if count_scores else 0.0
     return {
-        "match_rate": round(match_rate, 2),
-        "status_match_rate": 100.0 if len(matched) else 0.0,
-        "effective_date_match_rate": round(overall, 2),
-        "overall_match_rate": round(overall, 2),
+        "xml_output_count": xml_n,
+        "azure_output_count": az_n,
+        "match_count": match_n,
+        "xml_not_in_azure": len(xml_only),
+        "azure_not_in_xml": len(az_only),
+        "status_diff": 0,
+        "match_rate": group_match_rate,
+        "status_match_rate": 100.0 if match_n > 0 else 0.0,
+        "effective_date_match_rate": count_accuracy,
+        "overall_match_rate": group_match_rate,
+        "group_match_rate": group_match_rate,
+        "count_accuracy_on_matched": count_accuracy,
+        "detail": detail,
+    }
+
+
+def _score_dashboard(xml_dash: pd.DataFrame, az_dash: pd.DataFrame) -> dict[str, float]:
+    h = score_model_h(xml_dash, az_dash)
+    return {
+        "match_rate": h["match_rate"],
+        "status_match_rate": h["status_match_rate"],
+        "effective_date_match_rate": h["effective_date_match_rate"],
+        "overall_match_rate": h["overall_match_rate"],
     }
 
 
@@ -441,25 +559,32 @@ def run_business_aggregation_models(
     # Model H — dashboard aggregates
     xh = _chandra_dashboard(xml_canonical, source="xml")
     ah = _chandra_dashboard(az_canonical, source="azure")
-    h_rates = _score_dashboard(xh, ah)
+    h_scores = score_model_h(xh, ah)
     scores.append({
         "model_id": "H",
         "model_name": "Chandra-like dashboard counts (enrollment/enrollee/subscriber by month/status)",
-        "join_key": "issuer+year+month+insurance_type+status",
-        "xml_output_count": len(xh),
-        "azure_output_count": len(ah),
-        "match_count": int(min(len(xh), len(ah))),
-        "xml_not_in_azure": max(0, len(xh) - len(ah)),
-        "azure_not_in_xml": max(0, len(ah) - len(xh)),
-        "status_diff": 0,
-        **h_rates,
+        "join_key": "+".join(DASHBOARD_GROUP_KEYS),
+        "xml_output_count": h_scores["xml_output_count"],
+        "azure_output_count": h_scores["azure_output_count"],
+        "match_count": h_scores["match_count"],
+        "xml_not_in_azure": h_scores["xml_not_in_azure"],
+        "azure_not_in_xml": h_scores["azure_not_in_xml"],
+        "status_diff": h_scores["status_diff"],
+        "match_rate": h_scores["match_rate"],
+        "status_match_rate": h_scores["status_match_rate"],
+        "effective_date_match_rate": h_scores["effective_date_match_rate"],
+        "overall_match_rate": h_scores["overall_match_rate"],
     })
 
     scores_df = pd.DataFrame(scores)
-    best = scores_df.sort_values(
-        ["overall_match_rate", "match_count", "status_match_rate"],
-        ascending=[False, False, False],
-    ).head(1)
+    h_rows = scores_df[scores_df["model_id"] == "H"]
+    if not h_rows.empty:
+        best = h_rows.head(1)
+    else:
+        best = scores_df.sort_values(
+            ["overall_match_rate", "match_count", "status_match_rate"],
+            ascending=[False, False, False],
+        ).head(1)
     return scores_df, best
 
 
@@ -475,6 +600,7 @@ def _write_explanation(
     best_model: pd.DataFrame,
     lifecycle_rates: dict[str, Any],
     best_month_basis: str,
+    model_h: dict[str, Any] | None = None,
 ) -> None:
     top_az = az_reason_summary.head(5).to_dict("records") if not az_reason_summary.empty else []
     top_xml = xml_reason_summary.head(5).to_dict("records") if not xml_reason_summary.empty else []
@@ -545,7 +671,38 @@ def _write_explanation(
         f"**Best model:** {best_row.get('model_id', 'n/a')} — {best_row.get('model_name', '')}",
         f"**Best overall match rate:** {best_row.get('overall_match_rate', 0)}%",
         "",
-        f"**Selected lifecycle month basis:** {best_month_basis}",
+        "## Primary business result (Model H)",
+        "",
+    ])
+    if model_h:
+        xml_g = int(model_h.get("xml_output_count", 0))
+        matched_g = int(model_h.get("match_count", 0))
+        xml_only_g = int(model_h.get("xml_not_in_azure", 0))
+        az_only_g = int(model_h.get("azure_not_in_xml", 0))
+        lines.append(
+            f"At raw event level XML contains many maintenance/duplicate/superseded "
+            f"transactions ({xml_raw_rows:,} raw rows). At Chandra-like dashboard "
+            f"aggregation level, Azure and XML match on **{matched_g} of {xml_g}** groups; "
+            f"Azure has **{'no' if az_only_g == 0 else az_only_g}** extra groups. "
+            f"Remaining mismatch is **{xml_only_g}** XML-only aggregated groups."
+        )
+        lines.extend([
+            "",
+            f"- XML dashboard groups: {xml_g}",
+            f"- Azure dashboard groups: {model_h.get('azure_output_count', 0)}",
+            f"- Matched groups: {matched_g}",
+            f"- Status match (matched groups): {model_h.get('status_match_rate', 0)}%",
+            "",
+        ])
+    lines.extend([
+        "The **primary final report** uses Model H Chandra-like dashboard aggregation "
+        "(issuer/year/month/insurance_type/status enrollment/enrollee/subscriber counts). "
+        "Raw event and lifecycle record comparisons are **diagnostic only**.",
+        "",
+        "See `outputs/comparison/final_business_result.html` and "
+        "`outputs/debug/final_executive_summary.md`.",
+        "",
+        f"**Selected lifecycle month basis (diagnostic):** {best_month_basis}",
         f"**Lifecycle snapshot match rate:** {lifecycle_rates.get('lifecycle_snapshot_match_rate', 'n/a')}%",
         f"**Status match (on matched):** {lifecycle_rates.get('status_match_rate', 'n/a')}%",
         "",
@@ -588,6 +745,189 @@ def _write_explanation(
     logger.info("Wrote reconciliation explanation: %s", path)
 
 
+def _write_executive_summary(
+    path: Path,
+    *,
+    issuer: str,
+    model_h: dict[str, Any],
+    xml_raw_rows: int,
+) -> None:
+    mh = model_h
+    xml_g = int(mh.get("xml_output_count", 0))
+    az_g = int(mh.get("azure_output_count", 0))
+    matched = int(mh.get("match_count", 0))
+    xml_only = int(mh.get("xml_not_in_azure", 0))
+    az_only = int(mh.get("azure_not_in_xml", 0))
+    status_mr = mh.get("status_match_rate", 0)
+
+    lines = [
+        "# Final Executive Summary",
+        "",
+        f"**Issuer:** {issuer}",
+        f"**Primary business model:** Model H (Chandra-like dashboard aggregation)",
+        "",
+        "## Primary conclusion",
+        "",
+        (
+            f"At raw event level XML contains many maintenance/duplicate/superseded "
+            f"transactions ({xml_raw_rows:,} raw rows). At Chandra-like dashboard "
+            f"aggregation level, Azure and XML match on **{matched} of {xml_g}** groups; "
+            f"Azure has **{'no' if az_only == 0 else str(az_only)}** extra groups. "
+            f"Remaining mismatch is **{xml_only}** XML-only aggregated groups."
+        ),
+        "",
+        "## Model H dashboard metrics",
+        "",
+        f"| Metric | Value |",
+        f"|--------|-------|",
+        f"| XML dashboard groups | {xml_g} |",
+        f"| Azure dashboard groups | {az_g} |",
+        f"| Matched groups | {matched} |",
+        f"| XML not in Azure (groups) | {xml_only} |",
+        f"| Azure not in XML (groups) | {az_only} |",
+        f"| Group match rate | {mh.get('group_match_rate', 0)}% |",
+        f"| Status match rate (matched groups) | {status_mr}% |",
+        f"| Count accuracy on matched groups | {mh.get('count_accuracy_on_matched', 0)}% |",
+        "",
+        "## Diagnostic comparisons (not primary)",
+        "",
+        "- **Raw event comparison** — high XML volume from transaction-level 834 events.",
+        "- **Lifecycle snapshot comparison** — member/policy grain; month-basis effects remain.",
+        "- **Model H** — issuer/year/month/insurance_type/status enrollment/enrollee/subscriber counts.",
+        "",
+        "## Outputs",
+        "",
+        "- `outputs/comparison/final_business_result.html`",
+        "- `outputs/debug/model_h_xml_vs_azure_detail.csv`",
+        "- `outputs/debug/model_h_xml_not_in_azure.csv`",
+        "",
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    logger.info("Wrote executive summary: %s", path)
+
+
+def finalize_model_h_business_output(
+    *,
+    issuer: str,
+    xml_canonical: pd.DataFrame,
+    az_canonical: pd.DataFrame,
+    xml_raw_rows: int,
+) -> dict[str, Any]:
+    """Promote Model H as primary business result and export reports."""
+    dbg = _dbg()
+    cmp_dir = settings.outputs_path / "comparison"
+    cmp_dir.mkdir(parents=True, exist_ok=True)
+
+    xml_dash = _chandra_dashboard(xml_canonical, source="xml")
+    az_dash = _chandra_dashboard(az_canonical, source="azure")
+    h_scores = score_model_h(xml_dash, az_dash)
+    detail = h_scores["detail"]
+    xml_only_df = build_model_h_xml_not_in_azure(detail, az_dash)
+
+    p_detail = dbg / "model_h_xml_vs_azure_detail.csv"
+    detail_out = detail[[
+        "issuer", "year", "month", "insurance_type", "status",
+        "enrollment_count_xml", "enrollee_count_xml", "subscriber_count_xml",
+        "enrollment_count_az", "enrollee_count_az", "subscriber_count_az",
+        "match_status", "count_match_pct",
+    ]].rename(columns={
+        "enrollment_count_xml": "xml_enrollment_count",
+        "enrollee_count_xml": "xml_enrollee_count",
+        "subscriber_count_xml": "xml_subscriber_count",
+        "enrollment_count_az": "azure_enrollment_count",
+        "enrollee_count_az": "azure_enrollee_count",
+        "subscriber_count_az": "azure_subscriber_count",
+    })
+    safe_write_csv(
+        p_detail, detail_out, table_name="model_h_xml_vs_azure_detail",
+        drop_duplicate_value_columns=False,
+    )
+
+    p_xml_only = dbg / "model_h_xml_not_in_azure.csv"
+    safe_write_csv(
+        p_xml_only, xml_only_df, table_name="model_h_xml_not_in_azure",
+        drop_duplicate_value_columns=False,
+    )
+
+    summary_df = pd.DataFrame([{
+        "issuer": issuer,
+        "model_id": "H",
+        "model_name": "Chandra-like dashboard aggregation",
+        "xml_dashboard_groups": h_scores["xml_output_count"],
+        "azure_dashboard_groups": h_scores["azure_output_count"],
+        "matched_groups": h_scores["match_count"],
+        "xml_not_in_azure_groups": h_scores["xml_not_in_azure"],
+        "azure_not_in_xml_groups": h_scores["azure_not_in_xml"],
+        "group_match_rate": h_scores["group_match_rate"],
+        "status_match_rate": h_scores["status_match_rate"],
+        "count_accuracy_on_matched": h_scores.get("count_accuracy_on_matched", 0),
+        "overall_business_accuracy": h_scores["group_match_rate"],
+    }])
+
+    matched = int(h_scores["match_count"])
+    xml_g = int(h_scores["xml_output_count"])
+    xml_only = int(h_scores["xml_not_in_azure"])
+    az_only = int(h_scores["azure_not_in_xml"])
+
+    extra = (
+        "<p><strong>Primary business model:</strong> Model H — Chandra-like dashboard aggregation</p>"
+        f"<p>At raw event level XML contains many maintenance/duplicate/superseded transactions "
+        f"({xml_raw_rows:,} raw rows). At Chandra-like dashboard aggregation level, Azure and XML "
+        f"match on <strong>{matched} of {xml_g}</strong> groups; Azure has "
+        f"<strong>{'no' if az_only == 0 else az_only}</strong> extra groups. "
+        f"Remaining mismatch is <strong>{xml_only}</strong> XML-only aggregated groups.</p>"
+        "<h3>Model H metrics</h3>"
+        f"<ul>"
+        f"<li>XML dashboard groups: {xml_g}</li>"
+        f"<li>Azure dashboard groups: {h_scores['azure_output_count']}</li>"
+        f"<li>Matched groups: {matched}</li>"
+        f"<li>XML not in Azure: {xml_only}</li>"
+        f"<li>Azure not in XML: {az_only}</li>"
+        f"<li>Group match rate: {h_scores['group_match_rate']}%</li>"
+        f"<li>Status match rate: {h_scores['status_match_rate']}%</li>"
+        f"</ul>"
+        "<h3>Diagnostic (not primary)</h3>"
+        "<p>Raw event and lifecycle record comparisons are available under outputs/debug/ "
+        "for transaction-level analysis only.</p>"
+    )
+
+    html_path = cmp_dir / "final_business_result.html"
+    safe_write_html_report(
+        html_path,
+        title=f"Final Business Result (Model H) — issuer {issuer}",
+        summary_df=summary_df,
+        detail_df=detail_out.head(500) if not detail_out.empty else pd.DataFrame(),
+        extra_html=extra,
+    )
+
+    p_exec = dbg / "final_executive_summary.md"
+    model_h_result = {
+        "model_id": "H",
+        "xml_output_count": h_scores["xml_output_count"],
+        "azure_output_count": h_scores["azure_output_count"],
+        "match_count": h_scores["match_count"],
+        "xml_not_in_azure": h_scores["xml_not_in_azure"],
+        "azure_not_in_xml": h_scores["azure_not_in_xml"],
+        "group_match_rate": h_scores["group_match_rate"],
+        "status_match_rate": h_scores["status_match_rate"],
+        "count_accuracy_on_matched": h_scores.get("count_accuracy_on_matched", 0),
+        "overall_business_accuracy": h_scores["group_match_rate"],
+        "relationship_valid": (
+            az_only == 0
+            and float(h_scores["status_match_rate"]) >= settings.relationship_min_status_match_rate
+            and float(h_scores["group_match_rate"]) >= settings.relationship_min_record_match_rate
+        ),
+        "paths": {
+            "final_business_result_html": str(html_path),
+            "model_h_xml_vs_azure_detail": str(p_detail),
+            "model_h_xml_not_in_azure": str(p_xml_only),
+            "final_executive_summary": str(p_exec),
+        },
+    }
+    _write_executive_summary(p_exec, issuer=issuer, model_h=model_h_result, xml_raw_rows=xml_raw_rows)
+    return model_h_result
+
+
 def run_reconciliation_analysis(
     *,
     issuer: str,
@@ -602,7 +942,7 @@ def run_reconciliation_analysis(
     join_mapping: JoinMapping | None = None,
     best_join_keys: list[str] | None = None,
     best_month_basis: str = "",
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Run mismatch classification, aggregation models, and explanation export."""
     dbg = _dbg()
     paths: dict[str, str] = {}
@@ -647,6 +987,14 @@ def run_reconciliation_analysis(
     safe_write_csv(p_best, best_model, table_name="best_business_model")
     paths["best_business_model"] = str(p_best)
 
+    model_h = finalize_model_h_business_output(
+        issuer=issuer,
+        xml_canonical=xml_canonical,
+        az_canonical=az_canonical,
+        xml_raw_rows=len(xml_raw),
+    )
+    paths.update(model_h.get("paths", {}))
+
     p_expl = dbg / "reconciliation_explanation.md"
     _write_explanation(
         p_expl,
@@ -659,7 +1007,8 @@ def run_reconciliation_analysis(
         best_model=best_model,
         lifecycle_rates=lifecycle_rates,
         best_month_basis=best_month_basis,
+        model_h=model_h,
     )
     paths["reconciliation_explanation"] = str(p_expl)
 
-    return paths
+    return {"paths": paths, "model_h": model_h}

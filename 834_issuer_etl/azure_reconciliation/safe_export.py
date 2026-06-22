@@ -108,6 +108,7 @@ def safe_dataframe_for_export(
     df: pd.DataFrame | None,
     *,
     table_name: str = "",
+    drop_duplicate_value_columns: bool = True,
 ) -> pd.DataFrame:
     """Sanitize a DataFrame for SQLite/Excel/HTML/CSV export."""
     if df is None or df.empty:
@@ -124,14 +125,15 @@ def safe_dataframe_for_export(
     work.columns = clean_cols
 
     # Drop fully duplicated columns (identical values)
-    dup_mask = work.T.duplicated()
-    if dup_mask.any():
-        drop_cols = list(work.columns[dup_mask])
-        work = work.drop(columns=drop_cols)
-        logger.warning(
-            "safe_dataframe_for_export [%s]: dropped %d duplicate column(s): %s",
-            table_name, len(drop_cols), drop_cols[:5],
-        )
+    if drop_duplicate_value_columns:
+        dup_mask = work.T.duplicated()
+        if dup_mask.any():
+            drop_cols = list(work.columns[dup_mask])
+            work = work.drop(columns=drop_cols)
+            logger.warning(
+                "safe_dataframe_for_export [%s]: dropped %d duplicate column(s): %s",
+                table_name, len(drop_cols), drop_cols[:5],
+            )
 
     for col in work.columns:
         series = work[col]
@@ -287,10 +289,15 @@ def safe_write_csv(
     *,
     table_name: str = "",
     export_errors: ExportErrors | None = None,
+    drop_duplicate_value_columns: bool = True,
 ) -> bool:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        safe = safe_dataframe_for_export(df, table_name=table_name or output_path.stem)
+        safe = safe_dataframe_for_export(
+            df,
+            table_name=table_name or output_path.stem,
+            drop_duplicate_value_columns=drop_duplicate_value_columns,
+        )
         safe.to_csv(output_path, index=False)
         logger.info("Wrote CSV: %s (%d rows)", output_path, len(safe))
         return True

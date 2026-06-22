@@ -730,7 +730,7 @@ def run_fast_final_comparison(
     join_mapping = record_stats.get("join_mapping")
     raw_rates = record_stats.get("rates", {})
 
-    # Lifecycle snapshot comparison — PRIMARY business match
+    # Lifecycle snapshot comparison — diagnostic; Model H is primary business match
     lifecycle_result = run_lifecycle_snapshot_comparison(
         xml_raw,
         table_df,
@@ -744,6 +744,7 @@ def run_fast_final_comparison(
     lifecycle_stats = lifecycle_result["lifecycle_stats"]
     lifecycle_rates = lifecycle_result["lifecycle_rates"]
     lifecycle_paths = lifecycle_result.get("debug_paths", {})
+    model_h = lifecycle_result.get("model_h", {}) or {}
 
     match_count = lifecycle_result.get("match_count", 0)
     rates = lifecycle_rates
@@ -762,10 +763,35 @@ def run_fast_final_comparison(
         if join_mapping:
             result.join_key = join_mapping.label() + " (0 lifecycle matches — mapping unverified)"
 
-    if match_count > 0 and rates:
+    result.scores["raw_event_match_rate"] = float(raw_rates.get("record_match_rate", 0))
+    if rates:
         result.scores.update({k: float(v) for k, v in rates.items() if isinstance(v, (int, float))})
-        result.scores["raw_event_match_rate"] = float(raw_rates.get("record_match_rate", 0))
         result.scores["lifecycle_snapshot_match_rate"] = float(rates.get("lifecycle_snapshot_match_rate", 0))
+
+    if model_h:
+        mh_rate = float(model_h.get("group_match_rate", 0))
+        result.scores.update({
+            "model_h_group_match_rate": mh_rate,
+            "model_h_status_match_rate": float(model_h.get("status_match_rate", 0)),
+            "model_h_xml_groups": float(model_h.get("xml_output_count", 0)),
+            "model_h_azure_groups": float(model_h.get("azure_output_count", 0)),
+            "model_h_matched_groups": float(model_h.get("match_count", 0)),
+            "model_h_xml_not_in_azure": float(model_h.get("xml_not_in_azure", 0)),
+            "model_h_azure_not_in_xml": float(model_h.get("azure_not_in_xml", 0)),
+            "final_business_match_rate": mh_rate,
+        })
+        result.overall_accuracy = mh_rate
+        xml_g = int(model_h.get("xml_output_count", 0))
+        matched_g = int(model_h.get("match_count", 0))
+        xml_only_g = int(model_h.get("xml_not_in_azure", 0))
+        az_only_g = int(model_h.get("azure_not_in_xml", 0))
+        result.low_confidence_reason = (
+            f"Model H (Chandra-like dashboard): {matched_g} of {xml_g} groups match; "
+            f"{xml_only_g} XML-only groups; Azure has "
+            f"{'no' if az_only_g == 0 else str(az_only_g)} extra groups. "
+            + (XML_EVENT_EXPLANATION if lifecycle_result.get("event_explanation") else "")
+        )
+    elif match_count > 0 and rates:
         result.scores["final_business_match_rate"] = float(
             lifecycle_result.get("latest_rates", {}).get("final_business_match_rate", 0)
         )
@@ -798,10 +824,15 @@ def run_fast_final_comparison(
         "lifecycle_rates": lifecycle_rates,
         "lifecycle_paths": lifecycle_paths,
         "analysis_paths": lifecycle_result.get("analysis_paths", {}),
+        "model_h": model_h,
         "join_mapping": join_mapping.label() if join_mapping else "",
         "status_mapping_reliable": lifecycle_result.get("status_mapping_reliable", False),
-        "accuracy_reliable": match_count > 0,
-        "relationship_valid": rates.get("relationship_valid", False) if rates else False,
+        "accuracy_reliable": bool(model_h) or match_count > 0,
+        "relationship_valid": (
+            model_h.get("relationship_valid", False)
+            if model_h
+            else (rates.get("relationship_valid", False) if rates else False)
+        ),
         "match_count": match_count,
         "raw_event_match_count": record_stats.get("match_count", 0),
         "xml_lifecycle_snapshot_rows": lifecycle_result.get("xml_snapshot_rows", 0),
@@ -813,7 +844,18 @@ def run_fast_final_comparison(
         "cross_field_date_diff_count": lifecycle_stats.get("cross_field_date_diff_count", 0),
         "raw_event_match_rate": raw_rates.get("record_match_rate", 0),
         "lifecycle_snapshot_match_rate": rates.get("lifecycle_snapshot_match_rate", 0) if rates else 0,
-        "final_business_match_rate": lifecycle_result.get("latest_rates", {}).get("final_business_match_rate", 0),
+        "final_business_match_rate": (
+            float(model_h.get("group_match_rate", 0))
+            if model_h
+            else lifecycle_result.get("latest_rates", {}).get("final_business_match_rate", 0)
+        ),
+        "model_h_xml_groups": model_h.get("xml_output_count", 0),
+        "model_h_azure_groups": model_h.get("azure_output_count", 0),
+        "model_h_matched_groups": model_h.get("match_count", 0),
+        "model_h_xml_not_in_azure": model_h.get("xml_not_in_azure", 0),
+        "model_h_azure_not_in_xml": model_h.get("azure_not_in_xml", 0),
+        "model_h_group_match_rate": model_h.get("group_match_rate", 0),
+        "model_h_status_match_rate": model_h.get("status_match_rate", 0),
         "event_explanation": lifecycle_result.get("event_explanation", ""),
         "best_month_basis": lifecycle_result.get("best_month_basis", ""),
         "month_basis_diff_count": lifecycle_result.get("month_basis_diff_count", 0),
@@ -971,7 +1013,34 @@ def print_final_result(comparison: dict[str, Any]) -> None:
     lifecycle_rates = comparison.get("lifecycle_rates") or comparison.get("record_rates", {})
 
     lines.append("")
-    lines.append("--- A) Raw event comparison (diagnostic) ---")
+    lines.append("--- PRIMARY: Model H dashboard aggregation (Chandra-like) ---")
+    model_h = comparison.get("model_h") or {}
+    if model_h:
+        xml_g = int(model_h.get("xml_output_count", 0))
+        matched_g = int(model_h.get("match_count", 0))
+        xml_only_g = int(model_h.get("xml_not_in_azure", 0))
+        az_only_g = int(model_h.get("azure_not_in_xml", 0))
+        lines.extend([
+            f"XML dashboard groups: {xml_g}",
+            f"Azure dashboard groups: {model_h.get('azure_output_count', 0)}",
+            f"Matched groups: {matched_g}",
+            f"XML not in Azure (groups): {xml_only_g}",
+            f"Azure not in XML (groups): {az_only_g}",
+            f"Group match rate: {model_h.get('group_match_rate', 0)}%",
+            f"Status match rate (matched groups): {model_h.get('status_match_rate', 0)}%",
+            (
+                "At raw event level XML contains many maintenance/duplicate/superseded "
+                f"transactions. At Chandra-like dashboard aggregation level, Azure and XML "
+                f"match on {matched_g} of {xml_g} groups; Azure has "
+                f"{'no' if az_only_g == 0 else az_only_g} extra groups. "
+                f"Remaining mismatch is {xml_only_g} XML-only aggregated groups."
+            ),
+        ])
+    else:
+        lines.append("Model H results not available — run reconciliation analysis.")
+
+    lines.append("")
+    lines.append("--- A) Raw event comparison (diagnostic only) ---")
     if raw_rates or comparison.get("raw_event_match_count") is not None:
         lines.extend([
             f"Raw event match count: {comparison.get('raw_event_match_count', comparison.get('record_stats', {}).get('match_count', 'n/a'))}",
@@ -981,7 +1050,7 @@ def print_final_result(comparison: dict[str, Any]) -> None:
         ])
 
     lines.append("")
-    lines.append("--- B) Lifecycle snapshot comparison (primary) ---")
+    lines.append("--- B) Lifecycle snapshot comparison (diagnostic only) ---")
     if comparison.get("best_month_basis"):
         lines.append(f"Best month basis selected: {comparison.get('best_month_basis')}")
         lines.append(f"Match rate without month: {comparison.get('match_rate_without_month', 'n/a')}%")
@@ -1062,10 +1131,18 @@ def print_final_result(comparison: dict[str, Any]) -> None:
         f"Status Match (aggregate): {s.get('status_match', 0):.1f}%",
         f"Lifecycle Match: {s.get('lifecycle_match', 0):.1f}%",
         f"Timeline Match: {s.get('timeline_match', 0):.1f}%",
-        f"Overall Accuracy (lifecycle-based): {winner.overall_accuracy:.1f}%"
-        + (" (NOT RELIABLE — 0 lifecycle matches)" if not accuracy_reliable else ""),
+        f"Overall Accuracy (Model H group match): {winner.overall_accuracy:.1f}%"
+        + (" (lifecycle diagnostic only)" if model_h else ""),
     ])
-    lines.append(f"Final Business Accuracy: {comparison.get('final_business_match_rate', winner.overall_accuracy):.1f}%")
+    if not model_h:
+        lines.append(
+            f"Overall Accuracy (lifecycle-based): {winner.overall_accuracy:.1f}%"
+            + (" (NOT RELIABLE — 0 lifecycle matches)" if not accuracy_reliable else "")
+        )
+    lines.append(
+        f"Final Business Accuracy (Model H): "
+        f"{comparison.get('final_business_match_rate', winner.overall_accuracy):.1f}%"
+    )
     if winner.behavior_penalty or winner.behavior_bonus:
         lines.append(
             f"Behavior adjustment: penalty={winner.behavior_penalty:.1f}% "
@@ -1087,6 +1164,10 @@ def _append_output_paths(lines: list[str], comparison: dict[str, Any]) -> None:
         if isinstance(paths, dict):
             for k, v in paths.items():
                 lines.append(f"  {k}: {v}")
+    lines.append("  outputs/comparison/final_business_result.html")
+    lines.append("  outputs/debug/model_h_xml_vs_azure_detail.csv")
+    lines.append("  outputs/debug/model_h_xml_not_in_azure.csv")
+    lines.append("  outputs/debug/final_executive_summary.md")
     lines.append("  outputs/comparison/final_result.html")
     lines.append("  outputs/comparison/final_result.xlsx")
     lines.append("  outputs/comparison/final_result.csv")

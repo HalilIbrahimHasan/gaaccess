@@ -1,5 +1,5 @@
 """
-Lifecycle snapshot comparison — PRIMARY business-level XML vs Azure match.
+Lifecycle snapshot comparison — diagnostic member/policy-level XML vs Azure match.
 
 Collapses transaction events to member/policy grain, compares across multiple
 month-basis join strategies, and auto-selects the best match rate.
@@ -378,7 +378,7 @@ def run_lifecycle_snapshot_comparison(
     )
 
     from azure_reconciliation.reconciliation_analysis import run_reconciliation_analysis
-    analysis_paths = run_reconciliation_analysis(
+    analysis_result = run_reconciliation_analysis(
         issuer=issuer,
         xml_raw=xml_raw,
         table_df=table_df,
@@ -392,7 +392,9 @@ def run_lifecycle_snapshot_comparison(
         best_join_keys=best_keys,
         best_month_basis=best_label,
     )
-    debug_paths.update(analysis_paths)
+    analysis_paths = analysis_result.get("paths", analysis_result if isinstance(analysis_result, dict) else {})
+    model_h = analysis_result.get("model_h", {}) if isinstance(analysis_result, dict) else {}
+    debug_paths.update(analysis_paths if isinstance(analysis_paths, dict) else {})
 
     return {
         "xml_processed_snapshot": xml_snap,
@@ -422,6 +424,7 @@ def run_lifecycle_snapshot_comparison(
         "status_mapping_reliable": lifecycle_stats.get("status_mapping_reliable", False),
         "debug_paths": debug_paths,
         "analysis_paths": analysis_paths,
+        "model_h": model_h,
         "event_explanation": XML_EVENT_EXPLANATION
         if len(xml_raw) > len(table_df) * 1.5 else "",
     }
@@ -537,7 +540,8 @@ def export_lifecycle_debug_csvs(
         f"<p><strong>MONTH_BASIS_DIFF count:</strong> {lifecycle_stats.get('month_basis_diff_count', 0):,}</p>"
         "<h3>A) Raw event comparison (diagnostic)</h3>"
         f"<p>Raw event match rate: {rates.get('raw_event_match_rate', 'n/a')}%</p>"
-        "<h3>B) Lifecycle snapshot comparison (primary)</h3>"
+        "<h3>B) Lifecycle snapshot comparison (diagnostic only)</h3>"
+        "<p><em>Primary business result is Model H — see outputs/comparison/final_business_result.html</em></p>"
         f"<p>Lifecycle snapshot match rate: {rates.get('lifecycle_snapshot_match_rate', 0):.2f}%</p>"
         f"<p>Status match rate: {rates.get('status_match_rate', 0):.2f}%</p>"
         f"<p>XML lifecycle not in Azure (after reclassification): "
