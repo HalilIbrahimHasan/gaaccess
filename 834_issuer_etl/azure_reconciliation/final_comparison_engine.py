@@ -735,6 +735,7 @@ def run_fast_final_comparison(
         xml_raw,
         table_df,
         profile,
+        issuer=issuer,
         join_mapping=join_mapping,
         date_col=FIXED_DATE_COL,
         partitions=issuer_parts,
@@ -796,6 +797,7 @@ def run_fast_final_comparison(
         "lifecycle_stats": lifecycle_stats,
         "lifecycle_rates": lifecycle_rates,
         "lifecycle_paths": lifecycle_paths,
+        "analysis_paths": lifecycle_result.get("analysis_paths", {}),
         "join_mapping": join_mapping.label() if join_mapping else "",
         "status_mapping_reliable": lifecycle_result.get("status_mapping_reliable", False),
         "accuracy_reliable": match_count > 0,
@@ -1080,7 +1082,7 @@ def print_final_result(comparison: dict[str, Any]) -> None:
 
 def _append_output_paths(lines: list[str], comparison: dict[str, Any]) -> None:
     lines.append("Output paths:")
-    for key in ("record_paths", "lifecycle_paths", "final_comparison_paths", "output_paths"):
+    for key in ("record_paths", "lifecycle_paths", "analysis_paths", "final_comparison_paths", "output_paths"):
         paths = comparison.get(key)
         if isinstance(paths, dict):
             for k, v in paths.items():
@@ -1091,7 +1093,10 @@ def _append_output_paths(lines: list[str], comparison: dict[str, Any]) -> None:
     lines.append("  outputs/debug/final_validation.txt")
     lines.append("  outputs/comparison/final_lifecycle_result.html")
     lines.append("  outputs/debug/month_basis_comparison.csv")
-    lines.append("  outputs/debug/month_basis_diff.csv")
+    lines.append("  outputs/debug/reconciliation_explanation.md")
+    lines.append("  outputs/debug/business_aggregation_model_scores.csv")
+    lines.append("  outputs/debug/azure_not_in_xml_reason_summary.csv")
+    lines.append("  outputs/debug/xml_not_in_azure_reason_summary.csv")
     lines.append("  outputs/debug/lifecycle_match_summary.csv")
     lines.append("  outputs/debug/xml_lifecycle_snapshot.csv")
     lines.append("  outputs/debug/azure_lifecycle_snapshot.csv")

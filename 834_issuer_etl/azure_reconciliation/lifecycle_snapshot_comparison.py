@@ -312,6 +312,7 @@ def run_lifecycle_snapshot_comparison(
     table_df: pd.DataFrame,
     profile: TableProfile,
     *,
+    issuer: str = "",
     join_mapping: JoinMapping | None = None,
     date_col: str = "GAA_834_File_Date",
     partitions: list[Partition] | None = None,
@@ -376,6 +377,23 @@ def run_lifecycle_snapshot_comparison(
         az_raw_rows=len(table_df),
     )
 
+    from azure_reconciliation.reconciliation_analysis import run_reconciliation_analysis
+    analysis_paths = run_reconciliation_analysis(
+        issuer=issuer,
+        xml_raw=xml_raw,
+        table_df=table_df,
+        xml_canonical=xml_canonical,
+        az_canonical=az_canonical,
+        xml_snap=xml_snap,
+        az_snap=az_snap,
+        lifecycle_stats=lifecycle_stats,
+        lifecycle_rates=lifecycle_stats.get("rates", {}),
+        join_mapping=join_mapping,
+        best_join_keys=best_keys,
+        best_month_basis=best_label,
+    )
+    debug_paths.update(analysis_paths)
+
     return {
         "xml_processed_snapshot": xml_snap,
         "azure_processed_snapshot": az_snap,
@@ -403,6 +421,7 @@ def run_lifecycle_snapshot_comparison(
         "status_mapping": lifecycle_stats.get("status_mapping", {}),
         "status_mapping_reliable": lifecycle_stats.get("status_mapping_reliable", False),
         "debug_paths": debug_paths,
+        "analysis_paths": analysis_paths,
         "event_explanation": XML_EVENT_EXPLANATION
         if len(xml_raw) > len(table_df) * 1.5 else "",
     }
