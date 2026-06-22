@@ -116,6 +116,21 @@ class Pipeline:
         stats["asset_partitions"] = asset_stats["partitions"]
         stats["asset_rollups"] = asset_stats["rollups"]
 
+        try:
+            from azure_reconciliation.safe_export import ExportErrors
+            from azure_reconciliation.xml_business_reports import run_xml_business_reporting
+
+            xml_stats = run_xml_business_reporting(
+                issuer=issuer or settings.issuer_filter,
+                parse_source=False,
+                export_errors=ExportErrors(),
+                disable_azure=False,
+            )
+            stats["xml_business_reports"] = xml_stats
+            logger.info("XML business + assets-style reports: %s", xml_stats.get("output_root"))
+        except Exception as exc:
+            logger.warning("XML business reports skipped — %s", exc)
+
         if settings.azure_enabled and settings.azure_reconciliation_enabled:
             try:
                 from azure_reconciliation.intelligence_pipeline import run_intelligence_pipeline

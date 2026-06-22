@@ -61,12 +61,35 @@ def main() -> None:
         help="Issuer to compare (optional — all issuers in source_data when omitted)",
     )
     parser.add_argument("--parse-source", action="store_true", help="Parse source_data instead of staging")
+    parser.add_argument(
+        "--xml-only",
+        action="store_true",
+        help="XML-only Model H business reports (no Azure connection)",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--fast", action="store_true", help="FAST_MODE — fixed 834_Inbound_test / Strategy C (default)")
     mode.add_argument("--full-discovery", action="store_true", help="Scan all Azure tables (slow)")
     args = parser.parse_args()
 
     settings.refresh_from_env()
+    if args.xml_only or settings.xml_only_business_mode:
+        settings.apply_xml_only_business_mode(True)
+        from azure_reconciliation.xml_business_reports import run_xml_business_reporting
+
+        export_errors = ExportErrors()
+        try:
+            result = run_xml_business_reporting(
+                issuer=args.issuer,
+                parse_source=args.parse_source,
+                export_errors=export_errors,
+            )
+        except RuntimeError as exc:
+            logger.error("%s", exc)
+            sys.exit(1)
+        print("\nXML-only business reporting complete (via run_final_comparison --xml-only).")
+        print(f"  Output: {result['output_root']}")
+        return
+
     if args.full_discovery:
         settings.enable_full_discovery = True
         settings.use_fixed_azure_candidate = False

@@ -166,6 +166,9 @@ class Settings:
     fast_mode: bool = field(default_factory=lambda: _env_bool("FAST_MODE", True))
     enable_full_discovery: bool = field(default_factory=lambda: _env_bool("ENABLE_FULL_DISCOVERY", False))
     use_fixed_azure_candidate: bool = field(default_factory=lambda: _env_bool("USE_FIXED_AZURE_CANDIDATE", True))
+    xml_only_business_mode: bool = field(
+        default_factory=lambda: _env_bool("XML_ONLY_BUSINESS_MODE", False)
+    )
     relationship_min_record_match_rate: float = field(
         default_factory=lambda: float(os.getenv("RELATIONSHIP_MIN_RECORD_MATCH_RATE", "70"))
     )
@@ -220,6 +223,7 @@ class Settings:
         self.fast_mode = _env_bool("FAST_MODE", True)
         self.enable_full_discovery = _env_bool("ENABLE_FULL_DISCOVERY", False)
         self.use_fixed_azure_candidate = _env_bool("USE_FIXED_AZURE_CANDIDATE", True)
+        self.xml_only_business_mode = _env_bool("XML_ONLY_BUSINESS_MODE", False)
         self.relationship_min_record_match_rate = float(
             os.getenv("RELATIONSHIP_MIN_RECORD_MATCH_RATE", "70")
         )
@@ -232,6 +236,21 @@ class Settings:
         self.fast_mode = enabled
         self.use_fixed_azure_candidate = enabled
         self.enable_full_discovery = not enabled
+
+    def apply_xml_only_business_mode(self, enabled: bool = True) -> None:
+        """XML-only Chandra-like reporting — no Azure connection or discovery."""
+        self.xml_only_business_mode = enabled
+        if enabled:
+            self.azure_enabled = False
+            self.azure_reconciliation_enabled = False
+            self.azure_discovery_enabled = False
+            self.enable_full_discovery = False
+            self.fast_mode = True
+            self.use_fixed_azure_candidate = True
+
+    @property
+    def xml_business_reports_path(self) -> Path:
+        return self.outputs_path / "xml_business_reports"
 
     def apply_cli_filters(
         self,
@@ -268,6 +287,8 @@ class Settings:
             self.outputs_path / "debug",
             self.outputs_path / "comparison",
             self.outputs_path / "issuer_reports",
+            self.outputs_path / "xml_business_reports",
+            self.outputs_path / "xml_business_reports" / "all_issuers",
             self.azure_reconciliation_output_path / "excel",
             self.azure_reconciliation_output_path / "dashboards",
             self.azure_reconciliation_output_path / "sqlite",

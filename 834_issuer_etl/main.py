@@ -97,6 +97,7 @@ def main() -> None:
         logger.info("Asset rollups       : %d", stats.get("asset_rollups", 0))
         logger.info("Reports             : %s", settings.reports_path)
         logger.info("Assets              : %s", settings.assets_path)
+        logger.info("XML business        : %s", settings.xml_business_reports_path)
         logger.info("=" * 60)
     finally:
         pipeline.close()
