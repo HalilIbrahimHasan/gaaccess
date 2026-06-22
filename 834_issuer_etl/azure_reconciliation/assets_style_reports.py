@@ -121,7 +121,7 @@ def issuer_all_years_rollup(monthly: pd.DataFrame) -> pd.DataFrame:
         return monthly
     sum_cols = [
         "Enrollment_Count", "Enrollee_Count", "Subscriber_Count",
-        "Raw_XML_Row_Count", "Canonical_Row_Count", "Lifecycle_Row_Count",
+        "Raw_XML_Row_Count", "Canonical_Row_Count", "Latest_State_Record_Count",
         "Duplicate_Count", "Maintenance_Only_Count", "Superseded_Count",
     ]
     keys = ["issuer", "insurance_type", "status"]
@@ -144,6 +144,7 @@ def _write_assets_bundle(
     summary: pd.DataFrame,
     detail: pd.DataFrame,
     export_errors: ExportErrors | None = None,
+    processing_html: str = "",
 ) -> None:
     reports_dir.mkdir(parents=True, exist_ok=True)
     safe_write_csv(reports_dir / f"{prefix}_detail.csv", detail, export_errors=export_errors)
@@ -158,6 +159,7 @@ def _write_assets_bundle(
         title=prefix.replace("_", " ").title(),
         summary_df=summary,
         detail_df=detail.head(500) if not detail.empty else pd.DataFrame(),
+        extra_html=processing_html,
         export_errors=export_errors,
     )
 
@@ -168,11 +170,18 @@ def export_assets_style_reports(
     export_errors: ExportErrors | None = None,
 ) -> Path:
     """Write Model H reports under assets/{issuer}/.../reports/."""
+    from azure_reconciliation.business_output_validation import (
+        build_business_processing_summary,
+        lifecycle_snapshot_export_df,
+        processing_summary_html,
+    )
+
     root = assets_reports_root()
 
     for result in results:
         issuer = result.issuer
         issuer_dir = root / issuer / "reports"
+        issuer_proc = processing_summary_html(build_business_processing_summary(result))
         all_years_sum = issuer_all_years_rollup(result.business_monthly)
         all_years_detail = result.lifecycle_input.copy()
         _write_assets_bundle(
@@ -181,6 +190,7 @@ def export_assets_style_reports(
             summary=all_years_sum,
             detail=all_years_detail,
             export_errors=export_errors,
+            processing_html=issuer_proc,
         )
         safe_write_excel(
             issuer_dir / "cleanup_summary.xlsx",
@@ -200,12 +210,19 @@ def export_assets_style_reports(
             year_monthly = _filter_year_df(result.business_monthly, issuer, year)
             year_sum = yearly_rollup(year_monthly)
             year_detail = _filter_year_df(result.lifecycle_input, issuer, year)
+            year_proc = processing_summary_html(
+                build_business_processing_summary(
+                    result,
+                    next((p for p in result.partitions if p.year == year), None),
+                )
+            )
             _write_assets_bundle(
                 year_reports,
                 prefix="issuer_year",
                 summary=year_sum,
                 detail=year_detail,
                 export_errors=export_errors,
+                processing_html=year_proc,
             )
             year_cleanup = pd.concat(
                 [_partition_cleanup_summary(result, p) for p in result.partitions if p.year == year],
@@ -236,6 +253,10 @@ def export_assets_style_reports(
                 month_detail = _filter_partition_df(result.lifecycle_input, part)
                 xml_detail = _filter_partition_df(result.canonical, part)
 
+                month_proc = processing_summary_html(
+                    build_business_processing_summary(result, part),
+                )
+
                 safe_write_excel(
                     month_reports / "xml_month_summary.xlsx",
                     {"summary": month_sum},
@@ -247,6 +268,7 @@ def export_assets_style_reports(
                     title=f"{issuer}/{year}/{_zmonth(part.month)} — XML month summary",
                     summary_df=month_sum,
                     detail_df=xml_detail.head(500),
+                    extra_html=month_proc,
                     export_errors=export_errors,
                 )
                 safe_write_csv(month_reports / "xml_month_detail.csv", xml_detail, export_errors=export_errors)
@@ -262,6 +284,7 @@ def export_assets_style_reports(
                     title=f"{issuer}/{year}/{_zmonth(part.month)} — Model H month summary",
                     summary_df=month_sum,
                     detail_df=month_detail.head(500),
+                    extra_html=month_proc,
                     export_errors=export_errors,
                 )
 
@@ -295,7 +318,9 @@ def export_assets_style_reports(
                 )
                 safe_write_csv(
                     month_reports / "lifecycle_snapshot.csv",
-                    _filter_partition_df(result.lifecycle_snapshots, part, kind="lifecycle_snapshot"),
+                    lifecycle_snapshot_export_df(
+                        _filter_partition_df(result.lifecycle_snapshots, part, kind="lifecycle_snapshot"),
+                    ),
                     export_errors=export_errors,
                 )
 

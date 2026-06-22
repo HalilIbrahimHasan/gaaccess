@@ -29,10 +29,12 @@ from azure_reconciliation.record_comparison import (
 from azure_reconciliation.reconciliation_analysis import (
     DASHBOARD_GROUP_KEYS,
     MAINT_ACTION_PREFIXES,
+    XML_SUBSCRIBER_ID_COLS,
     _chandra_dashboard,
     _dedupe_transactions,
     build_model_h_count_column_audit,
 )
+from azure_reconciliation.status_mapper import normalize_insurance_type, normalize_status
 from azure_reconciliation.safe_export import (
     ExportErrors,
     safe_write_csv,
@@ -40,7 +42,7 @@ from azure_reconciliation.safe_export import (
     safe_write_html_report,
     safe_write_sqlite,
 )
-from azure_reconciliation.status_mapper import normalize_insurance_type, normalize_status
+from azure_reconciliation.df_utils import find_col, normalize_id, normalize_id_series
 from azure_reconciliation.xml_loader import load_xml_rows
 from config.config import settings
 from utils.logger import get_logger
@@ -52,7 +54,7 @@ PK = list(LIFECYCLE_PRIMARY_JOIN)
 BUSINESS_SUMMARY_COLS = [
     "issuer", "year", "month", "insurance_type", "status",
     "Enrollment_Count", "Enrollee_Count", "Subscriber_Count",
-    "Raw_XML_Row_Count", "Canonical_Row_Count", "Lifecycle_Row_Count",
+    "Raw_XML_Row_Count", "Canonical_Row_Count", "Latest_State_Record_Count",
     "Duplicate_Count", "Maintenance_Only_Count", "Superseded_Count",
     "Month_Basis_Used",
 ]
@@ -73,6 +75,15 @@ def xml_business_reports_root() -> Path:
 
 def _zmonth(m: str) -> str:
     return str(m).strip().zfill(2)
+
+
+def _filter_year_month_lifecycle(df: pd.DataFrame, year: str, month: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    work = df[df["year"].astype(str) == str(year)].copy()
+    if work.empty or "month" not in work.columns:
+        return work
+    return work[work["month"].astype(str).map(_zmonth) == _zmonth(month)].copy()
 
 
 def _status_series(df: pd.DataFrame) -> pd.Series:
@@ -226,6 +237,48 @@ def lifecycle_snapshots_to_model_input(snapshots: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _attach_canonical_subscriber_columns(
+    lifecycle_input: pd.DataFrame,
+    canonical: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Copy subscriber ID columns from canonical onto Model H input.
+
+    Lifecycle replay does not emit subscriber fields; Model H coalescing requires
+    them on the input frame. Uses existing canonical values and primary join keys only.
+    """
+    if lifecycle_input.empty or canonical.empty:
+        return lifecycle_input
+
+    merge_keys = [k for k in PK if k in lifecycle_input.columns and k in canonical.columns]
+    if len(merge_keys) < 3:
+        return lifecycle_input
+
+    sub_cols: list[str] = []
+    for cand in XML_SUBSCRIBER_ID_COLS:
+        col = find_col(canonical, cand)
+        if col and col not in merge_keys and col not in sub_cols:
+            sub_cols.append(col)
+
+    if not sub_cols:
+        return lifecycle_input
+
+    canon_pick = collapse_to_snapshot(canonical, PK)
+    pick = merge_keys + sub_cols
+    canon_sub = canon_pick[pick].drop_duplicates(subset=merge_keys, keep="last")
+    merged = lifecycle_input.merge(canon_sub, on=merge_keys, how="left")
+    attached = sum(
+        int((normalize_id_series(merged[c]).astype(str).str.strip() != "").sum())
+        for c in sub_cols if c in merged.columns
+    )
+    if attached:
+        logger.info(
+            "Attached %d subscriber field value(s) from canonical onto Model H input",
+            attached,
+        )
+    return merged
+
+
 def build_extended_business_summary(
     model_h: pd.DataFrame,
     *,
@@ -274,7 +327,7 @@ def build_extended_business_summary(
             "Subscriber_Count": int(row.get("subscriber_count", 0)),
             "Raw_XML_Row_Count": int(gmask_r.sum()),
             "Canonical_Row_Count": int(gmask_c.sum()),
-            "Lifecycle_Row_Count": int(gmask_l.sum()),
+            "Latest_State_Record_Count": int(gmask_l.sum()),
             "Duplicate_Count": int(gmask_d.sum()),
             "Maintenance_Only_Count": int(gmask_m.sum()),
             "Superseded_Count": int(gmask_s.sum()),
@@ -289,7 +342,7 @@ def yearly_rollup(monthly: pd.DataFrame) -> pd.DataFrame:
         return monthly
     sum_cols = [
         "Enrollment_Count", "Enrollee_Count", "Subscriber_Count",
-        "Raw_XML_Row_Count", "Canonical_Row_Count", "Lifecycle_Row_Count",
+        "Raw_XML_Row_Count", "Canonical_Row_Count", "Latest_State_Record_Count",
         "Duplicate_Count", "Maintenance_Only_Count", "Superseded_Count",
     ]
     keys = ["issuer", "year", "insurance_type", "status"]
@@ -353,6 +406,7 @@ def process_issuer_xml_business(
         lifecycle_input, _ = apply_business_month_basis(lifecycle_input)
     else:
         lifecycle_input = lifecycle_collapsed
+    lifecycle_input = _attach_canonical_subscriber_columns(lifecycle_input, canonical)
     result.lifecycle_input = lifecycle_input
 
     model_h = _chandra_dashboard(lifecycle_input, source="xml")
@@ -382,6 +436,7 @@ def _write_bundle(
     detail: pd.DataFrame,
     *,
     export_errors: ExportErrors | None = None,
+    processing_html: str = "",
 ) -> None:
     base.mkdir(parents=True, exist_ok=True)
     safe_write_csv(base / f"{prefix}_detail.csv", detail, export_errors=export_errors)
@@ -396,6 +451,7 @@ def _write_bundle(
         title=f"{prefix} summary",
         summary_df=summary,
         detail_df=detail.head(500) if not detail.empty else pd.DataFrame(),
+        extra_html=processing_html,
         export_errors=export_errors,
     )
 
@@ -406,12 +462,23 @@ def export_issuer_reports(
     export_errors: ExportErrors | None = None,
 ) -> Path:
     """Write per-issuer HTML/XLSX/CSV tree."""
+    from azure_reconciliation.business_output_validation import (
+        build_business_processing_summary,
+        lifecycle_snapshot_export_df,
+        processing_summary_html,
+    )
+
     root = xml_business_reports_root() / result.issuer
     root.mkdir(parents=True, exist_ok=True)
+    issuer_proc = processing_summary_html(build_business_processing_summary(result))
 
     safe_write_excel(
         root / "issuer_summary.xlsx",
-        {"issuer_summary": result.business_rollup, "yearly": result.business_yearly},
+        {
+            "processing_summary": build_business_processing_summary(result),
+            "issuer_summary": result.business_rollup,
+            "yearly": result.business_yearly,
+        },
         drop_duplicate_value_columns=False,
         export_errors=export_errors,
     )
@@ -419,6 +486,7 @@ def export_issuer_reports(
         root / "issuer_summary.html",
         title=f"Issuer {result.issuer} — XML business summary",
         summary_df=result.business_rollup,
+        extra_html=issuer_proc,
         export_errors=export_errors,
     )
 
@@ -438,7 +506,7 @@ def export_issuer_reports(
     safe_write_csv(diag / "duplicate_transactions.csv", result.duplicate_df, export_errors=export_errors)
     safe_write_csv(diag / "maintenance_only_events.csv", result.maintenance_df, export_errors=export_errors)
     safe_write_csv(diag / "superseded_events.csv", result.superseded_df, export_errors=export_errors)
-    safe_write_csv(diag / "lifecycle_snapshot.csv", result.lifecycle_snapshots, export_errors=export_errors)
+    safe_write_csv(diag / "lifecycle_snapshot.csv", lifecycle_snapshot_export_df(result.lifecycle_snapshots), export_errors=export_errors)
     safe_write_csv(diag / "model_h_count_column_audit.csv", result.count_column_audit, export_errors=export_errors)
     safe_write_csv(diag / "month_basis_audit.csv", result.month_basis_audit, export_errors=export_errors)
 
@@ -447,6 +515,7 @@ def export_issuer_reports(
         rollup_dir, "xml_all_months",
         result.business_rollup, result.lifecycle_input,
         export_errors=export_errors,
+        processing_html=issuer_proc,
     )
 
     for year in sorted({p.year for p in result.partitions}):
@@ -457,17 +526,31 @@ def export_issuer_reports(
             result.lifecycle_input["year"].astype(str) == str(year)
         ]
         year_dir = root / "yearly" / str(year)
-        _write_bundle(year_dir, "xml_year", year_sum, year_detail, export_errors=export_errors)
+        year_parts = [p for p in result.partitions if p.year == year]
+        year_proc = processing_summary_html(
+            build_business_processing_summary(result, year_parts[0] if len(year_parts) == 1 else None)
+        )
+        _write_bundle(
+            year_dir, "xml_year", year_sum, year_detail,
+            export_errors=export_errors, processing_html=year_proc,
+        )
 
-        for month in sorted({
-            p.month for p in result.partitions if p.year == year
-        }):
-            month_sum = year_sum[year_sum["month"].astype(str).map(_zmonth) == _zmonth(month)]
-            month_detail = year_detail[
-                year_detail["month"].astype(str).map(_zmonth) == _zmonth(month)
+        for part in sorted(
+            (p for p in result.partitions if p.year == year),
+            key=lambda p: p.month,
+        ):
+            month_sum = year_sum[
+                year_sum["month"].astype(str).map(_zmonth) == _zmonth(part.month)
             ]
-            month_dir = root / "monthly" / str(year) / _zmonth(month)
-            _write_bundle(month_dir, "xml_month", month_sum, month_detail, export_errors=export_errors)
+            month_detail = _filter_year_month_lifecycle(result.lifecycle_input, year, part.month)
+            month_dir = root / "monthly" / str(year) / _zmonth(part.month)
+            month_proc = processing_summary_html(
+                build_business_processing_summary(result, part),
+            )
+            _write_bundle(
+                month_dir, "xml_month", month_sum, month_detail,
+                export_errors=export_errors, processing_html=month_proc,
+            )
 
     logger.info("Wrote XML business reports for issuer %s → %s", result.issuer, root)
     return root
@@ -498,6 +581,11 @@ def write_index_reports(
     export_errors: ExportErrors | None = None,
 ) -> Path:
     """Master index.html / index.xlsx at xml_business_reports root."""
+    from azure_reconciliation.business_output_validation import (
+        build_business_processing_summary,
+        processing_summary_html,
+    )
+
     root = xml_business_reports_root()
     monthly = pd.concat([r.business_monthly for r in results if not r.business_monthly.empty], ignore_index=True)
     yearly = pd.concat([r.business_yearly for r in results if not r.business_yearly.empty], ignore_index=True)
@@ -555,8 +643,13 @@ def write_index_reports(
         "<h1>XML-Only Business Reports (Model H)</h1>",
         f"<p>Generated: {exec_rows[0]['generated_utc']}</p>",
         f"<p>Issuers processed: {len(results)}</p>",
-        "<h2>Issuer summary</h2>",
     ]
+    if results:
+        combined = build_business_processing_summary(results[0])
+        for r in results[1:]:
+            combined = pd.concat([combined, build_business_processing_summary(r)], ignore_index=True)
+        index_lines.append(processing_summary_html(combined))
+    index_lines.append("<h2>Issuer summary</h2>")
     if not issuer_summary.empty:
         index_lines.append(issuer_summary.to_html(index=False))
     index_lines.append("<h2>Navigation</h2><ul>")
@@ -654,6 +747,14 @@ def run_xml_business_reporting(
     from azure_reconciliation.assets_style_reports import export_assets_style_reports
 
     assets_root = export_assets_style_reports(results, export_errors=export_errors)
+
+    from azure_reconciliation.business_output_validation import (
+        write_business_validation_md,
+        write_subscriber_mapping_audit,
+    )
+
+    write_subscriber_mapping_audit(results)
+    write_business_validation_md(results)
 
     return {
         "issuers": [r.issuer for r in results],
