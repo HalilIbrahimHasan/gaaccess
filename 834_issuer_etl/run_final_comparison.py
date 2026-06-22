@@ -165,6 +165,7 @@ def main() -> None:
                 xml_raw=xml_raw,
                 partitions=parts,
                 export_errors=export_errors,
+                engine=engine,
             )
             issuer_model_h.append((issuer, model_h))
         except Exception as exc:
@@ -194,6 +195,7 @@ def main() -> None:
                 xml_canonical=xml_canonical if isinstance(xml_canonical, pd.DataFrame) else pd.DataFrame(),
                 az_canonical=az_canonical if isinstance(az_canonical, pd.DataFrame) else pd.DataFrame(),
                 model_h=mh_for_reports if isinstance(mh_for_reports, dict) else {},
+                azure_zero_reason=comparison.get("azure_zero_reason", ""),
                 export_errors=export_errors,
             )
             partitioned_contexts.append(ctx)

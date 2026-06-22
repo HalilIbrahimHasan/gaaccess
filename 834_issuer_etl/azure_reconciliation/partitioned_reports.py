@@ -75,6 +75,33 @@ def _filter_year(df: pd.DataFrame, year: str) -> pd.DataFrame:
     return df[df["year"].astype(str) == str(year)].copy()
 
 
+def _filter_xml_side_summary(summary: pd.DataFrame) -> pd.DataFrame:
+    """XML partition summaries — groups with XML enrollment counts only."""
+    if summary.empty:
+        return summary
+    work = summary.copy()
+    work["xml_enrollment_count"] = pd.to_numeric(
+        work.get("xml_enrollment_count", 0), errors="coerce",
+    ).fillna(0).astype(int)
+    return work[work["xml_enrollment_count"] > 0].reset_index(drop=True)
+
+
+def _filter_azure_side_summary(summary: pd.DataFrame) -> pd.DataFrame:
+    """Azure partition summaries — groups with Azure enrollment counts only."""
+    if summary.empty:
+        return summary
+    work = summary.copy()
+    work["azure_enrollment_count"] = pd.to_numeric(
+        work.get("azure_enrollment_count", 0), errors="coerce",
+    ).fillna(0).astype(int)
+    return work[work["azure_enrollment_count"] > 0].reset_index(drop=True)
+
+
+def _comparison_side_summary(summary: pd.DataFrame) -> pd.DataFrame:
+    """Comparison summaries include all Model H groups."""
+    return summary.copy() if not summary.empty else summary
+
+
 def _filter_year_month(df: pd.DataFrame, year: str, month: str) -> pd.DataFrame:
     work = _filter_year(df, year)
     if work.empty or "month" not in work.columns:
@@ -334,6 +361,7 @@ def generate_partitioned_reports_for_issuer(
     xml_canonical: pd.DataFrame,
     az_canonical: pd.DataFrame,
     model_h: dict[str, Any] | None = None,
+    azure_zero_reason: str = "",
     export_errors: ExportErrors | None = None,
 ) -> dict[str, Any]:
     """Generate partitioned reports for one issuer."""
@@ -345,16 +373,37 @@ def generate_partitioned_reports_for_issuer(
     mh = model_h or {}
     summary_all = mh.get("detail_df")
     xml_only = mh.get("xml_only_df")
+    zero_reason = azure_zero_reason or mh.get("azure_zero_reason", "")
     if summary_all is None or (isinstance(summary_all, pd.DataFrame) and summary_all.empty):
-        summary_all = _model_h_summary_from_canonical(xml_canonical, az_canonical)
+        xml_dash = _chandra_dashboard(xml_canonical, source="xml")
+        az_dash = _chandra_dashboard(az_canonical, source="azure")
+        h = score_model_h(xml_dash, az_dash)
+        xml_only = build_model_h_xml_not_in_azure(
+            h["detail"], az_dash, azure_zero_reason=zero_reason,
+        )
+        detail = h["detail"]
+        if not detail.empty:
+            detail = detail.rename(columns={
+                "enrollment_count_xml": "xml_enrollment_count",
+                "enrollee_count_xml": "xml_enrollee_count",
+                "subscriber_count_xml": "xml_subscriber_count",
+                "enrollment_count_az": "azure_enrollment_count",
+                "enrollee_count_az": "azure_enrollee_count",
+                "subscriber_count_az": "azure_subscriber_count",
+            })
+        summary_all = _enrich_model_h_summary(detail, xml_only)
     else:
         summary_all = _enrich_model_h_summary(summary_all, xml_only)
+
+    xml_summary_all = _filter_xml_side_summary(summary_all)
+    azure_summary_all = _filter_azure_side_summary(summary_all)
+    comp_summary_all = _comparison_side_summary(summary_all)
 
     xml_detail_all = _canonical_detail_records(xml_canonical, side="xml")
     az_detail_all = _canonical_detail_records(az_canonical, side="azure")
     comp_detail_all = _comparison_detail_records(xml_canonical, az_canonical)
 
-    issuer_summary = summary_all.copy()
+    issuer_summary = comp_summary_all.copy()
     if not issuer_summary.empty and "issuer" in issuer_summary.columns:
         issuer_summary = issuer_summary[issuer_summary["issuer"].astype(str) == str(issuer)]
 
@@ -368,21 +417,21 @@ def generate_partitioned_reports_for_issuer(
 
     xml_links = _generate_side_partitions(
         issuer_dir, "xml",
-        summary_all=summary_all,
+        summary_all=xml_summary_all,
         detail_all=xml_detail_all,
         partitions=issuer_parts,
         export_errors=export_errors,
     )
     azure_links = _generate_side_partitions(
         issuer_dir, "azure",
-        summary_all=summary_all,
+        summary_all=azure_summary_all,
         detail_all=az_detail_all,
         partitions=issuer_parts,
         export_errors=export_errors,
     )
     comp_links = _generate_side_partitions(
         issuer_dir, "comparison",
-        summary_all=summary_all,
+        summary_all=comp_summary_all,
         detail_all=comp_detail_all,
         partitions=issuer_parts,
         export_errors=export_errors,

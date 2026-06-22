@@ -43,12 +43,14 @@ def normalize_status(raw: str | None) -> str:
 
 def normalize_insurance_type(raw: str | None) -> str:
     if raw is None:
-        return "HEALTH"
+        return ""
     key = str(raw).strip().upper()
-    if key in ("HLT", "HEALTH", "H", "MEDICAL", "MED"):
+    if not key or key in ("NAN", "NONE", "NULL"):
+        return ""
+    if key in ("HLT", "HEALTH", "H", "MEDICAL", "MED") or "HEALTH" in key:
         return "HEALTH"
-    if key in ("DEN", "DENTAL", "D"):
+    if key in ("DEN", "DENTAL", "D") or "DENTAL" in key or key.startswith("DEN"):
         return "DENTAL"
-    if key in ("VIS", "VISION", "V"):
+    if key in ("VIS", "VISION", "V") or "VISION" in key:
         return "VISION"
-    return key or "HEALTH"
+    return key

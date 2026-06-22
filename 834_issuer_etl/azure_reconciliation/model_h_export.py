@@ -230,15 +230,28 @@ def export_model_h_for_issuer(
     xml_raw: pd.DataFrame,
     partitions: list[Partition],
     export_errors: ExportErrors | None = None,
+    engine: Any | None = None,
 ) -> dict[str, Any]:
     """Always export Model H outputs for one issuer."""
     logger.info("MODEL H STARTED for issuer %s", issuer)
     dbg = _dbg()
+    azure_zero_reason = ""
 
     try:
         xml_canonical, az_canonical = resolve_canonical_for_model_h(
             comparison, xml_raw, partitions,
         )
+
+        if engine is not None:
+            from azure_reconciliation.azure_fetch_diagnostics import write_issuer_diagnostics
+            _, azure_zero_reason = write_issuer_diagnostics(
+                engine,
+                issuer=issuer,
+                partitions=partitions,
+                canonical_azure=az_canonical,
+                xml_raw_rows=len(xml_raw),
+            )
+
         from azure_reconciliation.reconciliation_analysis import _chandra_dashboard
         xml_dash = _chandra_dashboard(xml_canonical, source="xml")
         az_dash = _chandra_dashboard(az_canonical, source="azure")
@@ -255,9 +268,12 @@ def export_model_h_for_issuer(
                 az_canonical=az_canonical,
                 xml_raw_rows=len(xml_raw),
                 write_per_issuer_paths=True,
+                azure_zero_reason=azure_zero_reason,
             )
+            model_h["azure_zero_reason"] = azure_zero_reason
 
         comparison["model_h"] = model_h
+        comparison["azure_zero_reason"] = azure_zero_reason
         for _k, path in model_h.get("paths", {}).items():
             if str(path).endswith((".csv", ".md", ".html")):
                 logger.info("MODEL H EXPORT WRITTEN: %s", path)

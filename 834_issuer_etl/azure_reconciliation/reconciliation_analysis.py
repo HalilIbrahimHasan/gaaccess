@@ -538,10 +538,15 @@ def build_model_h_detail(
     return merged.sort_values(keys).reset_index(drop=True)
 
 
-def _reason_for_xml_only_group(row: pd.Series, az_dash: pd.DataFrame) -> str:
+def _reason_for_xml_only_group(
+    row: pd.Series,
+    az_dash: pd.DataFrame,
+    *,
+    azure_zero_reason: str = "",
+) -> str:
     """Classify why an XML dashboard group has no Azure counterpart."""
     if az_dash.empty:
-        return "XML_ONLY_AGGREGATE_GROUP"
+        return azure_zero_reason or "AZURE_ZERO_ROWS_FOR_ISSUER"
     issuer = str(row.get("issuer", ""))
     year = str(row.get("year", ""))
     month = str(row.get("month", "")).zfill(2)
@@ -563,6 +568,8 @@ def _reason_for_xml_only_group(row: pd.Series, az_dash: pd.DataFrame) -> str:
 def build_model_h_xml_not_in_azure(
     detail: pd.DataFrame,
     az_dash: pd.DataFrame,
+    *,
+    azure_zero_reason: str = "",
 ) -> pd.DataFrame:
     """XML-only dashboard groups with counts and difference reason."""
     if detail.empty:
@@ -584,7 +591,9 @@ def build_model_h_xml_not_in_azure(
             "azure_enrollment_count": int(row["enrollment_count_az"]),
             "azure_enrollee_count": int(row["enrollee_count_az"]),
             "azure_subscriber_count": int(row["subscriber_count_az"]),
-            "difference_reason": _reason_for_xml_only_group(row, az_dash),
+            "difference_reason": _reason_for_xml_only_group(
+                row, az_dash, azure_zero_reason=azure_zero_reason,
+            ),
         })
     return pd.DataFrame(rows)
 
@@ -876,6 +885,11 @@ def _write_executive_summary(
 
     if xml_g == 0 and az_g == 0:
         conclusion = "No Model H groups were generated for this issuer."
+    elif az_g == 0:
+        conclusion = (
+            "Azure returned zero rows for issuer/scope; comparison cannot determine business match. "
+            f"XML has **{xml_g}** dashboard groups with **{xml_only}** XML-only groups."
+        )
     else:
         conclusion = (
             f"At raw event level XML contains many maintenance/duplicate/superseded "
@@ -979,6 +993,7 @@ def finalize_model_h_business_output(
     az_canonical: pd.DataFrame,
     xml_raw_rows: int,
     write_per_issuer_paths: bool = False,
+    azure_zero_reason: str = "",
 ) -> dict[str, Any]:
     """Promote Model H as primary business result and export reports."""
     dbg = _dbg()
@@ -990,7 +1005,9 @@ def finalize_model_h_business_output(
     count_audit = build_model_h_count_column_audit(xml_canonical, az_canonical)
     h_scores = score_model_h(xml_dash, az_dash)
     detail = h_scores["detail"]
-    xml_only_df = build_model_h_xml_not_in_azure(detail, az_dash)
+    xml_only_df = build_model_h_xml_not_in_azure(
+        detail, az_dash, azure_zero_reason=azure_zero_reason,
+    )
     detail_out = _model_h_detail_out(detail)
 
     p_detail_issuer, p_detail = _write_csv_both(
@@ -1029,6 +1046,13 @@ def finalize_model_h_business_output(
         extra = (
             "<p><strong>Primary business model:</strong> Model H — Chandra-like dashboard aggregation</p>"
             "<p><strong>No Model H groups were generated for this issuer.</strong></p>"
+        )
+    elif int(h_scores["azure_output_count"]) == 0:
+        extra = (
+            "<p><strong>Primary business model:</strong> Model H — Chandra-like dashboard aggregation</p>"
+            "<p><strong>Azure returned zero rows for issuer/scope; comparison cannot determine business match.</strong></p>"
+            f"<p>XML dashboard groups: {xml_g} | XML-only groups: {xml_only}</p>"
+            + (f"<p>Diagnostic reason: {azure_zero_reason}</p>" if azure_zero_reason else "")
         )
     else:
         extra = (
@@ -1099,6 +1123,7 @@ def finalize_model_h_business_output(
         "count_audit_df": count_audit,
         "xml_dash": xml_dash,
         "az_dash": az_dash,
+        "azure_zero_reason": azure_zero_reason,
     }
     _write_executive_summary(p_exec_issuer, issuer=issuer, model_h=model_h_result, xml_raw_rows=xml_raw_rows)
     _write_executive_summary(p_exec, issuer=issuer, model_h=model_h_result, xml_raw_rows=xml_raw_rows)

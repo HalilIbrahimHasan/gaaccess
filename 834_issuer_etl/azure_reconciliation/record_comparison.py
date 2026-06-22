@@ -199,14 +199,38 @@ def _id_frequency(df: pd.DataFrame, col: str, source: str) -> pd.DataFrame:
 
 
 def _insurance_series_xml(work: pd.DataFrame) -> pd.Series:
-    return _col_series(work, "insurance_type_code", "insurance_type").map(normalize_insurance_type)
+    for col_name in (
+        "insurance_type_code", "insurance_type", "insurance_type_description",
+        "planCoverageDescription", "PlanCoverageDescription",
+    ):
+        col = find_col(work, col_name)
+        if col and col in work.columns:
+            raw = work[col].astype(str).str.strip()
+            if ((raw != "") & (raw.str.upper() != "NAN")).any():
+                return raw.map(normalize_insurance_type)
+    return pd.Series([""] * len(work), index=work.index)
 
 
 def _insurance_series_azure(work: pd.DataFrame, profile: TableProfile) -> pd.Series:
-    ins_col = profile.insurance_type_col or find_col(work, "Insurance_Type", "planCoverageDescription")
-    if ins_col and ins_col in work.columns:
-        return work[ins_col].astype(str).map(normalize_insurance_type)
-    return pd.Series(["HEALTH"] * len(work), index=work.index)
+    candidates: list[str] = []
+    if profile.insurance_type_col:
+        candidates.append(profile.insurance_type_col)
+    candidates.extend([
+        "Insurance_Type", "planCoverageDescription", "PlanCoverageDescription",
+        "insurance_type", "insurance_type_code", "product_type",
+    ])
+    seen: set[str] = set()
+    for col_name in candidates:
+        if col_name in seen:
+            continue
+        col = find_col(work, col_name)
+        if not col or col not in work.columns:
+            continue
+        seen.add(col)
+        raw = work[col].astype(str).str.strip()
+        if ((raw != "") & (raw.str.upper() != "NAN") & (raw.str.upper() != "NONE")).any():
+            return work[col].astype(str).map(normalize_insurance_type)
+    return pd.Series([""] * len(work), index=work.index)
 
 
 def _month_series_xml(work: pd.DataFrame) -> pd.Series:
