@@ -50,7 +50,9 @@ def main() -> None:
     print(f"  Summary:  {result['summary_md']}")
     print(f"  Status:   {result['status_summaries']}")
     print(f"  Verdict:  {result['hypothesis_verdict']}")
-    print(f"  Rules:    {len(result['ranked_rules'])} ranked")
+    if result.get("best_rule"):
+        print(f"  Best rule: {result['best_rule'].get('Rule_Name')} "
+              f"({result['best_rule'].get('Pct_Gap_Explained')}%)")
 
 
 if __name__ == "__main__":
