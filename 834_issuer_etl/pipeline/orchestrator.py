@@ -131,6 +131,22 @@ class Pipeline:
         except Exception as exc:
             logger.warning("XML business reports skipped — %s", exc)
 
+        if settings.enable_full_data_export:
+            try:
+                from azure_reconciliation.full_data_exports import run_full_data_exports
+                from azure_reconciliation.safe_export import ExportErrors
+
+                export_stats = run_full_data_exports(
+                    issuer_filter=issuer or settings.issuer_filter,
+                    year_filter=settings.year_filter,
+                    parse_source=False,
+                    export_errors=ExportErrors(),
+                )
+                stats["full_data_exports"] = export_stats
+                logger.info("Full data exports: %s", export_stats.get("output_root"))
+            except Exception as exc:
+                logger.warning("Full data exports skipped — %s", exc)
+
         if (
             not settings.xml_only_business_mode
             and settings.azure_enabled
