@@ -212,6 +212,14 @@ class Settings:
     def business_review_filtered_path(self) -> Path:
         return self.outputs_path / "business_review_filtered"
 
+    @property
+    def assets_filtered_path(self) -> Path:
+        return self.project_root / "assets_filtered"
+
+    @property
+    def xml_business_reports_filtered_path(self) -> Path:
+        return self.outputs_path / "xml_business_reports_filtered"
+
     def reference_row_counts(self) -> dict[str, int]:
         raw = os.getenv("REFERENCE_ROW_COUNTS", "")
         out: dict[str, int] = {}

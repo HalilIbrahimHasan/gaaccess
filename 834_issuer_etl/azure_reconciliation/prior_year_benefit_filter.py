@@ -18,7 +18,7 @@ from typing import Any
 import pandas as pd
 
 from azure_reconciliation.full_data_exports import write_full_export_excel
-from azure_reconciliation.safe_export import safe_write_csv, safe_write_excel
+from azure_reconciliation.safe_export import safe_write_csv, safe_write_excel, ExportErrors
 from config.config import settings
 from utils.logger import get_logger
 
@@ -187,27 +187,47 @@ def apply_prior_year_benefit_filter(
     return df.loc[keep.values].reset_index(drop=True)
 
 
+def _dataset_audit_stats(audit: pd.DataFrame) -> dict[str, int]:
+    """Per-dataset counts from a filter audit frame."""
+    if audit.empty:
+        return {"before": 0, "excluded": 0, "after": 0, "null": 0}
+    before = len(audit)
+    excluded = int((audit["filter_action"] == "EXCLUDE").sum())
+    after = int((audit["filter_action"] == "KEEP").sum())
+    bey = audit["benefit_effective_year"]
+    bey_str = bey.astype(str).str.strip()
+    null_count = int(
+        bey.isna().sum()
+        + ((~bey.isna()) & bey_str.isin(["", "nan", "None"])).sum()
+    )
+    return {"before": before, "excluded": excluded, "after": after, "null": null_count}
+
+
 def build_filter_summary(
     raw_audit: pd.DataFrame,
     business_audit: pd.DataFrame,
     *,
     reporting_year: str,
-) -> tuple[pd.DataFrame, str]:
-    """Summary counts for one reporting year (raw + business combined view)."""
+) -> tuple[pd.DataFrame, str, pd.DataFrame]:
+    """Summary with separate raw and business-ready sections (not combined primary counts)."""
+    raw = _dataset_audit_stats(raw_audit)
+    biz = _dataset_audit_stats(business_audit)
+
+    summary_df = pd.DataFrame([{
+        "reporting_year": str(reporting_year),
+        "raw_before_count": raw["before"],
+        "raw_excluded_prior_year_count": raw["excluded"],
+        "raw_after_count": raw["after"],
+        "raw_null_benefit_effective_count": raw["null"],
+        "business_ready_before_count": biz["before"],
+        "business_ready_excluded_prior_year_count": biz["excluded"],
+        "business_ready_after_count": biz["after"],
+        "business_ready_null_benefit_effective_count": biz["null"],
+        "combined_row_count_before": raw["before"] + biz["before"],
+        "combined_row_count_after": raw["after"] + biz["after"],
+    }])
+
     combined = pd.concat([raw_audit, business_audit], ignore_index=True)
-    raw_n = len(raw_audit)
-    biz_n = len(business_audit)
-    before = raw_n + biz_n
-
-    excluded = int((combined["filter_action"] == "EXCLUDE").sum()) if not combined.empty else 0
-    after = int((combined["filter_action"] == "KEEP").sum()) if not combined.empty else 0
-    null_count = 0
-    if not combined.empty:
-        null_count = int(
-            combined["benefit_effective_year"].isna().sum()
-            + (combined["benefit_effective_year"].astype(str) == "").sum()
-        )
-
     by_year_rows: list[dict[str, Any]] = []
     if not combined.empty:
         for bey, grp in combined.groupby(
@@ -220,16 +240,6 @@ def build_filter_summary(
                 "excluded_count": int((grp["filter_action"] == "EXCLUDE").sum()),
                 "kept_count": int((grp["filter_action"] == "KEEP").sum()),
             })
-
-    summary_df = pd.DataFrame([{
-        "reporting_year": str(reporting_year),
-        "raw_before_count": raw_n,
-        "business_ready_before_count": biz_n,
-        "before_count": before,
-        "excluded_prior_year_count": excluded,
-        "after_count": after,
-        "null_benefit_effective_count": null_count,
-    }])
     by_year_df = pd.DataFrame(by_year_rows).sort_values("benefit_effective_year")
 
     md_lines = [
@@ -245,16 +255,32 @@ def build_filter_summary(
         f"- Keep records where `benefit_effective_year >= {reporting_year}`",
         "- Keep records with null `benefit_effective_date` (flagged in audit)",
         "",
-        "## Counts",
+        "## RAW DATASET FILTER SUMMARY",
+        "",
+        "Use **raw filtered** counts to compare against Chandra raw extract.",
         "",
         f"| Metric | Value |",
         f"|--------|------:|",
-        f"| Raw records (before) | {raw_n:,} |",
-        f"| Business-ready records (before) | {biz_n:,} |",
-        f"| Total before | {before:,} |",
-        f"| Excluded (prior year) | {excluded:,} |",
-        f"| After filter | {after:,} |",
-        f"| Null benefit effective (kept, flagged) | {null_count:,} |",
+        f"| raw_before_count | {raw['before']:,} |",
+        f"| raw_excluded_prior_year_count | {raw['excluded']:,} |",
+        f"| raw_after_count | {raw['after']:,} |",
+        f"| raw_null_benefit_effective_count | {raw['null']:,} |",
+        "",
+        "## BUSINESS READY DATASET FILTER SUMMARY",
+        "",
+        "Use **business ready filtered** counts for reporting input — not raw extract comparison.",
+        "",
+        f"| Metric | Value |",
+        f"|--------|------:|",
+        f"| business_ready_before_count | {biz['before']:,} |",
+        f"| business_ready_excluded_prior_year_count | {biz['excluded']:,} |",
+        f"| business_ready_after_count | {biz['after']:,} |",
+        f"| business_ready_null_benefit_effective_count | {biz['null']:,} |",
+        "",
+        "## Combined row counts (informational only)",
+        "",
+        f"- combined_row_count_before: {raw['before'] + biz['before']:,} (raw + business ready rows — not for validation)",
+        f"- combined_row_count_after: {raw['after'] + biz['after']:,}",
         "",
         "## Counts by benefit_effective_year",
         "",
@@ -269,13 +295,18 @@ def build_filter_summary(
                 f"| {row['benefit_effective_year']} | {int(row['record_count'])} "
                 f"| {int(row['excluded_count'])} | {int(row['kept_count'])} |"
             )
-    md_lines.append("")
-    md_lines.append(
+    md_lines.extend([
+        "",
         "Unfiltered raw and business exports are unchanged. "
-        "Filtered outputs live under `outputs/business_review_filtered/`."
-    )
-    md_lines.append("")
+        "Filtered outputs live under `outputs/business_review_filtered/`.",
+        "",
+    ])
     return summary_df, "\n".join(md_lines), by_year_df
+
+
+def filter_xml_raw_for_reporting(xml_raw: pd.DataFrame, reporting_year: str) -> pd.DataFrame:
+    """Apply prior-year benefit filter to XML rows before business pipeline."""
+    return apply_prior_year_benefit_filter(xml_raw, reporting_year=reporting_year)
 
 
 def _load_raw_export(issuer: str, year: str) -> pd.DataFrame:
@@ -325,6 +356,8 @@ def write_filtered_package(
     summary_df, summary_md, by_year_df = build_filter_summary(
         raw_audit, biz_audit, reporting_year=reporting_year,
     )
+    raw_stats = _dataset_audit_stats(raw_audit)
+    biz_stats = _dataset_audit_stats(biz_audit)
 
     comparison_xlsx = root / "filtered_comparison.xlsx"
     write_full_export_excel(
@@ -366,9 +399,11 @@ def write_filtered_package(
         "comparison_xlsx": str(comparison_xlsx),
         "raw_before": len(raw_df),
         "raw_after": len(raw_filtered),
+        "raw_excluded": raw_stats["excluded"],
         "business_before": len(business_df),
         "business_after": len(biz_filtered),
-        "excluded": int((filter_audit["filter_action"] == "EXCLUDE").sum()),
+        "business_excluded": biz_stats["excluded"],
+        "excluded": raw_stats["excluded"] + biz_stats["excluded"],
         "filter_audit": filter_audit,
         "summary_df": summary_df,
         "summary_md": summary_md,
@@ -456,4 +491,63 @@ def run_prior_year_benefit_filter_batch(
         "results": results,
         "diagnostics": diagnostics,
         "output_root": str(filtered_review_root()),
+    }
+
+
+def run_filtered_business_reporting(
+    issuer: str,
+    year: str,
+    *,
+    parse_source: bool = False,
+    export_errors: ExportErrors | None = None,
+) -> dict[str, Any]:
+    """
+    Generate filtered XML business + assets reports using prior-year benefit filter.
+
+    Writes to assets_filtered/ and xml_business_reports_filtered/ — does not touch unfiltered outputs.
+    """
+    from azure_reconciliation.partition_discovery import discover_partitions
+    from azure_reconciliation.xml_business_reports import (
+        export_issuer_reports,
+        process_issuer_xml_business,
+        write_sqlite_db,
+    )
+    from azure_reconciliation.xml_loader import load_xml_rows
+    from azure_reconciliation.assets_style_reports import export_assets_style_reports
+
+    ry = resolve_reporting_year(partition_year=year)
+    partitions = discover_partitions(settings.source_data_path, issuer_filter=issuer, year_filter=year)
+    xml_raw = load_xml_rows(
+        prefer_staging=not parse_source,
+        issuer_filter=issuer,
+        year_filter=year,
+    )
+    if xml_raw.empty:
+        raise RuntimeError(f"No XML rows for filtered reporting {issuer}/{year}")
+
+    before = len(xml_raw)
+    filtered = filter_xml_raw_for_reporting(xml_raw, ry)
+    logger.info(
+        "Filtered reporting input %s/%s: %d → %d rows (reporting_year=%s)",
+        issuer, year, before, len(filtered), ry,
+    )
+
+    result = process_issuer_xml_business(issuer, filtered, partitions)
+    xml_root = settings.xml_business_reports_filtered_path / issuer
+    export_issuer_reports(result, export_errors=export_errors, reports_root=xml_root)
+    assets_root = export_assets_style_reports(
+        [result], export_errors=export_errors, assets_root=settings.assets_filtered_path,
+    )
+    db_path = settings.xml_business_reports_filtered_path / "xml_business_filtered.sqlite"
+    write_sqlite_db([result], export_errors=export_errors, db_path=db_path)
+
+    return {
+        "issuer": issuer,
+        "year": year,
+        "reporting_year": ry,
+        "xml_rows_before": before,
+        "xml_rows_after": len(filtered),
+        "xml_reports_root": str(xml_root),
+        "assets_root": str(assets_root),
+        "sqlite": str(db_path),
     }

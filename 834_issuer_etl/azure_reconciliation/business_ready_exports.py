@@ -451,12 +451,44 @@ def business_ready_monthly_counts(df: pd.DataFrame, issuer: str, year: str) -> p
 
 
 def business_ready_dashboard_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """Dashboard-group summary — mirrors Model H grouping dimensions."""
+    """Business-facing dashboard-group summary (no subscriber fields)."""
     cols = [
         "issuer", "year", "month", "insurance_type", "status",
-        "business_ready_records", "distinct_enrollment_ids",
-        "distinct_enrollee_ids", "distinct_subscriber_ids",
-        "dashboard_group_key",
+        "business_ready_records", "distinct_enrollment_ids", "distinct_enrollee_ids",
+    ]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    rows = []
+    for key, grp in df.groupby("dashboard_group_key", dropna=False):
+        parts = str(key).split("|", 4)
+        issuer = parts[0] if len(parts) > 0 else ""
+        yr = parts[1] if len(parts) > 1 else ""
+        month = _zmonth(parts[2]) if len(parts) > 2 else ""
+        itype = parts[3] if len(parts) > 3 else ""
+        status = parts[4] if len(parts) > 4 else ""
+        enroll = grp["canonical_enrollment_id"].astype(str).str.strip()
+        enrollee = grp["canonical_enrollee_id"].astype(str).str.strip()
+        rows.append({
+            "issuer": issuer,
+            "year": yr,
+            "month": month,
+            "insurance_type": itype,
+            "status": status,
+            "business_ready_records": len(grp),
+            "distinct_enrollment_ids": int(enroll[enroll != ""].nunique()),
+            "distinct_enrollee_ids": int(enrollee[enrollee != ""].nunique()),
+        })
+    return pd.DataFrame(rows).sort_values(["year", "month", "insurance_type", "status"]).reset_index(drop=True)
+
+
+def business_ready_internal_traceability(df: pd.DataFrame) -> pd.DataFrame:
+    """Internal traceability summary — may include subscriber and raw lineage fields."""
+    cols = [
+        "issuer", "year", "month", "insurance_type", "status",
+        "business_ready_records", "distinct_enrollment_ids", "distinct_enrollee_ids",
+        "distinct_subscriber_ids", "dashboard_group_key",
+        "raw_transaction_count", "raw_source_files", "raw_transaction_keys",
     ]
     if df.empty:
         return pd.DataFrame(columns=cols)
@@ -472,6 +504,13 @@ def business_ready_dashboard_summary(df: pd.DataFrame) -> pd.DataFrame:
         enroll = grp["canonical_enrollment_id"].astype(str).str.strip()
         enrollee = grp["canonical_enrollee_id"].astype(str).str.strip()
         sub = grp["canonical_subscriber_id"].astype(str).str.strip()
+        raw_tx_count = int(grp["raw_transaction_count"].sum()) if "raw_transaction_count" in grp.columns else len(grp)
+        raw_files = ""
+        if "raw_source_files" in grp.columns:
+            raw_files = "; ".join(sorted({str(v).strip() for v in grp["raw_source_files"] if str(v).strip()}))
+        raw_keys = ""
+        if "raw_transaction_keys" in grp.columns:
+            raw_keys = "; ".join(sorted({str(v).strip() for v in grp["raw_transaction_keys"] if str(v).strip()}))
         rows.append({
             "issuer": issuer,
             "year": yr,
@@ -483,6 +522,9 @@ def business_ready_dashboard_summary(df: pd.DataFrame) -> pd.DataFrame:
             "distinct_enrollee_ids": int(enrollee[enrollee != ""].nunique()),
             "distinct_subscriber_ids": int(sub[sub != ""].nunique()),
             "dashboard_group_key": key,
+            "raw_transaction_count": raw_tx_count,
+            "raw_source_files": raw_files,
+            "raw_transaction_keys": raw_keys,
         })
     return pd.DataFrame(rows).sort_values(["year", "month", "insurance_type", "status"]).reset_index(drop=True)
 
@@ -550,6 +592,7 @@ def export_issuer_year(
     monthly = business_ready_monthly_counts(df, issuer, year)
     yearly = business_ready_yearly_counts(df, issuer, year)
     summary = business_ready_dashboard_summary(df)
+    traceability = business_ready_internal_traceability(df)
 
     csv_path = base / "business_ready_all_months.csv"
     xlsx_path = base / "business_ready_all_months.xlsx"
@@ -595,7 +638,10 @@ def export_issuer_year(
     summary_xlsx = base / "business_ready_summary.xlsx"
     write_full_export_excel(
         summary_xlsx,
-        {"BUSINESS_READY_SUMMARY": summary},
+        {
+            "Business_Ready_Summary": summary,
+            "Internal_Traceability": traceability,
+        },
         export_errors=export_errors,
     )
     out.summary_path = summary_xlsx

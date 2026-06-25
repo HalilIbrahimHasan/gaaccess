@@ -275,6 +275,7 @@ def export_assets_style_reports(
     results: list[IssuerBusinessResult],
     *,
     export_errors: ExportErrors | None = None,
+    assets_root: Path | None = None,
 ) -> Path:
     """Write Chandra-format business reports under assets/{issuer}/.../reports/."""
     from azure_reconciliation.business_output_validation import (
@@ -283,7 +284,8 @@ def export_assets_style_reports(
         processing_summary_html,
     )
 
-    root = assets_reports_root()
+    root = assets_root or assets_reports_root()
+    root.mkdir(parents=True, exist_ok=True)
 
     for result in results:
         issuer = result.issuer
@@ -397,13 +399,17 @@ def export_assets_style_reports(
 
         logger.info("Wrote assets-style Chandra reports for issuer %s", issuer)
 
-    write_assets_report_index(results)
+    write_assets_report_index(results, assets_root=root)
     return root
 
 
-def write_assets_report_index(results: list[IssuerBusinessResult]) -> Path:
+def write_assets_report_index(
+    results: list[IssuerBusinessResult],
+    *,
+    assets_root: Path | None = None,
+) -> Path:
     """Top-level assets/report_index.html linking business reports and diagnostics."""
-    root = assets_reports_root()
+    root = assets_root or assets_reports_root()
     generated = datetime.now(timezone.utc).isoformat(timespec="seconds")
     lines = [
         "<!DOCTYPE html><html><head><meta charset='utf-8'>",

@@ -536,6 +536,7 @@ def export_issuer_reports(
     result: IssuerBusinessResult,
     *,
     export_errors: ExportErrors | None = None,
+    reports_root: Path | None = None,
 ) -> Path:
     """Write per-issuer HTML/XLSX/CSV tree."""
     from azure_reconciliation.business_output_validation import (
@@ -551,7 +552,7 @@ def export_issuer_reports(
         write_model_h_month_html,
     )
 
-    root = xml_business_reports_root() / result.issuer
+    root = reports_root or (xml_business_reports_root() / result.issuer)
     root.mkdir(parents=True, exist_ok=True)
     issuer_proc = processing_summary_html(build_business_processing_summary(result))
     chandra_monthly = to_chandra_business_summary(result.business_monthly)
@@ -709,6 +710,7 @@ def write_index_reports(
     results: list[IssuerBusinessResult],
     *,
     export_errors: ExportErrors | None = None,
+    reports_root: Path | None = None,
 ) -> Path:
     """Master index.html / index.xlsx at xml_business_reports root."""
     from azure_reconciliation.business_output_validation import (
@@ -721,7 +723,7 @@ def write_index_reports(
         to_chandra_business_summary,
     )
 
-    root = xml_business_reports_root()
+    root = reports_root or xml_business_reports_root()
     monthly_internal = pd.concat(
         [r.business_monthly for r in results if not r.business_monthly.empty], ignore_index=True,
     )
@@ -811,9 +813,10 @@ def write_sqlite_db(
     results: list[IssuerBusinessResult],
     *,
     export_errors: ExportErrors | None = None,
+    db_path: Path | None = None,
 ) -> Path:
     """Persist canonical, lifecycle, Model H, and audit tables."""
-    db_path = xml_business_reports_root() / "xml_business.sqlite"
+    db_path = db_path or (xml_business_reports_root() / "xml_business.sqlite")
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     canonical = pd.concat([r.canonical for r in results if not r.canonical.empty], ignore_index=True)

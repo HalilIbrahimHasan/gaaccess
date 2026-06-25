@@ -188,7 +188,12 @@ def _install_lineage_diagram() -> dict[str, str]:
     return out
 
 
-def _root_readme_md(packages: list[PackageResult], lineage: dict[str, str]) -> str:
+def _root_readme_md(
+    packages: list[PackageResult],
+    lineage: dict[str, str],
+    *,
+    filtered_enabled: bool = False,
+) -> str:
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     lines = [
         "# Business Review Package",
@@ -217,9 +222,26 @@ def _root_readme_md(packages: list[PackageResult], lineage: dict[str, str]) -> s
         "Yearly **raw** and **canonical** counts often match because both are full record-level",
         "exports with no rows removed. **Business ready** counts are lower.",
         "",
-        "Monthly counts may differ when **source folder month** ≠ **business month**",
+        "- Monthly counts may differ when **source folder month** ≠ **business month**",
         "(see investigations/month_reassignment_matrix.xlsx).",
         "",
+    ]
+    if filtered_enabled:
+        lines.extend([
+            "## Prior-year benefit effective filter (enabled)",
+            "",
+            "When `FILTER_PRIOR_YEAR_BENEFIT_EFFECTIVE=true`, filtered outputs are written separately:",
+            "",
+            "- `outputs/business_review_filtered/<issuer>/<year>/filtered_comparison.xlsx` — FILTER_SUMMARY",
+            "- `assets_filtered/` — Chandra enrollment reports (prior-year excluded)",
+            "- `outputs/xml_business_reports_filtered/` — XML business reports + SQLite",
+            "",
+            "Unfiltered `outputs/business_review/` and `assets/` are unchanged.",
+            "Use **raw filtered** counts to compare Chandra raw extract; "
+            "use **business ready filtered** counts for reporting input.",
+            "",
+        ])
+    lines.extend([
         "## Trace a dashboard number",
         "",
         "1. Open `reports/monthly/<month>/enrollment_summary.xlsx` or `issuer_year_rollup.xlsx`",
@@ -242,7 +264,7 @@ def _root_readme_md(packages: list[PackageResult], lineage: dict[str, str]) -> s
         "",
         "## Data lineage",
         "",
-    ]
+    ])
     if lineage.get("png"):
         lines.append(f"![Data lineage](data_lineage_diagram.png)")
     lines.append(f"[Interactive lineage diagram](data_lineage_diagram.html)")
@@ -454,11 +476,13 @@ def run_business_review_package(
     lineage = _install_lineage_diagram()
 
     filter_stats: dict[str, Any] | None = None
+    filtered_reporting: list[dict[str, Any]] = []
     if settings.filter_prior_year_benefit_effective:
         logger.info("Step 6 — Prior-year benefit effective filter (optional)")
         try:
             from azure_reconciliation.prior_year_benefit_filter import (
                 resolve_reporting_year,
+                run_filtered_business_reporting,
                 run_prior_year_benefit_filter_batch,
             )
 
@@ -472,12 +496,34 @@ def run_business_review_package(
                 "Filtered exports → %s (%d issuer/years)",
                 filter_stats.get("output_root"), filter_stats.get("issuer_years", 0),
             )
+
+            logger.info("Step 7 — Filtered business reports (assets_filtered + xml_business_reports_filtered)")
+            for issuer, year in pairs:
+                try:
+                    fr = run_filtered_business_reporting(
+                        issuer, year, parse_source=parse_source, export_errors=errors,
+                    )
+                    filtered_reporting.append(fr)
+                    logger.info(
+                        "Filtered reports %s/%s: XML %d→%d rows → %s",
+                        issuer, year, fr["xml_rows_before"], fr["xml_rows_after"],
+                        fr["assets_root"],
+                    )
+                except Exception as exc:
+                    logger.warning("Filtered reporting failed for %s/%s: %s", issuer, year, exc)
+                    errors.record(f"Filtered reporting {issuer}/{year}: {exc}")
         except Exception as exc:
             logger.warning("Prior-year benefit filter failed: %s", exc)
             errors.record(f"Prior-year benefit filter: {exc}")
 
     readme_path = review_root() / "README.md"
-    readme_path.write_text(_root_readme_md(packages, lineage), encoding="utf-8")
+    readme_path.write_text(
+        _root_readme_md(
+            packages, lineage,
+            filtered_enabled=settings.filter_prior_year_benefit_effective,
+        ),
+        encoding="utf-8",
+    )
     index_path = _write_index_html(packages, lineage)
 
     return {
@@ -488,4 +534,5 @@ def run_business_review_package(
         "packages": packages,
         "lineage": lineage,
         "filtered_exports": filter_stats,
+        "filtered_reporting": filtered_reporting,
     }

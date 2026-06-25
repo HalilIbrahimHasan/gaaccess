@@ -113,10 +113,11 @@ def to_chandra_business_summary(internal: pd.DataFrame) -> pd.DataFrame:
     Convert internal Model H business summary to Chandra enrollment summary columns.
 
     Expects internal columns: issuer, year, month, insurance_type, status,
-    Enrollment_Count, Enrollee_Count, [Subscriber_Count].
+    Enrollment_Count, Enrollee_Count.
+    Business-facing output excludes Subscriber_Count (often unpopulated).
     """
     if internal.empty:
-        return pd.DataFrame(columns=CHANDRA_BUSINESS_COLUMNS)
+        return pd.DataFrame(columns=CHANDRA_BUSINESS_COLUMNS_CORE)
 
     rows: list[dict] = []
     for _, row in internal.iterrows():
@@ -132,10 +133,9 @@ def to_chandra_business_summary(internal: pd.DataFrame) -> pd.DataFrame:
             "enrolleeStatus": enrollee_status,
             "Enrollment_Count": int(row.get("Enrollment_Count", row.get("enrollment_count", 0)) or 0),
             "Enrollee_Count": int(row.get("Enrollee_Count", row.get("enrollee_count", 0)) or 0),
-            "Subscriber_Count": int(row.get("Subscriber_Count", row.get("subscriber_count", 0)) or 0),
         })
     out = pd.DataFrame(rows)
-    return out[CHANDRA_BUSINESS_COLUMNS]
+    return out[CHANDRA_BUSINESS_COLUMNS_CORE]
 
 
 def rollup_chandra_business(
@@ -145,7 +145,7 @@ def rollup_chandra_business(
     """Sum count columns on Chandra-formatted data."""
     if chandra_df.empty:
         return chandra_df
-    sum_cols = ["Enrollment_Count", "Enrollee_Count", "Subscriber_Count"]
+    sum_cols = ["Enrollment_Count", "Enrollee_Count"]
     keys = [k for k in group_keys if k in chandra_df.columns]
     if not keys:
         return chandra_df
@@ -177,7 +177,7 @@ def business_table_html(df: pd.DataFrame, *, title: str = "Business Enrollment S
     if df.empty:
         body = "<p><em>No business rows</em></p>"
     else:
-        show = df[[c for c in CHANDRA_BUSINESS_COLUMNS if c in df.columns]]
+        show = df[[c for c in CHANDRA_BUSINESS_COLUMNS_CORE if c in df.columns]]
         body = show.to_html(index=False, escape=True, border=1)
     return f"<h2>{title}</h2>\n{body}"
 
