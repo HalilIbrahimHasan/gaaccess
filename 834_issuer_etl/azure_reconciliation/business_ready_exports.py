@@ -454,6 +454,7 @@ def business_ready_dashboard_summary(df: pd.DataFrame) -> pd.DataFrame:
     """Business-facing dashboard-group summary (no subscriber fields)."""
     cols = [
         "issuer", "year", "month", "insurance_type", "status",
+        "dashboard_group_key",
         "business_ready_records", "distinct_enrollment_ids", "distinct_enrollee_ids",
     ]
     if df.empty:
@@ -475,6 +476,7 @@ def business_ready_dashboard_summary(df: pd.DataFrame) -> pd.DataFrame:
             "month": month,
             "insurance_type": itype,
             "status": status,
+            "dashboard_group_key": key,
             "business_ready_records": len(grp),
             "distinct_enrollment_ids": int(enroll[enroll != ""].nunique()),
             "distinct_enrollee_ids": int(enrollee[enrollee != ""].nunique()),
