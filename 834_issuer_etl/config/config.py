@@ -172,6 +172,12 @@ class Settings:
     enable_full_data_export: bool = field(
         default_factory=lambda: _env_bool("ENABLE_FULL_DATA_EXPORT", False)
     )
+    filter_prior_year_benefit_effective: bool = field(
+        default_factory=lambda: _env_bool("FILTER_PRIOR_YEAR_BENEFIT_EFFECTIVE", False)
+    )
+    reporting_year: str | None = field(
+        default_factory=lambda: os.getenv("REPORTING_YEAR") or None
+    )
     relationship_min_record_match_rate: float = field(
         default_factory=lambda: float(os.getenv("RELATIONSHIP_MIN_RECORD_MATCH_RATE", "70"))
     )
@@ -201,6 +207,10 @@ class Settings:
     @property
     def full_data_exports_path(self) -> Path:
         return self.outputs_path / "full_data_exports"
+
+    @property
+    def business_review_filtered_path(self) -> Path:
+        return self.outputs_path / "business_review_filtered"
 
     def reference_row_counts(self) -> dict[str, int]:
         raw = os.getenv("REFERENCE_ROW_COUNTS", "")
@@ -232,6 +242,10 @@ class Settings:
         self.use_fixed_azure_candidate = _env_bool("USE_FIXED_AZURE_CANDIDATE", True)
         self.xml_only_business_mode = _env_bool("XML_ONLY_BUSINESS_MODE", False)
         self.enable_full_data_export = _env_bool("ENABLE_FULL_DATA_EXPORT", False)
+        self.filter_prior_year_benefit_effective = _env_bool(
+            "FILTER_PRIOR_YEAR_BENEFIT_EFFECTIVE", False
+        )
+        self.reporting_year = os.getenv("REPORTING_YEAR") or None
         self.relationship_min_record_match_rate = float(
             os.getenv("RELATIONSHIP_MIN_RECORD_MATCH_RATE", "70")
         )
@@ -270,6 +284,7 @@ class Settings:
             self.issuer_filter = issuer
         if year:
             self.year_filter = year
+            self.reporting_year = year
         if month:
             self.month_filter = str(month).zfill(2)
 
@@ -298,6 +313,7 @@ class Settings:
             self.outputs_path / "xml_business_reports",
             self.outputs_path / "xml_business_reports" / "all_issuers",
             self.full_data_exports_path,
+            self.business_review_filtered_path,
             self.azure_reconciliation_output_path / "excel",
             self.azure_reconciliation_output_path / "dashboards",
             self.azure_reconciliation_output_path / "sqlite",

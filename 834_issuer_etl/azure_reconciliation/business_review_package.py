@@ -453,6 +453,29 @@ def run_business_review_package(
     packages = [assemble_package(i, y, month_filter=month_filter) for i, y in pairs]
     lineage = _install_lineage_diagram()
 
+    filter_stats: dict[str, Any] | None = None
+    if settings.filter_prior_year_benefit_effective:
+        logger.info("Step 6 — Prior-year benefit effective filter (optional)")
+        try:
+            from azure_reconciliation.prior_year_benefit_filter import (
+                resolve_reporting_year,
+                run_prior_year_benefit_filter_batch,
+            )
+
+            reporting_override = (
+                resolve_reporting_year(cli_year=year_filter) if year_filter else None
+            )
+            filter_stats = run_prior_year_benefit_filter_batch(
+                pairs, reporting_year_override=reporting_override,
+            )
+            logger.info(
+                "Filtered exports → %s (%d issuer/years)",
+                filter_stats.get("output_root"), filter_stats.get("issuer_years", 0),
+            )
+        except Exception as exc:
+            logger.warning("Prior-year benefit filter failed: %s", exc)
+            errors.record(f"Prior-year benefit filter: {exc}")
+
     readme_path = review_root() / "README.md"
     readme_path.write_text(_root_readme_md(packages, lineage), encoding="utf-8")
     index_path = _write_index_html(packages, lineage)
@@ -464,4 +487,5 @@ def run_business_review_package(
         "issuer_years": len(packages),
         "packages": packages,
         "lineage": lineage,
+        "filtered_exports": filter_stats,
     }

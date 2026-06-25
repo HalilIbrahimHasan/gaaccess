@@ -54,6 +54,7 @@ def main() -> None:
     args = parse_args()
     settings.refresh_from_env()
     settings.apply_xml_only_business_mode(True)
+    settings.apply_cli_filters(args.issuer, args.year, args.month)
     settings.ensure_dirs()
 
     export_errors = ExportErrors()
