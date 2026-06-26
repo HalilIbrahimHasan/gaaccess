@@ -222,6 +222,7 @@ def _root_readme_md(
         "- The prior-year filter does **not** modify `source_data` or unfiltered exports.",
         "- When `FILTER_PRIOR_YEAR_BENEFIT_EFFECTIVE=true`, filtered reports are written separately under",
         "  `assets_filtered/` and `outputs/xml_business_reports_filtered/`.",
+        "- Filter uses **benefit_effective_date** only — not selected_transaction_date.",
         "",
         "## RAW vs CANONICAL vs BUSINESS READY vs REPORTS",
         "",
@@ -251,6 +252,7 @@ def _root_readme_md(
             "",
             "Compare **raw filtered** counts to Chandra raw extract.",
             "Compare **business ready filtered** counts to reporting input (not raw extract).",
+            "Filter uses benefit_effective_date only — selected_transaction_date is for comparison.",
             "",
         ])
     lines.extend([
@@ -499,40 +501,22 @@ def run_business_review_package(
     filter_stats: dict[str, Any] | None = None
     filtered_reporting: list[dict[str, Any]] = []
     if settings.filter_prior_year_benefit_effective:
-        logger.info("Step 6 — Prior-year benefit effective filter (optional)")
+        logger.info("Step 6 — Prior-year benefit effective filter (FILTER_PRIOR_YEAR_BENEFIT_EFFECTIVE=true)")
         try:
-            from azure_reconciliation.prior_year_benefit_filter import (
-                resolve_reporting_year,
-                run_filtered_business_reporting,
-                run_prior_year_benefit_filter_batch,
-            )
+            from azure_reconciliation.prior_year_benefit_filter import run_prior_year_filter_end_to_end
 
-            reporting_override = (
-                resolve_reporting_year(cli_year=year_filter) if year_filter else None
+            filter_stats = run_prior_year_filter_end_to_end(
+                issuer_filter=issuer_filter,
+                year_filter=year_filter,
+                parse_source=parse_source,
+                export_errors=errors,
             )
-            filter_stats = run_prior_year_benefit_filter_batch(
-                pairs, reporting_year_override=reporting_override,
-            )
+            filtered_reporting = filter_stats.get("filtered_reporting", [])
             logger.info(
-                "Filtered exports → %s (%d issuer/years)",
-                filter_stats.get("output_root"), filter_stats.get("issuer_years", 0),
+                "Filtered package → %s (%d issuer/years)",
+                filter_stats.get("filtered_output_root"),
+                filter_stats.get("filter_stats", {}).get("issuer_years", 0),
             )
-
-            logger.info("Step 7 — Filtered business reports (assets_filtered + xml_business_reports_filtered)")
-            for issuer, year in pairs:
-                try:
-                    fr = run_filtered_business_reporting(
-                        issuer, year, parse_source=parse_source, export_errors=errors,
-                    )
-                    filtered_reporting.append(fr)
-                    logger.info(
-                        "Filtered reports %s/%s: XML %d→%d rows → %s",
-                        issuer, year, fr["xml_rows_before"], fr["xml_rows_after"],
-                        fr["assets_root"],
-                    )
-                except Exception as exc:
-                    logger.warning("Filtered reporting failed for %s/%s: %s", issuer, year, exc)
-                    errors.record(f"Filtered reporting {issuer}/{year}: {exc}")
         except Exception as exc:
             logger.warning("Prior-year benefit filter failed: %s", exc)
             errors.record(f"Prior-year benefit filter: {exc}")
@@ -554,6 +538,7 @@ def run_business_review_package(
         "issuer_years": len(packages),
         "packages": packages,
         "lineage": lineage,
-        "filtered_exports": filter_stats,
+        "filtered_exports": filter_stats.get("filter_stats") if filter_stats else None,
         "filtered_reporting": filtered_reporting,
+        "filtered_pipeline": filter_stats,
     }

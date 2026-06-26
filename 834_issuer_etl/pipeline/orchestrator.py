@@ -147,6 +147,25 @@ class Pipeline:
             except Exception as exc:
                 logger.warning("Full data exports skipped — %s", exc)
 
+        if settings.filter_prior_year_benefit_effective:
+            try:
+                from azure_reconciliation.prior_year_benefit_filter import run_prior_year_filter_end_to_end
+                from azure_reconciliation.safe_export import ExportErrors
+
+                filtered_stats = run_prior_year_filter_end_to_end(
+                    issuer_filter=issuer or settings.issuer_filter,
+                    year_filter=settings.year_filter,
+                    parse_source=False,
+                    export_errors=ExportErrors(),
+                )
+                stats["prior_year_filter"] = filtered_stats
+                logger.info(
+                    "Prior-year filtered pipeline complete → %s",
+                    filtered_stats.get("filtered_output_root"),
+                )
+            except Exception as exc:
+                logger.warning("Prior-year filter pipeline skipped — %s", exc)
+
         if (
             not settings.xml_only_business_mode
             and settings.azure_enabled

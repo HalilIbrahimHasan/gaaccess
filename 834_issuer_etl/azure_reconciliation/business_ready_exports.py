@@ -25,6 +25,7 @@ from azure_reconciliation.full_data_exports import (
     write_full_export_excel,
 )
 from azure_reconciliation.partition_discovery import discover_partitions
+from azure_reconciliation.prior_year_benefit_filter import parse_benefit_effective_year
 from azure_reconciliation.safe_export import ExportErrors, safe_write_csv
 from azure_reconciliation.status_mapper import normalize_insurance_type
 from azure_reconciliation.xml_business_reports import (
@@ -51,6 +52,8 @@ BUSINESS_READY_COLUMNS = [
     "member_id",
     "subscriber_id",
     "business_month",
+    "benefit_effective_date",
+    "benefit_effective_year",
     "selected_transaction_date",
     "selection_reason",
     "collapsed_event_count",
@@ -279,6 +282,42 @@ def _dashboard_group_key(row: pd.Series) -> str:
     ])
 
 
+def _attach_benefit_effective_dates(
+    work: pd.DataFrame,
+    canonical: pd.DataFrame,
+) -> pd.DataFrame:
+    """Ensure benefit_effective_date and benefit_effective_year on business-ready rows."""
+    out = work.copy()
+    bed_missing = (
+        "benefit_effective_date" not in out.columns
+        or out["benefit_effective_date"].astype(str).str.strip().isin(["", "nan", "None"]).all()
+    )
+    if bed_missing and not canonical.empty:
+        merge_keys = [
+            c for c in PK + ["year", "month"]
+            if c in out.columns and c in canonical.columns
+        ]
+        if merge_keys:
+            canon_sub = canonical[merge_keys + ["benefit_effective_date"]].drop_duplicates(
+                subset=merge_keys, keep="last",
+            )
+            out = out.merge(canon_sub, on=merge_keys, how="left", suffixes=("", "_canon"))
+            if "benefit_effective_date_canon" in out.columns:
+                if "benefit_effective_date" not in out.columns:
+                    out["benefit_effective_date"] = out["benefit_effective_date_canon"]
+                else:
+                    mask = out["benefit_effective_date"].astype(str).str.strip().isin(["", "nan", "None"])
+                    out.loc[mask, "benefit_effective_date"] = out.loc[mask, "benefit_effective_date_canon"]
+                out = out.drop(columns=["benefit_effective_date_canon"], errors="ignore")
+
+    if "benefit_effective_date" not in out.columns:
+        out["benefit_effective_date"] = ""
+    out["benefit_effective_year"] = out["benefit_effective_date"].map(
+        lambda v: "" if parse_benefit_effective_year(v) is None else int(parse_benefit_effective_year(v)),
+    )
+    return out
+
+
 def _merge_collapse_audit(
     lifecycle_input: pd.DataFrame,
     collapse_result: Any,
@@ -399,6 +438,7 @@ def build_business_ready_records(
     work["_insurance_type_norm"] = work.get("insurance_type", "").astype(str).map(normalize_insurance_type)
     work["insurance_type"] = work["_insurance_type_norm"].map(insurance_type_display)
 
+    work = _attach_benefit_effective_dates(work, result.canonical)
     work["selected_transaction_date"] = work.apply(_selected_transaction_date, axis=1)
 
     if "policy_id" not in work.columns:

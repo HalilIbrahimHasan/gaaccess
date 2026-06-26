@@ -30,8 +30,12 @@ AUDIT_COLUMNS = [
     "source_file",
     "policy_id",
     "member_id",
+    "canonical_enrollment_id",
+    "canonical_enrollee_id",
     "benefit_effective_date",
     "benefit_effective_year",
+    "selected_transaction_date",
+    "selected_transaction_year",
     "filter_action",
     "filter_reason",
 ]
@@ -40,10 +44,10 @@ FILTER_ACTION_EXCLUDE = "EXCLUDE_PRIOR_YEAR"
 FILTER_ACTION_KEEP_CURRENT = "KEEP_CURRENT_OR_FUTURE_YEAR"
 FILTER_ACTION_KEEP_NULL = "KEEP_NULL_BENEFIT_EFFECTIVE_DATE"
 
+# Prior-year filter uses benefit_effective_date only — never selected_transaction_date.
 BENEFIT_DATE_COLS = (
     "benefit_effective_date",
     "benefit_effective_begin_date",
-    "selected_transaction_date",
 )
 
 
@@ -114,9 +118,29 @@ def _policy_id_series(df: pd.DataFrame) -> pd.Series:
 
 
 def _member_id_series(df: pd.DataFrame) -> pd.Series:
-    for col in ("member_id", "exchg_assigned_enrollee_id", "exchg_indiv_identifier"):
+    for col in ("member_id", "exchg_assigned_enrollee_id", "exchg_indiv_identifier", "canonical_enrollee_id"):
         if col in df.columns:
             return df[col].astype(str)
+    return pd.Series([""] * len(df), index=df.index, dtype=str)
+
+
+def _canonical_enrollment_id_series(df: pd.DataFrame) -> pd.Series:
+    for col in ("canonical_enrollment_id", "policy_id", "enrollment_id", "health_coverage_policy_no"):
+        if col in df.columns:
+            return df[col].astype(str)
+    return pd.Series([""] * len(df), index=df.index, dtype=str)
+
+
+def _canonical_enrollee_id_series(df: pd.DataFrame) -> pd.Series:
+    for col in ("canonical_enrollee_id", "member_id", "exchg_assigned_enrollee_id"):
+        if col in df.columns:
+            return df[col].astype(str)
+    return pd.Series([""] * len(df), index=df.index, dtype=str)
+
+
+def _selected_transaction_date_series(df: pd.DataFrame) -> pd.Series:
+    if "selected_transaction_date" in df.columns:
+        return df["selected_transaction_date"].astype(str)
     return pd.Series([""] * len(df), index=df.index, dtype=str)
 
 
@@ -143,7 +167,7 @@ def classify_benefit_filter(
 
 
 def _benefit_date_column_used(df: pd.DataFrame) -> str | None:
-    """Return which column supplies benefit effective dates for this frame."""
+    """Return benefit_effective_date column if present with any non-null values."""
     for col in BENEFIT_DATE_COLS:
         if col in df.columns:
             s = df[col].astype(str).str.strip()
@@ -163,49 +187,37 @@ def _prior_year_candidate_count(df: pd.DataFrame, reporting_year: str) -> int:
     return int(((years.notna()) & (years < y)).sum())
 
 
-def _raw_filter_status(raw: dict[str, int]) -> str:
-    if raw["before"] == 0:
+def _raw_filter_status(stats: dict[str, int]) -> str:
+    if stats["before"] == 0:
         return "PASS"
-    return "PASS" if raw["before"] - raw["excluded"] == raw["after"] else "FAIL"
+    return "PASS" if stats["before"] - stats["excluded"] == stats["after"] else "FAIL"
 
 
-def _business_ready_filter_meta(
+def _business_ready_filter_note(
     business_df: pd.DataFrame,
     business_audit: pd.DataFrame,
     *,
     reporting_year: str,
-) -> dict[str, Any]:
-    """Explain whether business-ready prior-year filtering could apply."""
-    date_col = _benefit_date_column_used(business_df)
+) -> str:
+    """Explain business-ready filter outcome using benefit_effective_date only."""
+    if "benefit_effective_date" not in business_df.columns and not _benefit_date_column_used(business_df):
+        return (
+            "business_ready export missing benefit_effective_date — "
+            "prior-year filter could not be applied; re-run business_ready_exports."
+        )
     candidates = _prior_year_candidate_count(business_df, reporting_year)
     excluded = int((business_audit["filter_action"] == FILTER_ACTION_EXCLUDE).sum()) if not business_audit.empty else 0
-
-    if not date_col:
-        return {
-            "business_ready_prior_year_candidates": 0,
-            "business_ready_filter_applied": "no",
-            "business_ready_filter_note": (
-                "business_ready export has no benefit_effective_date or selected_transaction_date — "
-                "prior-year filter could not be evaluated on business-ready rows."
-            ),
-        }
-    if candidates == 0:
-        note = "No business-ready records had prior-year benefit effective dates."
-    elif excluded == 0 and candidates > 0:
-        note = (
-            f"{candidates} business-ready record(s) had benefit_effective_year < {reporting_year} "
-            f"but none were excluded — review FILTER_AUDIT."
+    if candidates == 0 and excluded == 0:
+        return "No business-ready records had prior-year benefit_effective_date values."
+    if excluded > 0:
+        return (
+            f"Excluded {excluded} business-ready record(s) where "
+            f"benefit_effective_year < {reporting_year} (filter uses benefit_effective_date only)."
         )
-    else:
-        note = (
-            f"{excluded} business-ready record(s) excluded "
-            f"({candidates} had benefit_effective_year < {reporting_year})."
-        )
-    return {
-        "business_ready_prior_year_candidates": candidates,
-        "business_ready_filter_applied": "yes",
-        "business_ready_filter_note": note,
-    }
+    return (
+        f"{candidates} record(s) had benefit_effective_year < {reporting_year} "
+        "but were not excluded — review FILTER_AUDIT."
+    )
 
 
 def build_filter_audit(
@@ -225,6 +237,11 @@ def build_filter_audit(
     benefit_year_out = benefit_years.apply(
         lambda y: "" if y is None or (isinstance(y, float) and pd.isna(y)) else int(y),
     )
+    selected_dates = _selected_transaction_date_series(work)
+    selected_years = selected_dates.map(parse_benefit_effective_year)
+    selected_year_out = selected_years.apply(
+        lambda y: "" if y is None or (isinstance(y, float) and pd.isna(y)) else int(y),
+    )
     actions: list[str] = []
     reasons: list[str] = []
     for bey in benefit_years:
@@ -240,8 +257,12 @@ def build_filter_audit(
         "source_file": _source_file_series(work),
         "policy_id": _policy_id_series(work),
         "member_id": _member_id_series(work),
+        "canonical_enrollment_id": _canonical_enrollment_id_series(work),
+        "canonical_enrollee_id": _canonical_enrollee_id_series(work),
         "benefit_effective_date": benefit_dates.astype(str),
         "benefit_effective_year": benefit_year_out,
+        "selected_transaction_date": selected_dates.astype(str),
+        "selected_transaction_year": selected_year_out,
         "filter_action": actions,
         "filter_reason": reasons,
     })
@@ -281,7 +302,7 @@ def build_filter_summary(
     """Summary with separate raw and business-ready sections (not combined primary counts)."""
     raw = _dataset_audit_stats(raw_audit)
     biz = _dataset_audit_stats(business_audit)
-    biz_meta = _business_ready_filter_meta(
+    filter_note = _business_ready_filter_note(
         business_df if business_df is not None else pd.DataFrame(),
         business_audit,
         reporting_year=reporting_year,
@@ -298,9 +319,8 @@ def build_filter_summary(
         "business_ready_excluded_prior_year_count": biz["excluded"],
         "business_ready_after_count": biz["after"],
         "business_ready_null_benefit_effective_count": biz["null"],
-        "business_ready_prior_year_candidates": biz_meta["business_ready_prior_year_candidates"],
-        "business_ready_filter_applied": biz_meta["business_ready_filter_applied"],
-        "business_ready_filter_note": biz_meta["business_ready_filter_note"],
+        "business_ready_filter_status": _raw_filter_status(biz),
+        "business_ready_filter_note": filter_note,
     }])
 
     combined = pd.concat([raw_audit, business_audit], ignore_index=True)
@@ -353,10 +373,9 @@ def build_filter_summary(
         f"| business_ready_excluded_prior_year_count | {biz['excluded']:,} |",
         f"| business_ready_after_count | {biz['after']:,} |",
         f"| business_ready_null_benefit_effective_count | {biz['null']:,} |",
-        f"| business_ready_prior_year_candidates | {biz_meta['business_ready_prior_year_candidates']:,} |",
-        f"| business_ready_filter_applied | {biz_meta['business_ready_filter_applied']} |",
+        f"| business_ready_filter_status | {_raw_filter_status(biz)} |",
         "",
-        f"**Note:** {biz_meta['business_ready_filter_note']}",
+        f"**Note:** {filter_note}",
         "",
         "## Counts by benefit_effective_year",
         "",
@@ -442,6 +461,8 @@ def write_filtered_package(
             "README": pd.DataFrame({
                 "note": [
                     f"Prior-year benefit filter for reporting year {reporting_year}.",
+                    "Filter uses benefit_effective_date / benefit_effective_year only.",
+                    "selected_transaction_date is included for comparison but NOT used for filtering.",
                     "RAW_FILTERED and BUSINESS_READY_FILTERED exclude benefit_effective_year < reporting_year.",
                     "Null benefit_effective_date rows are kept and flagged in FILTER_AUDIT.",
                     "Original unfiltered exports are not modified.",
@@ -468,9 +489,10 @@ def write_filtered_package(
     readme = root / "README.md"
     readme_body = summary_md + (
         "\n## About this package\n\n"
-        "This is the **filtered** comparison view for Chandra alignment.\n"
-        "It excludes records where `benefit_effective_year < reporting_year`.\n"
-        "Original unfiltered exports under `outputs/business_review/` are unchanged.\n"
+        "This is the **filtered** Chandra-aligned comparison view.\n"
+        "Prior-year benefit effective records are excluded dynamically by reporting year.\n"
+        "Filter uses **benefit_effective_date** only — not selected_transaction_date.\n"
+        "Full unfiltered source truth is preserved under `outputs/business_review/`.\n"
         "Filtered reports are under `assets_filtered/` and `outputs/xml_business_reports_filtered/`.\n\n"
         "## Files\n\n- `filtered_comparison.xlsx`\n"
     )
@@ -570,6 +592,15 @@ def run_prior_year_benefit_filter_batch(
             logger.error("Filter failed for %s/%s: %s", issuer, year, exc)
 
     diagnostics = write_global_diagnostics(results)
+    raw_excluded = sum(r.get("raw_excluded", 0) for r in results)
+    biz_excluded = sum(r.get("business_excluded", 0) for r in results)
+    ry = results[0]["reporting_year"] if results else ""
+    logger.info(
+        "FILTER_PRIOR_YEAR_BENEFIT_EFFECTIVE=true reporting_year=%s "
+        "excluded_prior_year_raw_count=%d excluded_prior_year_business_ready_count=%d "
+        "filtered output root=%s",
+        ry, raw_excluded, biz_excluded, filtered_review_root(),
+    )
     return {
         "issuer_years": len(results),
         "results": results,
@@ -634,7 +665,72 @@ def run_filtered_business_reporting(
         "reporting_year": ry,
         "xml_rows_before": before,
         "xml_rows_after": len(filtered),
+        "xml_rows_excluded": before - len(filtered),
         "xml_reports_root": str(xml_root),
         "assets_root": str(assets_root),
         "sqlite": str(db_path),
+    }
+
+
+def run_prior_year_filter_end_to_end(
+    *,
+    issuer_filter: str | None = None,
+    year_filter: str | None = None,
+    parse_source: bool = False,
+    export_errors: ExportErrors | None = None,
+) -> dict[str, Any]:
+    """
+    End-to-end filtered pipeline: exports → filter comparison → filtered reports.
+
+    Unfiltered outputs are produced separately by callers; this only writes filtered roots.
+    """
+    from azure_reconciliation.business_ready_exports import run_business_ready_exports
+    from azure_reconciliation.full_data_exports import discover_issuer_year_pairs, run_full_data_exports
+
+    if not settings.filter_prior_year_benefit_effective:
+        return {"enabled": False}
+
+    pairs = discover_issuer_year_pairs(issuer_filter=issuer_filter, year_filter=year_filter)
+    if not pairs:
+        logger.warning("Prior-year filter: no issuer/year pairs found")
+        return {"enabled": True, "issuer_years": 0}
+
+    logger.info("FILTER_PRIOR_YEAR_BENEFIT_EFFECTIVE=true")
+    errors = export_errors or ExportErrors()
+
+    for issuer, year in pairs:
+        run_full_data_exports(
+            issuer_filter=issuer, year_filter=year,
+            parse_source=parse_source, export_errors=errors,
+        )
+        run_business_ready_exports(
+            issuer_filter=issuer, year_filter=year,
+            parse_source=parse_source, export_errors=errors,
+        )
+
+    reporting_override = resolve_reporting_year(cli_year=year_filter) if year_filter else None
+    filter_stats = run_prior_year_benefit_filter_batch(
+        pairs, reporting_year_override=reporting_override,
+    )
+
+    filtered_reporting: list[dict[str, Any]] = []
+    for issuer, year in pairs:
+        logger.info("Running filtered reports for issuer=%s, year=%s", issuer, year)
+        logger.info("Writing filtered assets to assets_filtered/%s/%s", issuer, year)
+        try:
+            fr = run_filtered_business_reporting(
+                issuer, year, parse_source=parse_source, export_errors=errors,
+            )
+            filtered_reporting.append(fr)
+        except Exception as exc:
+            logger.error("Filtered reporting failed for %s/%s: %s", issuer, year, exc)
+            errors.record(f"Filtered reporting {issuer}/{year}: {exc}")
+
+    return {
+        "enabled": True,
+        "filter_stats": filter_stats,
+        "filtered_reporting": filtered_reporting,
+        "filtered_output_root": str(filtered_review_root()),
+        "assets_filtered_root": str(settings.assets_filtered_path),
+        "xml_reports_filtered_root": str(settings.xml_business_reports_filtered_path),
     }
