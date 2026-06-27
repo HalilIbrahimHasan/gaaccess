@@ -112,26 +112,72 @@ class Pipeline:
         self.reconcile()
         self.validate(issuer or settings.issuer_filter)
         self.report(issuer or settings.issuer_filter)
-        asset_stats = self.export_assets(issuer or settings.issuer_filter)
-        stats["asset_partitions"] = asset_stats["partitions"]
-        stats["asset_rollups"] = asset_stats["rollups"]
 
-        try:
-            from azure_reconciliation.safe_export import ExportErrors
-            from azure_reconciliation.xml_business_reports import run_xml_business_reporting
+        if settings.fast_business_report_mode:
+            settings.apply_fast_business_report_mode(True)
+            logger.info("FAST_BUSINESS_REPORT_MODE=true — using lightweight reporting path")
 
-            xml_stats = run_xml_business_reporting(
-                issuer=issuer or settings.issuer_filter,
-                parse_source=False,
-                export_errors=ExportErrors(),
-                disable_azure=True,
-            )
-            stats["xml_business_reports"] = xml_stats
-            logger.info("XML business + assets-style reports: %s", xml_stats.get("output_root"))
-        except Exception as exc:
-            logger.warning("XML business reports skipped — %s", exc)
+        if settings.generate_legacy_assets_reports and not settings.fast_business_report_mode:
+            asset_stats = self.export_assets(issuer or settings.issuer_filter)
+            stats["asset_partitions"] = asset_stats["partitions"]
+            stats["asset_rollups"] = asset_stats["rollups"]
+        elif settings.fast_business_report_mode:
+            logger.info("Skipping legacy assets export (GENERATE_LEGACY_ASSETS_REPORTS=false)")
+            stats["asset_partitions"] = 0
+            stats["asset_rollups"] = 0
+        else:
+            asset_stats = self.export_assets(issuer or settings.issuer_filter)
+            stats["asset_partitions"] = asset_stats["partitions"]
+            stats["asset_rollups"] = asset_stats["rollups"]
 
-        if settings.enable_full_data_export:
+        if settings.fast_business_report_mode:
+            try:
+                from azure_reconciliation.fast_business_reports import run_fast_business_reports
+                from azure_reconciliation.safe_export import ExportErrors
+
+                fast_stats = run_fast_business_reports(
+                    issuer_filter=issuer or settings.issuer_filter,
+                    year_filter=settings.year_filter,
+                    month_filter=settings.month_filter,
+                    all_issuers=settings.issuer_filter is None and settings.year_filter is not None,
+                    parse_source=False,
+                    export_errors=ExportErrors(),
+                )
+                stats["fast_business_reports"] = fast_stats
+                logger.info("Fast business reports: %s", fast_stats.get("output_root"))
+            except Exception as exc:
+                logger.warning("Fast business reports skipped — %s", exc)
+
+            if settings.generate_storage_estimate:
+                try:
+                    from azure_reconciliation.storage_estimator import run_storage_estimator
+
+                    storage_stats = run_storage_estimator(
+                        issuer_filter=issuer or settings.issuer_filter,
+                        year_filter=settings.year_filter,
+                        month_filter=settings.month_filter,
+                        all_issuers=settings.issuer_filter is None and settings.year_filter is not None,
+                    )
+                    stats["storage_estimates"] = storage_stats
+                except Exception as exc:
+                    logger.warning("Storage estimator skipped — %s", exc)
+        else:
+            try:
+                from azure_reconciliation.safe_export import ExportErrors
+                from azure_reconciliation.xml_business_reports import run_xml_business_reporting
+
+                xml_stats = run_xml_business_reporting(
+                    issuer=issuer or settings.issuer_filter,
+                    parse_source=False,
+                    export_errors=ExportErrors(),
+                    disable_azure=True,
+                )
+                stats["xml_business_reports"] = xml_stats
+                logger.info("XML business + assets-style reports: %s", xml_stats.get("output_root"))
+            except Exception as exc:
+                logger.warning("XML business reports skipped — %s", exc)
+
+        if settings.enable_full_data_export and not settings.fast_business_report_mode:
             try:
                 from azure_reconciliation.full_data_exports import run_full_data_exports
                 from azure_reconciliation.safe_export import ExportErrors
@@ -147,7 +193,7 @@ class Pipeline:
             except Exception as exc:
                 logger.warning("Full data exports skipped — %s", exc)
 
-        if settings.filter_prior_year_benefit_effective:
+        if settings.filter_prior_year_benefit_effective and settings.generate_filtered_reports:
             try:
                 from azure_reconciliation.prior_year_benefit_filter import run_prior_year_filter_end_to_end
                 from azure_reconciliation.safe_export import ExportErrors

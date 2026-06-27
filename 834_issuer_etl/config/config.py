@@ -178,6 +178,37 @@ class Settings:
     reporting_year: str | None = field(
         default_factory=lambda: os.getenv("REPORTING_YEAR") or None
     )
+    # Fast business reporting mode (lightweight outputs — does not replace full pipeline)
+    fast_business_report_mode: bool = field(
+        default_factory=lambda: _env_bool("FAST_BUSINESS_REPORT_MODE", False)
+    )
+    generate_legacy_assets_reports: bool = field(
+        default_factory=lambda: _env_bool("GENERATE_LEGACY_ASSETS_REPORTS", True)
+    )
+    generate_html_reports: bool = field(
+        default_factory=lambda: _env_bool("GENERATE_HTML_REPORTS", True)
+    )
+    generate_xlsx_reports: bool = field(
+        default_factory=lambda: _env_bool("GENERATE_XLSX_REPORTS", True)
+    )
+    generate_sqlite_reports: bool = field(
+        default_factory=lambda: _env_bool("GENERATE_SQLITE_REPORTS", True)
+    )
+    generate_debug_diagnostics: bool = field(
+        default_factory=lambda: _env_bool("GENERATE_DEBUG_DIAGNOSTICS", True)
+    )
+    generate_business_review_package: bool = field(
+        default_factory=lambda: _env_bool("GENERATE_BUSINESS_REVIEW_PACKAGE", False)
+    )
+    generate_filtered_reports: bool = field(
+        default_factory=lambda: _env_bool("GENERATE_FILTERED_REPORTS", False)
+    )
+    generate_plotly_dashboards: bool = field(
+        default_factory=lambda: _env_bool("GENERATE_PLOTLY_DASHBOARDS", False)
+    )
+    generate_storage_estimate: bool = field(
+        default_factory=lambda: _env_bool("GENERATE_STORAGE_ESTIMATE", False)
+    )
     relationship_min_record_match_rate: float = field(
         default_factory=lambda: float(os.getenv("RELATIONSHIP_MIN_RECORD_MATCH_RATE", "70"))
     )
@@ -220,6 +251,59 @@ class Settings:
     def xml_business_reports_filtered_path(self) -> Path:
         return self.outputs_path / "xml_business_reports_filtered"
 
+    @property
+    def fast_business_reports_path(self) -> Path:
+        return self.outputs_path / "fast_business_reports"
+
+    @property
+    def storage_estimates_path(self) -> Path:
+        return self.outputs_path / "storage_estimates"
+
+    def _env_bool_fast_default(self, key: str, *, fast_default: bool, normal_default: bool) -> bool:
+        """When fast mode is on, use fast_default unless env explicitly sets the key."""
+        raw = os.getenv(key)
+        if raw is not None and str(raw).strip() != "":
+            return _env_bool(key, normal_default)
+        return fast_default if self.fast_business_report_mode else normal_default
+
+    def apply_fast_business_report_mode(self, enabled: bool | None = None) -> None:
+        """Apply fast reporting defaults — lightweight outputs, no legacy heavy artifacts."""
+        if enabled is not None:
+            self.fast_business_report_mode = enabled
+        if not self.fast_business_report_mode:
+            return
+        self.apply_xml_only_business_mode(True)
+        self.generate_legacy_assets_reports = self._env_bool_fast_default(
+            "GENERATE_LEGACY_ASSETS_REPORTS", fast_default=False, normal_default=True,
+        )
+        self.generate_html_reports = self._env_bool_fast_default(
+            "GENERATE_HTML_REPORTS", fast_default=True, normal_default=True,
+        )
+        self.generate_xlsx_reports = self._env_bool_fast_default(
+            "GENERATE_XLSX_REPORTS", fast_default=True, normal_default=True,
+        )
+        self.generate_sqlite_reports = self._env_bool_fast_default(
+            "GENERATE_SQLITE_REPORTS", fast_default=False, normal_default=True,
+        )
+        self.generate_debug_diagnostics = self._env_bool_fast_default(
+            "GENERATE_DEBUG_DIAGNOSTICS", fast_default=False, normal_default=True,
+        )
+        self.enable_full_data_export = self._env_bool_fast_default(
+            "GENERATE_FULL_DATA_EXPORTS", fast_default=False, normal_default=False,
+        )
+        self.generate_business_review_package = self._env_bool_fast_default(
+            "GENERATE_BUSINESS_REVIEW_PACKAGE", fast_default=False, normal_default=False,
+        )
+        self.generate_filtered_reports = self._env_bool_fast_default(
+            "GENERATE_FILTERED_REPORTS", fast_default=False, normal_default=False,
+        )
+        self.generate_plotly_dashboards = self._env_bool_fast_default(
+            "GENERATE_PLOTLY_DASHBOARDS", fast_default=False, normal_default=False,
+        )
+        self.generate_storage_estimate = self._env_bool_fast_default(
+            "GENERATE_STORAGE_ESTIMATE", fast_default=False, normal_default=False,
+        )
+
     def reference_row_counts(self) -> dict[str, int]:
         raw = os.getenv("REFERENCE_ROW_COUNTS", "")
         out: dict[str, int] = {}
@@ -254,6 +338,18 @@ class Settings:
             "FILTER_PRIOR_YEAR_BENEFIT_EFFECTIVE", False
         )
         self.reporting_year = os.getenv("REPORTING_YEAR") or None
+        self.fast_business_report_mode = _env_bool("FAST_BUSINESS_REPORT_MODE", False)
+        self.generate_legacy_assets_reports = _env_bool("GENERATE_LEGACY_ASSETS_REPORTS", True)
+        self.generate_html_reports = _env_bool("GENERATE_HTML_REPORTS", True)
+        self.generate_xlsx_reports = _env_bool("GENERATE_XLSX_REPORTS", True)
+        self.generate_sqlite_reports = _env_bool("GENERATE_SQLITE_REPORTS", True)
+        self.generate_debug_diagnostics = _env_bool("GENERATE_DEBUG_DIAGNOSTICS", True)
+        self.generate_business_review_package = _env_bool("GENERATE_BUSINESS_REVIEW_PACKAGE", False)
+        self.generate_filtered_reports = _env_bool("GENERATE_FILTERED_REPORTS", False)
+        self.generate_plotly_dashboards = _env_bool("GENERATE_PLOTLY_DASHBOARDS", False)
+        self.generate_storage_estimate = _env_bool("GENERATE_STORAGE_ESTIMATE", False)
+        if self.fast_business_report_mode:
+            self.apply_fast_business_report_mode(True)
         self.relationship_min_record_match_rate = float(
             os.getenv("RELATIONSHIP_MIN_RECORD_MATCH_RATE", "70")
         )
@@ -322,6 +418,8 @@ class Settings:
             self.outputs_path / "xml_business_reports" / "all_issuers",
             self.full_data_exports_path,
             self.business_review_filtered_path,
+            self.fast_business_reports_path,
+            self.storage_estimates_path,
             self.azure_reconciliation_output_path / "excel",
             self.azure_reconciliation_output_path / "dashboards",
             self.azure_reconciliation_output_path / "sqlite",

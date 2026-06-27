@@ -70,6 +70,9 @@ def main() -> None:
     logger.info("  years=%s", format_filter_display(year_allow))
     logger.info("  months=%s", format_filter_display(month_allow))
     logger.info("CLEAN START  : %s", settings.clean_on_start)
+    if settings.fast_business_report_mode:
+        logger.info("FAST MODE    : true (lightweight business reports)")
+        settings.apply_fast_business_report_mode(True)
 
     if settings.sftp_audit_only:
         if settings.processing_mode != "sftp":
@@ -99,8 +102,11 @@ def main() -> None:
         logger.info("Asset partitions    : %d", stats.get("asset_partitions", 0))
         logger.info("Asset rollups       : %d", stats.get("asset_rollups", 0))
         logger.info("Reports             : %s", settings.reports_path)
-        logger.info("Assets              : %s", settings.assets_path)
-        logger.info("XML business        : %s", settings.xml_business_reports_path)
+        if stats.get("fast_business_reports"):
+            logger.info("Fast reports        : %s", stats["fast_business_reports"].get("output_root"))
+        else:
+            logger.info("Assets              : %s", settings.assets_path)
+            logger.info("XML business        : %s", settings.xml_business_reports_path)
         logger.info("=" * 60)
     finally:
         pipeline.close()
