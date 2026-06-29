@@ -31,9 +31,15 @@ from azure_reconciliation.chandra_business_format import (
     to_chandra_business_summary,
 )
 from azure_reconciliation.chandra_nan_safe import (
+    StageTracker,
+    append_run_errors_log,
+    safe_int,
+    safe_sum,
     sanitize_business_ready_df,
     sanitize_chandra_summary_df,
     sanitize_dashboard_summary_df,
+    sanitize_dataframe_pre_export,
+    write_issuer_failure,
 )
 from azure_reconciliation.partition_discovery import Partition, discover_partitions
 from azure_reconciliation.prior_year_benefit_filter import (
@@ -94,6 +100,9 @@ class RunState:
     missing_output_files: list[dict[str, Any]] = field(default_factory=list)
     nan_cleanup_audit: list[dict[str, Any]] = field(default_factory=list)
     export_errors: list[str] = field(default_factory=list)
+    current_stage: str = "discover"
+    last_stage_by_issuer: dict[str, str] = field(default_factory=dict)
+    last_failure_context_by_issuer: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def month_key(self, issuer: str, year: str, month: str) -> str:
         return f"{issuer}|{year}|{_zmonth(month)}"
@@ -154,15 +163,24 @@ def _filter_status(before: int, excluded: int, after: int) -> str:
     return "PASS" if before - excluded == after else "FAIL"
 
 
-def _write_pair(path_base: Path, stem: str, df: pd.DataFrame, errors: ExportErrors | None) -> None:
+def _write_pair(
+    path_base: Path,
+    stem: str,
+    df: pd.DataFrame,
+    errors: ExportErrors | None,
+    *,
+    audit: list[dict[str, Any]] | None = None,
+    year: str = "",
+) -> None:
     if df.empty:
         return
+    clean = sanitize_dataframe_pre_export(df, audit, year=year, context=stem)
     safe_write_excel(
-        path_base / f"{stem}.xlsx", {stem: df},
+        path_base / f"{stem}.xlsx", {stem: clean},
         export_errors=errors, drop_duplicate_value_columns=False,
     )
     safe_write_csv(
-        path_base / f"{stem}.csv", df,
+        path_base / f"{stem}.csv", clean,
         export_errors=errors, drop_duplicate_value_columns=False,
     )
 
@@ -187,7 +205,7 @@ def _raw_rows_for_partition(xml_raw: pd.DataFrame, part: Partition) -> int:
         mask &= xml_raw["month"].astype(str).map(_zmonth) == _zmonth(part.month)
     elif "source_month" in xml_raw.columns:
         mask &= xml_raw["source_month"].astype(str).map(_zmonth) == _zmonth(part.month)
-    return int(mask.sum())
+    return safe_int(mask.sum(), 0)
 
 
 def _parse_month_set(month_filter: str | None) -> set[str] | None:
@@ -320,14 +338,38 @@ def _write_required_excel(
     sheet_name: str,
     df: pd.DataFrame,
     export_errors: ExportErrors | None,
+    *,
+    audit: list[dict[str, Any]] | None = None,
+    issuer: str = "",
+    year: str = "",
+    month: str = "",
 ) -> None:
     """Write a required output file (creates parent dirs). Empty df still writes headers."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    clean = sanitize_dataframe_pre_export(
+        df, audit, issuer=issuer, year=year, month=month, context=sheet_name,
+    )
     safe_write_excel(
-        path, {sheet_name: df},
+        path, {sheet_name: clean},
         export_errors=export_errors,
         drop_duplicate_value_columns=False,
     )
+
+
+def _write_csv_safe(
+    path: Path,
+    df: pd.DataFrame,
+    export_errors: ExportErrors | None,
+    *,
+    audit: list[dict[str, Any]] | None = None,
+    issuer: str = "",
+    year: str = "",
+    month: str = "",
+) -> None:
+    clean = sanitize_dataframe_pre_export(
+        df, audit, issuer=issuer, year=year, month=month, context=path.name,
+    )
+    safe_write_csv(path, clean, export_errors=export_errors, drop_duplicate_value_columns=False)
 
 
 def _write_dashboards(
@@ -453,6 +495,7 @@ def process_issuer_year(
     *,
     force: bool = False,
     dry_run: bool = False,
+    debug_trace: bool = False,
     export_errors: ExportErrors | None = None,
 ) -> dict[str, Any] | None:
     """Process one issuer/year — pipeline uses all year partitions; writes scoped to write_partitions."""
@@ -482,7 +525,15 @@ def process_issuer_year(
     )
     t0 = time.monotonic()
     reporting_year = str(year)
+    stage = StageTracker(issuer, year, debug_trace=debug_trace)
 
+    def _track_stage(stage_name: str, df: pd.DataFrame | None = None, label: str = "") -> None:
+        stage.set_stage(stage_name, df, label)
+        state.current_stage = stage.current_stage
+        state.last_stage_by_issuer[issuer] = stage.current_stage
+        state.last_failure_context_by_issuer[issuer] = stage.failure_context()
+
+    _track_stage("load_xml")
     xml_raw = load_xml_rows(
         prefer_staging=not PARSE_FROM_SOURCE,
         issuer_filter=issuer,
@@ -506,12 +557,15 @@ def process_issuer_year(
         return None
 
     raw_before = len(xml_raw)
+    _track_stage("apply_prior_year_filter")
     raw_audit = build_filter_audit(xml_raw, issuer=issuer, reporting_year=reporting_year, dataset_label="RAW")
-    raw_excluded = int((raw_audit["filter_action"] == FILTER_ACTION_EXCLUDE).sum()) if PY_FILTER_ENABLED else 0
+    raw_excluded = safe_int((raw_audit["filter_action"] == FILTER_ACTION_EXCLUDE).sum()) if PY_FILTER_ENABLED else 0
 
+    _track_stage("process_issuer_xml_business")
     result = process_issuer_xml_business_quiet(issuer, xml_raw, year_parts)
 
     business_ready = _prepare_business_ready(result, issuer=issuer, year=year, xml_raw=xml_raw)
+    _track_stage("prepare_business_ready", business_ready, "business_ready")
     business_ready = sanitize_business_ready_df(
         business_ready, state.nan_cleanup_audit, issuer=issuer, year=year,
     )
@@ -527,6 +581,7 @@ def process_issuer_year(
         lifecycle = apply_prior_year_benefit_filter(lifecycle, reporting_year=reporting_year)
 
     model_h = _chandra_dashboard(lifecycle, source="xml") if not lifecycle.empty else pd.DataFrame()
+    _track_stage("chandra_summary", model_h, "model_h")
     chandra_monthly = to_chandra_business_summary(model_h)
     chandra_yearly = chandra_year_rollup(chandra_monthly)
     br_summary = business_ready_dashboard_summary(business_ready)
@@ -664,7 +719,7 @@ def process_issuer_year(
             part_audit = build_filter_audit(
                 xml_part, issuer=issuer, reporting_year=reporting_year, dataset_label="RAW",
             ) if not xml_part.empty else pd.DataFrame()
-            part_raw_excl = int((part_audit["filter_action"] == FILTER_ACTION_EXCLUDE).sum()) if not part_audit.empty else 0
+            part_raw_excl = safe_int((part_audit["filter_action"] == FILTER_ACTION_EXCLUDE).sum()) if not part_audit.empty else 0
             state.filter_summary.append({
                 "issuer": issuer, "year": year, "month": _zmonth(part.month),
                 "raw_prior_year_excluded": part_raw_excl,
@@ -689,7 +744,7 @@ def process_issuer_year(
         part_audit = build_filter_audit(
             xml_part, issuer=issuer, reporting_year=reporting_year, dataset_label="RAW",
         ) if not xml_part.empty else pd.DataFrame()
-        part_raw_excl = int((part_audit["filter_action"] == FILTER_ACTION_EXCLUDE).sum()) if not part_audit.empty else 0
+        part_raw_excl = safe_int((part_audit["filter_action"] == FILTER_ACTION_EXCLUDE).sum()) if not part_audit.empty else 0
         state.filter_summary.append({
             "issuer": issuer, "year": year, "month": _zmonth(part.month),
             "raw_prior_year_excluded": part_raw_excl,
@@ -729,16 +784,23 @@ def process_issuer_year(
     monthly_dir = rep_dir / "monthly"
     dash_dir = out_base / "dashboards"
 
+    _track_stage("write_reports")
+
     br_cols = [c for c in CHANDRA_BUSINESS_READY_COLUMNS if c in export_br.columns]
     br_out = export_br[br_cols] if not export_br.empty else pd.DataFrame(columns=br_cols)
     _write_required_excel(
         br_dir / "business_ready_all_months.xlsx",
         "business_ready_all_months", br_out, export_errors,
+        audit=state.nan_cleanup_audit, issuer=issuer, year=year,
     )
-    safe_write_csv(br_dir / "business_ready_all_months.csv", br_out, export_errors=export_errors)
+    _write_csv_safe(
+        br_dir / "business_ready_all_months.csv", br_out, export_errors,
+        audit=state.nan_cleanup_audit, issuer=issuer, year=year,
+    )
     _write_required_excel(
         br_dir / "business_ready_summary.xlsx",
         "Business_Ready_Summary", br_summary, export_errors,
+        audit=state.nan_cleanup_audit, issuer=issuer, year=year,
     )
 
     rollup_cols = [c for c in CHANDRA_BUSINESS_COLUMNS_CORE if c in export_chandra_yearly.columns]
@@ -746,8 +808,12 @@ def process_issuer_year(
     _write_required_excel(
         rep_dir / "issuer_year_rollup.xlsx",
         "issuer_year_rollup", rollup_out, export_errors,
+        audit=state.nan_cleanup_audit, issuer=issuer, year=year,
     )
-    safe_write_csv(rep_dir / "issuer_year_rollup.csv", rollup_out, export_errors=export_errors)
+    _write_csv_safe(
+        rep_dir / "issuer_year_rollup.csv", rollup_out, export_errors,
+        audit=state.nan_cleanup_audit, issuer=issuer, year=year,
+    )
 
     for mw in month_writes:
         part = mw["part"]
@@ -756,8 +822,12 @@ def process_issuer_year(
         _write_required_excel(
             month_out / "enrollment_summary.xlsx",
             "enrollment_summary", chandra_month, export_errors,
+            audit=state.nan_cleanup_audit, issuer=issuer, year=year, month=_zmonth(part.month),
         )
-        safe_write_csv(month_out / "enrollment_summary.csv", chandra_month, export_errors=export_errors)
+        _write_csv_safe(
+            month_out / "enrollment_summary.csv", chandra_month, export_errors,
+            audit=state.nan_cleanup_audit, issuer=issuer, year=year, month=_zmonth(part.month),
+        )
 
         mkey = state.month_key(issuer, year, part.month)
         state.months_successfully_written.add(mkey)
@@ -806,18 +876,24 @@ def _write_year_rollup(year: str, state: RunState, errors: ExportErrors | None) 
     )
     all_br = pd.concat(state.br_parts, ignore_index=True) if state.br_parts else pd.DataFrame()
 
-    _write_pair(year_dir, "all_issuers_chandra_summary", all_chandra, errors)
-    _write_pair(year_dir, "all_issuers_business_ready_records", all_br, errors)
+    _write_pair(
+        year_dir, "all_issuers_chandra_summary", all_chandra, errors,
+        audit=state.nan_cleanup_audit, year=year,
+    )
+    _write_pair(
+        year_dir, "all_issuers_business_ready_records", all_br, errors,
+        audit=state.nan_cleanup_audit, year=year,
+    )
 
     if state.month_status:
         for (iss, yr), grp in pd.DataFrame(state.month_status).groupby(["issuer", "year"]):
             state.issuer_year_status.append({
                 "issuer": iss,
                 "year": yr,
-                "months_processed": int((grp["status"] == "OK").sum()),
-                "total_raw_rows": int(grp["raw_rows"].sum()),
-                "total_business_ready_rows": int(grp["business_ready_rows"].sum()),
-                "total_summary_rows": int(grp["summary_rows"].sum()),
+                "months_processed": safe_int((grp["status"] == "OK").sum(), 0),
+                "total_raw_rows": safe_sum(grp["raw_rows"]),
+                "total_business_ready_rows": safe_sum(grp["business_ready_rows"]),
+                "total_summary_rows": safe_sum(grp["summary_rows"]),
                 "status": "OK" if (grp["status"] == "OK").any() else "WARN",
                 "message": "",
             })
@@ -865,10 +941,10 @@ def _write_run_summary(
         for (issuer, yr), grp in month_df.groupby(["issuer", "year"]):
             rows.append({
                 "issuer": issuer, "year": yr,
-                "months_processed": int((grp["status"] == "OK").sum()),
-                "total_raw_rows": int(grp["raw_rows"].sum()),
-                "total_business_ready_rows": int(grp["business_ready_rows"].sum()),
-                "total_summary_rows": int(grp["summary_rows"].sum()),
+                "months_processed": safe_int((grp["status"] == "OK").sum(), 0),
+                "total_raw_rows": safe_sum(grp["raw_rows"]),
+                "total_business_ready_rows": safe_sum(grp["business_ready_rows"]),
+                "total_summary_rows": safe_sum(grp["summary_rows"]),
                 "status": "OK" if (grp["status"] == "OK").any() else "WARN",
                 "message": "",
             })
@@ -882,7 +958,7 @@ def _write_run_summary(
                  "business_ready_prior_year_excluded", "filter_status"],
     )
 
-    total_summary_rows = int(month_df["summary_rows"].sum()) if not month_df.empty and "summary_rows" in month_df.columns else 0
+    total_summary_rows = safe_sum(month_df["summary_rows"]) if not month_df.empty and "summary_rows" in month_df.columns else 0
     months_skipped = len(skipped_df)
     missing_count = len(state.missing_output_files)
     expected_monthly = len(state.months_successfully_written)
@@ -891,11 +967,9 @@ def _write_run_summary(
         if "monthly_enrollment_summary" in str(entry.get("reason", ""))
     )
 
-    if missing_count > 0:
+    if missing_count > 0 or state.issuers_failed:
         final_status = "FAIL"
     elif state.export_errors:
-        final_status = "WARNINGS"
-    elif state.issuers_failed:
         final_status = "WARNINGS"
     elif (
         (not month_df.empty and (month_df["status"] == "WARN").any())
@@ -956,9 +1030,9 @@ def _write_run_summary(
 def _compute_final_status(state: RunState, *, dry_run: bool = False) -> str:
     if dry_run:
         return "DRY_RUN"
-    if state.missing_output_files:
+    if state.missing_output_files or state.issuers_failed:
         return "FAIL"
-    if state.export_errors or state.issuers_failed:
+    if state.export_errors:
         return "WARNINGS"
     if state.skipped or any(r.get("status") == "WARN" for r in state.month_status):
         return "WARNINGS"
@@ -1007,6 +1081,7 @@ def run_chandra_report_only(
     force: bool = False,
     dry_run: bool = False,
     stop_on_error: bool = False,
+    debug_trace: bool = False,
     export_errors: ExportErrors | None = None,
 ) -> dict[str, Any]:
     """
@@ -1022,6 +1097,10 @@ def run_chandra_report_only(
     if not dry_run:
         _clear_outputs(year, issuer_filter=issuer_filter)
 
+    state = RunState()
+    state.current_stage = "discover"
+    if debug_trace:
+        print(f"CURRENT_STAGE=discover year={year} issuer={issuer_filter or 'all'}")
     all_partitions = discover_partitions(
         issuer_filter=issuer_filter,
         year_filter=year,
@@ -1041,7 +1120,6 @@ def run_chandra_report_only(
             )
 
     pairs = sorted({(p.issuer, p.year) for p in all_partitions})
-    state = RunState()
     for p in all_partitions:
         state.issuers_discovered.add(p.issuer)
         state.months_discovered.add(state.month_key(p.issuer, p.year, p.month))
@@ -1072,7 +1150,8 @@ def run_chandra_report_only(
         try:
             res = process_issuer_year(
                 iss, yr, pipeline_parts, write_parts, state,
-                force=force, dry_run=dry_run, export_errors=export_errors,
+                force=force, dry_run=dry_run, debug_trace=debug_trace,
+                export_errors=export_errors,
             )
             if res is None:
                 if not _is_benign_skip(state, iss):
@@ -1092,10 +1171,28 @@ def run_chandra_report_only(
                 else:
                     state.issuers_successfully_written.add(iss)
         except Exception as exc:
-            logger.error("ERROR issuer=%s year=%s reason=%s", iss, yr, exc)
+            stage_name = state.last_stage_by_issuer.get(iss, state.current_stage)
+            fail_ctx = dict(state.last_failure_context_by_issuer.get(iss, {}))
+            fail_ctx["current_stage"] = stage_name
+            logger.error("ERROR issuer=%s year=%s stage=%s reason=%s", iss, yr, stage_name, exc)
+            failed_path = None
+            if not dry_run:
+                failed_path = write_issuer_failure(
+                    iss, yr, exc, stage=stage_name,
+                    context=fail_ctx,
+                    debug_trace=debug_trace,
+                )
+                append_run_errors_log(yr, iss, exc, stage=stage_name, failed_path=failed_path)
+                state.missing_output_files.append({
+                    "issuer": iss,
+                    "year": yr,
+                    "month": "",
+                    "expected_file": str(failed_path) if failed_path else "",
+                    "reason": f"exception at {stage_name}: {exc}",
+                })
             state.skipped.append({
                 "issuer": iss, "year": yr, "month": "",
-                "reason": f"exception: {exc}",
+                "reason": f"exception at {stage_name}: {exc}; traceback={failed_path or 'dry_run'}",
             })
             state.export_errors.append(f"{iss}/{yr}: {exc}")
             state.issuers_failed.add(iss)

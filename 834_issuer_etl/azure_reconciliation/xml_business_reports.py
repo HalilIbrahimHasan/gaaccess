@@ -15,6 +15,7 @@ from typing import Any
 
 import pandas as pd
 
+from azure_reconciliation.chandra_nan_safe import safe_int
 from azure_reconciliation.lifecycle_engine import build_all_lifecycle_snapshots
 from azure_reconciliation.lifecycle_snapshot_comparison import (
     _sort_chronological,
@@ -380,15 +381,15 @@ def build_extended_business_summary(
             "month": _zmonth(str(row["month"])),
             "insurance_type": row["insurance_type"],
             "status": row["status"],
-            "Enrollment_Count": int(row.get("enrollment_count", 0)),
-            "Enrollee_Count": int(row.get("enrollee_count", 0)),
-            "Subscriber_Count": int(row.get("subscriber_count", 0)),
-            "Raw_XML_Row_Count": int(gmask_r.sum()),
-            "Canonical_Row_Count": int(gmask_c.sum()),
-            "Latest_State_Record_Count": int(gmask_l.sum()),
-            "Duplicate_Count": int(gmask_d.sum()),
-            "Maintenance_Only_Count": int(gmask_m.sum()),
-            "Superseded_Count": int(gmask_s.sum()),
+            "Enrollment_Count": safe_int(row.get("enrollment_count", 0), 0),
+            "Enrollee_Count": safe_int(row.get("enrollee_count", 0), 0),
+            "Subscriber_Count": safe_int(row.get("subscriber_count", 0), 0),
+            "Raw_XML_Row_Count": safe_int(gmask_r.sum(), 0),
+            "Canonical_Row_Count": safe_int(gmask_c.sum(), 0),
+            "Latest_State_Record_Count": safe_int(gmask_l.sum(), 0),
+            "Duplicate_Count": safe_int(gmask_d.sum(), 0),
+            "Maintenance_Only_Count": safe_int(gmask_m.sum(), 0),
+            "Superseded_Count": safe_int(gmask_s.sum(), 0),
             "Month_Basis_Used": month_basis,
         })
     return pd.DataFrame(rows)

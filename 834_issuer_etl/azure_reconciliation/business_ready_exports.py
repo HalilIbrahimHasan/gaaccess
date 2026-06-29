@@ -14,10 +14,10 @@ from typing import Any
 
 import pandas as pd
 
+from azure_reconciliation.chandra_nan_safe import is_missing, safe_int, safe_optional_int, safe_status_id, safe_sum
 from azure_reconciliation.chandra_business_format import (
     enrollee_status_display,
     insurance_type_display,
-    status_id_for_display,
 )
 from azure_reconciliation.dashboard_difference_analysis import _enrollment_id_series
 from azure_reconciliation.full_data_exports import (
@@ -248,14 +248,12 @@ def _attach_raw_lineage(
         files = xml_hit.get("raw_source_files", "")
         keys = xml_hit.get("raw_transaction_keys", "")
 
-        if not count:
-            count = int(row.get("raw_transaction_count", row.get("collapsed_event_count", 1)) or 1)
-        if not files:
-            files = str(row.get("raw_source_files", "") or "")
-        if not keys:
-            keys = str(row.get("raw_transaction_keys", "") or "")
+        if is_missing(count):
+            count = safe_int(
+                row.get("raw_transaction_count", row.get("collapsed_event_count", 1)), 1,
+            )
 
-        raw_counts.append(int(count))
+        raw_counts.append(safe_int(count, 1))
         raw_files.append(files)
         raw_keys.append(keys)
 
@@ -313,7 +311,11 @@ def _attach_benefit_effective_dates(
     if "benefit_effective_date" not in out.columns:
         out["benefit_effective_date"] = ""
     out["benefit_effective_year"] = out["benefit_effective_date"].map(
-        lambda v: "" if parse_benefit_effective_year(v) is None else int(parse_benefit_effective_year(v)),
+        lambda v: (
+            ""
+            if parse_benefit_effective_year(v) is None or is_missing(parse_benefit_effective_year(v))
+            else safe_optional_int(parse_benefit_effective_year(v), default="")
+        ),
     )
     return out
 
@@ -356,7 +358,9 @@ def _merge_collapse_audit(
         work["collapsed_event_count"] = work["collapsed_event_count"].fillna(
             work["collapsed_event_count_audit"],
         )
-    work["collapsed_event_count"] = work.get("collapsed_event_count", pd.Series([1] * len(work))).fillna(1).astype(int)
+    work["collapsed_event_count"] = pd.to_numeric(
+        work.get("collapsed_event_count", pd.Series([1] * len(work))), errors="coerce",
+    ).fillna(1).apply(lambda v: safe_int(v, 1))
     work["selection_reason"] = work["selection_reason"].fillna("kept_final_business_state")
     drop_cols = [c for c in work.columns if c.endswith("_audit")]
     return work.drop(columns=drop_cols, errors="ignore")
@@ -434,7 +438,9 @@ def build_business_ready_records(
 
     status_raw = work.get("normalized_status", work.get("status", "")).astype(str)
     work["enrolleeStatus"] = status_raw.map(enrollee_status_display)
-    work["status_Id"] = work["enrolleeStatus"].map(status_id_for_display)
+    work["status_Id"] = [
+        safe_status_id(None, enrollee_status=es) for es in work["enrolleeStatus"]
+    ]
     work["_insurance_type_norm"] = work.get("insurance_type", "").astype(str).map(normalize_insurance_type)
     work["insurance_type"] = work["_insurance_type_norm"].map(insurance_type_display)
 
@@ -451,7 +457,9 @@ def build_business_ready_records(
     if "collapsed_event_count" not in work.columns:
         work["collapsed_event_count"] = 1
     else:
-        work["collapsed_event_count"] = work["collapsed_event_count"].fillna(1).astype(int)
+        work["collapsed_event_count"] = pd.to_numeric(
+            work["collapsed_event_count"], errors="coerce",
+        ).fillna(1).apply(lambda v: safe_int(v, 1))
 
     if "selection_reason" not in work.columns:
         work["selection_reason"] = "kept_final_business_state"
@@ -485,7 +493,7 @@ def business_ready_monthly_counts(df: pd.DataFrame, issuer: str, year: str) -> p
             "distinct_enrollment_count": int(enroll[enroll != ""].nunique()),
             "distinct_enrollee_count": int(enrollee[enrollee != ""].nunique()),
             "distinct_subscriber_count": int(sub[sub != ""].nunique()),
-            "model_h_included_count": int(grp["model_h_included_flag"].sum()) if "model_h_included_flag" in grp.columns else len(grp),
+            "model_h_included_count": safe_int(grp["model_h_included_flag"].sum(), len(grp)) if "model_h_included_flag" in grp.columns else len(grp),
         })
     return pd.DataFrame(rows).sort_values("month").reset_index(drop=True)
 
@@ -546,7 +554,7 @@ def business_ready_internal_traceability(df: pd.DataFrame) -> pd.DataFrame:
         enroll = grp["canonical_enrollment_id"].astype(str).str.strip()
         enrollee = grp["canonical_enrollee_id"].astype(str).str.strip()
         sub = grp["canonical_subscriber_id"].astype(str).str.strip()
-        raw_tx_count = int(grp["raw_transaction_count"].sum()) if "raw_transaction_count" in grp.columns else len(grp)
+        raw_tx_count = safe_sum(grp["raw_transaction_count"]) if "raw_transaction_count" in grp.columns else len(grp)
         raw_files = ""
         if "raw_source_files" in grp.columns:
             raw_files = "; ".join(sorted({str(v).strip() for v in grp["raw_source_files"] if str(v).strip()}))

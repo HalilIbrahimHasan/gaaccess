@@ -2,7 +2,7 @@
 """
 Chandra-style report-only runner — reads YEAR_FILTER / ISSUER_FILTER / MONTH_FILTER from .env.
 
-Optional CLI overrides: --year, --issuer, --month, --force, --dry-run, --stop-on-error
+Optional CLI overrides: --year, --issuer, --month, --force, --dry-run, --stop-on-error, --debug-trace
 
 Examples:
     python run_chandra_report_only.py --force
@@ -74,6 +74,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Stop immediately on first issuer/month failure",
     )
+    p.add_argument(
+        "--debug-trace",
+        action="store_true",
+        help="Print CURRENT_STAGE markers and failure trace paths",
+    )
     return p.parse_args()
 
 
@@ -140,6 +145,7 @@ def main() -> None:
             force=args.force,
             dry_run=args.dry_run,
             stop_on_error=args.stop_on_error,
+            debug_trace=args.debug_trace,
             export_errors=errors,
         )
     except RuntimeError as exc:

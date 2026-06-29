@@ -11,7 +11,17 @@ from pathlib import Path
 
 import pandas as pd
 
+from azure_reconciliation.chandra_nan_safe import (
+    is_missing,
+    safe_int,
+    safe_month as safe_month_str,
+    safe_status_id,
+    safe_year as safe_year_str,
+)
 from azure_reconciliation.safe_export import safe_write_excel
+
+# Re-export for backward compatibility
+safe_count_int = safe_int
 
 CHANDRA_BUSINESS_COLUMNS = [
     "Coverage_Year",
@@ -71,76 +81,6 @@ STATUS_ID_MAP = {
 }
 
 
-def _is_na(val: object) -> bool:
-    if val is None:
-        return True
-    try:
-        return bool(pd.isna(val))
-    except (TypeError, ValueError):
-        return False
-
-
-def safe_count_int(val: object, default: int = 0) -> int:
-    """NaN-safe count conversion — missing/NaN becomes default."""
-    if _is_na(val):
-        return default
-    try:
-        num = float(val)  # type: ignore[arg-type]
-        if pd.isna(num):
-            return default
-        return int(num)
-    except (TypeError, ValueError):
-        return default
-
-
-def safe_year_str(val: object) -> str:
-    """Year as string for report outputs — never int-cast NaN."""
-    if _is_na(val):
-        return ""
-    s = str(val).strip()
-    if s.lower() in ("", "nan", "none", "<na>", "nat"):
-        return ""
-    try:
-        return str(int(float(s)))
-    except (TypeError, ValueError):
-        return s if s.isdigit() and len(s) == 4 else ""
-
-
-def safe_month_str(val: object) -> str:
-    """Month as zero-padded string — never int-cast NaN."""
-    if _is_na(val):
-        return ""
-    s = str(val).strip()
-    if s.lower() in ("", "nan", "none", "<na>", "nat", "all"):
-        return ""
-    try:
-        m = int(float(s))
-        return str(m).zfill(2) if 1 <= m <= 12 else ""
-    except (TypeError, ValueError):
-        return s.zfill(2) if s.isdigit() and len(s) <= 2 else ""
-
-
-def safe_status_id(
-    status_id_val: object = None,
-    *,
-    enrollee_status: object = None,
-) -> int:
-    """
-    NaN-safe status_Id:
-    CONFIRM=>1, CANCEL=>2, TERM=>3; derive from enrolleeStatus when missing.
-    """
-    if not _is_na(status_id_val):
-        try:
-            num = float(status_id_val)  # type: ignore[arg-type]
-            if not pd.isna(num) and int(num) in (1, 2, 3, 0):
-                return int(num)
-        except (TypeError, ValueError):
-            pass
-    if enrollee_status is not None and not _is_na(enrollee_status):
-        return status_id_for_display(enrollee_status_display(enrollee_status))
-    return 0
-
-
 def _zmonth(m: str | object) -> str:
     return safe_month_str(m)
 
@@ -151,7 +91,7 @@ def gaa_load_date(year: str | int | object, month: str | int | object) -> str:
     ms = safe_month_str(month)
     if not ys or not ms:
         return ""
-    return f"{int(ms)}/1/{int(ys)}"
+    return f"{safe_int(ms, 0)}/1/{safe_int(ys, 0)}"
 
 
 def insurance_type_display(raw: str | None) -> str:
@@ -179,7 +119,9 @@ def enrollee_status_display(raw: str | None) -> str:
 
 
 def status_id_for_display(enrollee_status: str) -> int:
-    return int(STATUS_ID_MAP.get(str(enrollee_status).strip().upper(), 0))
+    if is_missing(enrollee_status):
+        return 0
+    return safe_int(STATUS_ID_MAP.get(str(enrollee_status).strip().upper(), 0), 0)
 
 
 def to_chandra_business_summary(internal: pd.DataFrame) -> pd.DataFrame:
@@ -209,8 +151,8 @@ def to_chandra_business_summary(internal: pd.DataFrame) -> pd.DataFrame:
             "Insurance_Type": insurance_type_display(row.get("insurance_type")),
             "status_Id": safe_status_id(row.get("status_Id"), enrollee_status=enrollee_status),
             "enrolleeStatus": enrollee_status,
-            "Enrollment_Count": safe_count_int(enroll_ct, 0),
-            "Enrollee_Count": safe_count_int(enrollee_ct, 0),
+            "Enrollment_Count": safe_int(enroll_ct, 0),
+            "Enrollee_Count": safe_int(enrollee_ct, 0),
         })
     if not rows:
         return pd.DataFrame(columns=CHANDRA_BUSINESS_COLUMNS_CORE)
@@ -233,7 +175,7 @@ def rollup_chandra_business(
     out = chandra_df.groupby(keys, dropna=False).agg(agg).reset_index()
     for c in sum_cols:
         if c in out.columns:
-            out[c] = out[c].apply(lambda v: safe_count_int(v, 0))
+            out[c] = out[c].apply(lambda v: safe_int(v, 0))
     return out[[c for c in group_keys + sum_cols if c in out.columns]]
 
 

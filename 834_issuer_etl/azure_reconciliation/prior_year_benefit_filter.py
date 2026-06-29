@@ -17,6 +17,8 @@ from typing import Any
 
 import pandas as pd
 
+from azure_reconciliation.chandra_nan_safe import is_missing, safe_int, safe_optional_int
+
 from azure_reconciliation.full_data_exports import write_full_export_excel
 from azure_reconciliation.safe_export import safe_write_csv, safe_write_excel, ExportErrors
 from config.config import settings
@@ -144,25 +146,37 @@ def _selected_transaction_date_series(df: pd.DataFrame) -> pd.Series:
     return pd.Series([""] * len(df), index=df.index, dtype=str)
 
 
+def _audit_year_out(y: Any) -> str | int:
+    if is_missing(y):
+        return ""
+    return safe_optional_int(y, default="")
+
+
 def classify_benefit_filter(
     benefit_effective_year: int | None,
     reporting_year: int | str,
 ) -> tuple[str, str]:
     """Return (filter_action, filter_reason)."""
-    y = int(reporting_year)
-    if benefit_effective_year is None:
+    if is_missing(benefit_effective_year):
         return (
             FILTER_ACTION_KEEP_NULL,
             "benefit_effective_date is null — kept and flagged for review",
         )
-    if benefit_effective_year < y:
+    y = safe_int(reporting_year, 0)
+    bey = safe_int(benefit_effective_year, -1)
+    if bey < 0:
+        return (
+            FILTER_ACTION_KEEP_NULL,
+            "benefit_effective_date is null — kept and flagged for review",
+        )
+    if bey < y:
         return (
             FILTER_ACTION_EXCLUDE,
-            f"benefit_effective_year {benefit_effective_year} < reporting_year {y}",
+            f"benefit_effective_year {bey} < reporting_year {y}",
         )
     return (
         FILTER_ACTION_KEEP_CURRENT,
-        f"benefit_effective_year {benefit_effective_year} >= reporting_year {y}",
+        f"benefit_effective_year {bey} >= reporting_year {y}",
     )
 
 
@@ -183,8 +197,10 @@ def _prior_year_candidate_count(df: pd.DataFrame, reporting_year: str) -> int:
     if not date_col:
         return 0
     years = df[date_col].map(parse_benefit_effective_year)
-    y = int(reporting_year)
-    return int(((years.notna()) & (years < y)).sum())
+    y = safe_int(reporting_year, 0)
+    if y <= 0:
+        return 0
+    return safe_int(((years.notna()) & (years < y)).sum(), 0)
 
 
 def _raw_filter_status(stats: dict[str, int]) -> str:
@@ -234,14 +250,10 @@ def build_filter_audit(
     work = df.copy()
     benefit_dates = _benefit_date_series(work)
     benefit_years = benefit_dates.map(parse_benefit_effective_year)
-    benefit_year_out = benefit_years.apply(
-        lambda y: "" if y is None or (isinstance(y, float) and pd.isna(y)) else int(y),
-    )
+    benefit_year_out = benefit_years.map(_audit_year_out)
     selected_dates = _selected_transaction_date_series(work)
     selected_years = selected_dates.map(parse_benefit_effective_year)
-    selected_year_out = selected_years.apply(
-        lambda y: "" if y is None or (isinstance(y, float) and pd.isna(y)) else int(y),
-    )
+    selected_year_out = selected_years.map(_audit_year_out)
     actions: list[str] = []
     reasons: list[str] = []
     for bey in benefit_years:
@@ -286,9 +298,9 @@ def _dataset_audit_stats(audit: pd.DataFrame) -> dict[str, int]:
     if audit.empty:
         return {"before": 0, "excluded": 0, "after": 0, "null": 0}
     before = len(audit)
-    excluded = int((audit["filter_action"] == FILTER_ACTION_EXCLUDE).sum())
-    after = int((audit["filter_action"] != FILTER_ACTION_EXCLUDE).sum())
-    null_count = int((audit["filter_action"] == FILTER_ACTION_KEEP_NULL).sum())
+    excluded = safe_int((audit["filter_action"] == FILTER_ACTION_EXCLUDE).sum(), 0)
+    after = safe_int((audit["filter_action"] != FILTER_ACTION_EXCLUDE).sum(), 0)
+    null_count = safe_int((audit["filter_action"] == FILTER_ACTION_KEEP_NULL).sum(), 0)
     return {"before": before, "excluded": excluded, "after": after, "null": null_count}
 
 
@@ -333,8 +345,8 @@ def build_filter_summary(
             by_year_rows.append({
                 "benefit_effective_year": bey,
                 "record_count": len(grp),
-                "excluded_count": int((grp["filter_action"] == FILTER_ACTION_EXCLUDE).sum()),
-                "kept_count": int((grp["filter_action"] != FILTER_ACTION_EXCLUDE).sum()),
+                "excluded_count": safe_int((grp["filter_action"] == FILTER_ACTION_EXCLUDE).sum(), 0),
+                "kept_count": safe_int((grp["filter_action"] != FILTER_ACTION_EXCLUDE).sum(), 0),
             })
     by_year_df = pd.DataFrame(by_year_rows).sort_values("benefit_effective_year")
 
