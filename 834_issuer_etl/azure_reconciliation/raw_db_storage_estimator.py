@@ -25,6 +25,7 @@ logger = get_logger(__name__)
 
 STORAGE_METHOD_EXACT = "EXACT_DB_TABLE_SIZE"
 STORAGE_METHOD_ESTIMATED = "ESTIMATED_FROM_PARSED_RAW"
+STORAGE_METHOD_ALL_ISSUERS = "ESTIMATED_FROM_ALL_ISSUER_PARSED_RAW"
 STORAGE_METHOD_MIXED = "MIXED"
 
 # SQLite per-row header / alignment overhead (bytes), applied on top of column payloads.
@@ -44,6 +45,18 @@ _SUMMARY_COLUMNS = [
     "Raw_834_DB_Storage_GB",
     "Parsed_Row_Count",
     "Issuer_Count",
+    "Storage_Method",
+]
+
+_ALL_ISSUERS_SUMMARY_COLUMNS = [
+    "Year",
+    "Month",
+    "Raw_834_DB_Storage",
+    "Raw_834_DB_Storage_MB",
+    "Raw_834_DB_Storage_GB",
+    "Parsed_Row_Count",
+    "Issuer_Count",
+    "Source_File_Count",
     "Storage_Method",
 ]
 
@@ -193,8 +206,8 @@ def _estimate_storage_bytes_from_records(records: list[dict[str, Any]]) -> int:
     return total
 
 
-def _parse_partition(part: Partition) -> tuple[int, int]:
-    """Parse XML for one partition; return (row_count, estimated_storage_bytes)."""
+def _parse_partition(part: Partition) -> tuple[int, int, int]:
+    """Parse XML for one partition; return (row_count, storage_bytes, source_file_count)."""
     parser = Parser834()
     sources = discover_source_files(
         settings.source_data_path,
@@ -217,7 +230,7 @@ def _parse_partition(part: Partition) -> tuple[int, int]:
             records.extend(parsed)
         except Exception as exc:
             logger.warning("Parse failed %s: %s", src.file_name, exc)
-    return len(records), _estimate_storage_bytes_from_records(records)
+    return len(records), _estimate_storage_bytes_from_records(records), len(sources)
 
 
 def build_issuer_month_detail(
@@ -231,6 +244,7 @@ def build_issuer_month_detail(
         issuer_filter=issuer_filter,
         year_filter=year_filter,
         month_filter=month_filter,
+        use_env_filters=False,
     )
     if not partitions:
         return pd.DataFrame(columns=_DETAIL_COLUMNS)
@@ -249,7 +263,7 @@ def build_issuer_month_detail(
             storage_bytes = exact[key]["storage_bytes"]
             method = STORAGE_METHOD_EXACT
         else:
-            count, storage_bytes = _parse_partition(part)
+            count, storage_bytes, _file_count = _parse_partition(part)
             method = STORAGE_METHOD_ESTIMATED
 
         mb = _bytes_to_mb(storage_bytes)
@@ -294,6 +308,196 @@ def build_monthly_summary(detail: pd.DataFrame) -> pd.DataFrame:
         })
 
     return pd.DataFrame(rows)[_SUMMARY_COLUMNS]
+
+
+def build_all_issuers_partition_detail(
+    *,
+    issuer_filter: str | None = None,
+    year_filter: str | None = None,
+    month_filter: str | None = None,
+) -> pd.DataFrame:
+    """
+    Parse every source_data partition and estimate raw DB (stg_834_records) storage.
+
+    When issuer_filter is None, walks source_data/*/year/month for all issuers.
+    """
+    partitions = discover_partitions(
+        issuer_filter=issuer_filter,
+        year_filter=year_filter,
+        month_filter=month_filter,
+        use_env_filters=False,
+    )
+    if not partitions:
+        return pd.DataFrame(columns=[
+            "issuer", "year", "month", "parsed_row_count",
+            "raw_db_storage_mb", "source_file_count", "storage_method",
+        ])
+
+    rows: list[dict[str, Any]] = []
+    for i, part in enumerate(partitions, start=1):
+        logger.info(
+            "Parsing partition %d/%d: %s/%s/%s",
+            i, len(partitions), part.issuer, part.year, part.month,
+        )
+        count, storage_bytes, file_count = _parse_partition(part)
+        mb = _bytes_to_mb(storage_bytes)
+        rows.append({
+            "issuer": part.issuer,
+            "year": part.year,
+            "month": _zmonth(part.month),
+            "parsed_row_count": count,
+            "raw_db_storage_mb": round(mb, 4),
+            "source_file_count": file_count,
+            "storage_method": STORAGE_METHOD_ALL_ISSUERS,
+        })
+
+    return pd.DataFrame(rows).sort_values(["year", "month", "issuer"]).reset_index(drop=True)
+
+
+def build_all_issuers_monthly_summary(detail: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate all-issuer partition detail by year/month with a TOTAL row."""
+    if detail.empty:
+        return pd.DataFrame(columns=_ALL_ISSUERS_SUMMARY_COLUMNS)
+
+    rows: list[dict[str, Any]] = []
+    for (year, month), grp in detail.groupby(["year", "month"], sort=True):
+        total_mb = float(grp["raw_db_storage_mb"].sum())
+        rows.append({
+            "Year": str(year),
+            "Month": _month_label(str(month)),
+            "Raw_834_DB_Storage": _format_storage(total_mb),
+            "Raw_834_DB_Storage_MB": round(total_mb, 4),
+            "Raw_834_DB_Storage_GB": round(total_mb / 1024, 6),
+            "Parsed_Row_Count": int(grp["parsed_row_count"].sum()),
+            "Issuer_Count": int(grp["issuer"].nunique()),
+            "Source_File_Count": int(grp["source_file_count"].sum()),
+            "Storage_Method": STORAGE_METHOD_ALL_ISSUERS,
+        })
+
+    summary = pd.DataFrame(rows)
+    years = sorted(summary["Year"].astype(str).unique())
+    for year in years:
+        year_rows = summary[summary["Year"].astype(str) == year]
+        year_detail = detail[detail["year"].astype(str) == year]
+        total_mb = float(year_rows["Raw_834_DB_Storage_MB"].sum())
+        rows.append({
+            "Year": str(year),
+            "Month": "TOTAL",
+            "Raw_834_DB_Storage": _format_storage(total_mb),
+            "Raw_834_DB_Storage_MB": round(total_mb, 4),
+            "Raw_834_DB_Storage_GB": round(total_mb / 1024, 6),
+            "Parsed_Row_Count": int(year_rows["Parsed_Row_Count"].sum()),
+            "Issuer_Count": int(year_detail["issuer"].nunique()),
+            "Source_File_Count": int(year_rows["Source_File_Count"].sum()),
+            "Storage_Method": STORAGE_METHOD_ALL_ISSUERS,
+        })
+
+    out = pd.DataFrame(rows)
+    month_order = list(MONTH_LABELS.values()) + ["TOTAL"]
+    out["_month_sort"] = out["Month"].map(
+        lambda m: month_order.index(m) if m in month_order else 99,
+    )
+    out = out.sort_values(["Year", "_month_sort"]).drop(columns=["_month_sort"])
+    return out[_ALL_ISSUERS_SUMMARY_COLUMNS].reset_index(drop=True)
+
+
+def _write_all_issuers_summary_md(
+    summary: pd.DataFrame,
+    detail: pd.DataFrame,
+    *,
+    year_filter: str | None,
+) -> str:
+    from datetime import datetime, timezone
+
+    lines = [
+        "# Raw 834 DB Storage — All Issuers",
+        "",
+        f"**Generated:** {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+        f"**Year filter:** {year_filter or 'all'}",
+        "",
+        "Estimated storage for `stg_834_records` (parsed raw 834 XML rows) across all issuers.",
+        "This is **not** compressed XML, on-disk XML file size, canonical, business-ready, or report storage.",
+        "",
+        f"**Storage method:** `{STORAGE_METHOD_ALL_ISSUERS}`",
+        "",
+        f"- Issuer-month partitions parsed: **{len(detail)}**",
+        f"- Distinct issuers: **{detail['issuer'].nunique() if not detail.empty else 0}**",
+        f"- Total source XML files: **{int(detail['source_file_count'].sum()) if not detail.empty else 0:,}**",
+        f"- Total parsed rows: **{int(detail['parsed_row_count'].sum()) if not detail.empty else 0:,}**",
+        "",
+        "## Monthly rollup (all issuers)",
+        "",
+        "| Year | Month | Storage | MB | GB | Rows | Issuers | Files |",
+        "|------|-------|---------|---:|---:|-----:|--------:|------:|",
+    ]
+    for _, row in summary.iterrows():
+        lines.append(
+            f"| {row['Year']} | {row['Month']} | {row['Raw_834_DB_Storage']} "
+            f"| {row['Raw_834_DB_Storage_MB']:,.2f} | {row['Raw_834_DB_Storage_GB']:.4f} "
+            f"| {int(row['Parsed_Row_Count']):,} | {int(row['Issuer_Count'])} "
+            f"| {int(row['Source_File_Count']):,} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def run_raw_db_storage_all_issuers(
+    *,
+    year_filter: str,
+    issuer_filter: str | None = None,
+    month_filter: str | None = None,
+) -> dict[str, Any]:
+    """
+    Estimate raw 834 DB storage for ALL issuers under source_data and write Snowflake-planning exports.
+
+    Writes only:
+      outputs/storage_estimates/raw_834_db_storage_all_issuers.xlsx
+      outputs/storage_estimates/raw_834_db_storage_all_issuers.csv
+      outputs/storage_estimates/raw_834_db_storage_summary.md
+    """
+    out_dir = settings.storage_estimates_path
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    detail = build_all_issuers_partition_detail(
+        issuer_filter=issuer_filter,
+        year_filter=year_filter,
+        month_filter=month_filter,
+    )
+    summary = build_all_issuers_monthly_summary(detail)
+    md = _write_all_issuers_summary_md(summary, detail, year_filter=year_filter)
+
+    xlsx_path = out_dir / "raw_834_db_storage_all_issuers.xlsx"
+    csv_path = out_dir / "raw_834_db_storage_all_issuers.csv"
+    md_path = out_dir / "raw_834_db_storage_summary.md"
+
+    safe_write_excel(
+        xlsx_path,
+        {
+            "raw_834_db_storage_all_issuers": summary,
+            "Issuer_Month_Detail": detail,
+        },
+        drop_duplicate_value_columns=False,
+    )
+    safe_write_csv(csv_path, summary, drop_duplicate_value_columns=False)
+    md_path.write_text(md, encoding="utf-8")
+
+    logger.info(
+        "All-issuer raw DB storage: %d summary row(s), %d partition(s), %d issuer(s)",
+        len(summary),
+        len(detail),
+        detail["issuer"].nunique() if not detail.empty else 0,
+    )
+    return {
+        "output_dir": str(out_dir),
+        "summary_xlsx": str(xlsx_path),
+        "summary_csv": str(csv_path),
+        "summary_md": str(md_path),
+        "month_rows": len(summary),
+        "partition_rows": len(detail),
+        "issuer_count": int(detail["issuer"].nunique()) if not detail.empty else 0,
+        "summary": summary,
+        "detail": detail,
+    }
 
 
 def run_raw_db_storage_only(

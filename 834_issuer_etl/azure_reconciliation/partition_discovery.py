@@ -46,16 +46,26 @@ def discover_partitions(
     issuer_filter: str | None = None,
     year_filter: str | None = None,
     month_filter: str | None = None,
+    use_env_filters: bool = True,
 ) -> list[Partition]:
     """
     Walk source_data/{issuer}/{year}/{month}/ and return sorted partitions.
 
     Applies .env / CLI filters when provided.
+    Set use_env_filters=False to ignore .env filters (None issuer_filter = all issuers).
     """
     root = source_root or settings.source_data_path
-    issuer_allow = _parse_filter_set(issuer_filter or settings.issuer_filter)
-    year_allow = _parse_filter_set(year_filter or settings.year_filter)
-    month_allow = _parse_filter_set(month_filter or settings.month_filter)
+    if use_env_filters:
+        effective_issuer = issuer_filter if issuer_filter is not None else settings.issuer_filter
+        effective_year = year_filter if year_filter is not None else settings.year_filter
+        effective_month = month_filter if month_filter is not None else settings.month_filter
+    else:
+        effective_issuer = issuer_filter
+        effective_year = year_filter
+        effective_month = month_filter
+    issuer_allow = _parse_filter_set(effective_issuer)
+    year_allow = _parse_filter_set(effective_year)
+    month_allow = _parse_filter_set(effective_month)
     if month_allow:
         month_allow = {m.zfill(2) if m.isdigit() else m for m in month_allow}
 
