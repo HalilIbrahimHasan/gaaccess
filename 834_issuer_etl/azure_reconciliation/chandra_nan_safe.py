@@ -388,6 +388,87 @@ def write_issuer_failure(
     return path
 
 
+def write_fatal_error_file(
+    exc: BaseException,
+    *,
+    year: str | None = None,
+    issuer_filter: str | None = None,
+    month_filter: str | None = None,
+    current_stage: str = "",
+    active_issuer: str | None = None,
+    active_month: str | None = None,
+    extra_context: dict[str, Any] | None = None,
+    debug_trace: bool = False,
+) -> Path:
+    """
+    Write outputs/chandra_report_only/_FATAL_ERROR.txt for top-level uncaught failures.
+
+    Also appends to outputs/chandra_report_only/<year>/run_errors.log when year is known.
+    """
+    from config.config import settings
+
+    root = settings.outputs_path / "chandra_report_only"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / "_FATAL_ERROR.txt"
+    tb = traceback.format_exc()
+    exc_type = type(exc).__name__
+    exc_loc = traceback.format_exception_only(exc_type, exc)
+
+    lines = [
+        "CHANDRA REPORT ONLY — FATAL ERROR",
+        f"exception_type={exc_type}",
+        f"exception={exc}",
+        f"CURRENT_STAGE={current_stage or 'unknown'}",
+        f"year={year or ''}",
+        f"issuer_filter={issuer_filter or 'ALL'}",
+        f"month_filter={month_filter or 'ALL'}",
+        f"active_issuer={active_issuer or ''}",
+        f"active_month={active_month or ''}",
+        "",
+        "=== EXCEPTION SUMMARY ===",
+        "".join(exc_loc).strip(),
+        "",
+        "=== FULL TRACEBACK (file + line) ===",
+        tb,
+    ]
+    if extra_context:
+        lines.append("")
+        lines.append("=== CONTEXT ===")
+        for k, v in extra_context.items():
+            if k == "nan_sample" and isinstance(v, list):
+                lines.append(f"{k}:")
+                for row in v:
+                    lines.append(f"  {row}")
+            elif k == "dataframe_columns" and isinstance(v, list):
+                lines.append(f"{k}: {', '.join(str(c) for c in v)}")
+            else:
+                lines.append(f"{k}: {v}")
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    if year:
+        log_path = root / year / "run_errors.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        entry = (
+            f"[{ts}] FATAL year={year} stage={current_stage or 'unknown'} "
+            f"issuer_filter={issuer_filter or 'ALL'} active_issuer={active_issuer or ''} "
+            f"active_month={active_month or ''} error={exc}\n{tb}\n"
+            f"fatal_file={path}\n---\n"
+        )
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(entry)
+
+    print(tb, end="")
+    print(f"\nFATAL ERROR trace written to: {path}")
+    if year:
+        print(f"Also logged to: {root / year / 'run_errors.log'}")
+    if debug_trace:
+        print(f"CURRENT_STAGE={current_stage or 'unknown'}")
+
+    return path
+
+
 def append_run_errors_log(
     year: str,
     issuer: str,

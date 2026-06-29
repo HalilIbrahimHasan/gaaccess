@@ -14,13 +14,15 @@ from __future__ import annotations
 
 import argparse
 import sys
+import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from azure_reconciliation.chandra_report_only import run_chandra_report_only
+from azure_reconciliation.chandra_nan_safe import write_fatal_error_file
+from azure_reconciliation.chandra_report_only import chandra_report_only_root, run_chandra_report_only
 from azure_reconciliation.safe_export import ExportErrors
 from config.config import settings
 from utils.logger import get_logger
@@ -148,11 +150,24 @@ def main() -> None:
             debug_trace=args.debug_trace,
             export_errors=errors,
         )
-    except RuntimeError as exc:
-        logger.error("%s", exc)
+    except Exception as exc:
+        fatal_path = chandra_report_only_root() / "_FATAL_ERROR.txt"
+        if not fatal_path.exists():
+            fatal_path = write_fatal_error_file(
+                exc,
+                year=year,
+                issuer_filter=issuer,
+                month_filter=month,
+                current_stage="main",
+                debug_trace=args.debug_trace,
+            )
+        else:
+            traceback.print_exc()
+            print(f"\nFATAL ERROR trace already written to: {fatal_path}")
         print(f"\nCHANDRA REPORT ONLY FINAL STATUS: FAIL")
-        print(f"Reason: {exc}")
-        sys.exit(1)
+        print(f"Fatal error trace: {fatal_path}")
+        print(f"Exception: {type(exc).__name__}: {exc}")
+        raise
 
     _print_final_summary(result, dry_run=args.dry_run)
     print(f"\nElapsed: {result['elapsed_sec']:.1f}s")

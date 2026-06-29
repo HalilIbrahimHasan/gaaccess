@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import shutil
 import time
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +40,7 @@ from azure_reconciliation.chandra_nan_safe import (
     sanitize_chandra_summary_df,
     sanitize_dashboard_summary_df,
     sanitize_dataframe_pre_export,
+    write_fatal_error_file,
     write_issuer_failure,
 )
 from azure_reconciliation.partition_discovery import Partition, discover_partitions
@@ -78,6 +80,11 @@ def _zmonth(m: str) -> str:
     return str(m).strip().zfill(2)
 
 
+def _stage_log(message: str) -> None:
+    """Console stage marker for top-level crash diagnosis."""
+    print(message, flush=True)
+
+
 @dataclass
 class RunState:
     """Loop guard and validation collectors."""
@@ -101,6 +108,8 @@ class RunState:
     nan_cleanup_audit: list[dict[str, Any]] = field(default_factory=list)
     export_errors: list[str] = field(default_factory=list)
     current_stage: str = "discover"
+    active_issuer: str = ""
+    active_month: str = ""
     last_stage_by_issuer: dict[str, str] = field(default_factory=dict)
     last_failure_context_by_issuer: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -664,6 +673,7 @@ def process_issuer_year(
             continue
 
         mkey = state.month_key(issuer, year, part.month)
+        state.active_month = _zmonth(part.month)
         state.months_attempted.add(mkey)
         logger.info("START issuer=%s year=%s month=%s", issuer, year, part.month)
 
@@ -1090,154 +1100,194 @@ def run_chandra_report_only(
     Reads partition filters via caller (from .env YEAR_FILTER / ISSUER_FILTER / MONTH_FILTER).
     Does not read FILTER_PRIOR_YEAR_BENEFIT_EFFECTIVE or other .env feature flags.
     """
-    _apply_xml_only_mode()
-    root = chandra_report_only_root()
-    root.mkdir(parents=True, exist_ok=True)
+    state: RunState | None = None
+    _stage_log("START run_chandra_report_only")
+    try:
+        _apply_xml_only_mode()
+        root = chandra_report_only_root()
+        root.mkdir(parents=True, exist_ok=True)
 
-    if not dry_run:
-        _clear_outputs(year, issuer_filter=issuer_filter)
+        if not dry_run:
+            _clear_outputs(year, issuer_filter=issuer_filter)
 
-    state = RunState()
-    state.current_stage = "discover"
-    if debug_trace:
-        print(f"CURRENT_STAGE=discover year={year} issuer={issuer_filter or 'all'}")
-    all_partitions = discover_partitions(
-        issuer_filter=issuer_filter,
-        year_filter=year,
-    )
-    if not all_partitions:
-        raise RuntimeError(
-            f"No source_data partitions for year={year} issuer={issuer_filter or 'all'}"
+        state = RunState()
+        state.current_stage = "discover"
+        _stage_log("START discovery")
+        if debug_trace:
+            print(f"CURRENT_STAGE=discover year={year} issuer={issuer_filter or 'all'}")
+        all_partitions = discover_partitions(
+            issuer_filter=issuer_filter,
+            year_filter=year,
+        )
+        if not all_partitions:
+            raise RuntimeError(
+                f"No source_data partitions for year={year} issuer={issuer_filter or 'all'}"
+            )
+        _stage_log(
+            f"DONE discovery issuers={len({p.issuer for p in all_partitions})} "
+            f"months={len(all_partitions)}"
         )
 
-    month_allow = _parse_month_set(month_filter)
-    write_partitions = all_partitions
-    if month_allow:
-        write_partitions = [p for p in all_partitions if _zmonth(p.month) in month_allow]
-        if not write_partitions:
-            raise RuntimeError(
-                f"No source_data for year={year} month={month_filter} issuer={issuer_filter or 'all'}"
-            )
+        month_allow = _parse_month_set(month_filter)
+        write_partitions = all_partitions
+        if month_allow:
+            write_partitions = [p for p in all_partitions if _zmonth(p.month) in month_allow]
+            if not write_partitions:
+                raise RuntimeError(
+                    f"No source_data for year={year} month={month_filter} issuer={issuer_filter or 'all'}"
+                )
 
-    pairs = sorted({(p.issuer, p.year) for p in all_partitions})
-    for p in all_partitions:
-        state.issuers_discovered.add(p.issuer)
-        state.months_discovered.add(state.month_key(p.issuer, p.year, p.month))
+        pairs = sorted({(p.issuer, p.year) for p in all_partitions})
+        for p in all_partitions:
+            state.issuers_discovered.add(p.issuer)
+            state.months_discovered.add(state.month_key(p.issuer, p.year, p.month))
 
-    results: list[dict[str, Any]] = []
-    run_start = time.monotonic()
+        results: list[dict[str, Any]] = []
+        run_start = time.monotonic()
 
-    logger.info(
-        "Chandra report only: year=%s issuer=%s month=%s issuers=%d months=%d PY_filter=ON dry_run=%s",
-        year, issuer_filter or "all", month_filter or "all",
-        len(state.issuers_discovered), len(state.months_discovered), dry_run,
-    )
+        logger.info(
+            "Chandra report only: year=%s issuer=%s month=%s issuers=%d months=%d PY_filter=ON dry_run=%s",
+            year, issuer_filter or "all", month_filter or "all",
+            len(state.issuers_discovered), len(state.months_discovered), dry_run,
+        )
 
-    for iss, yr in pairs:
-        state.issuers_attempted.add(iss)
-        pipeline_parts = [p for p in all_partitions if p.issuer == iss and p.year == yr]
-        write_parts = [p for p in write_partitions if p.issuer == iss and p.year == yr]
-        if month_allow and not write_parts:
-            state.skipped.append({
-                "issuer": iss, "year": yr, "month": ",".join(sorted(month_allow)),
-                "reason": "month_not_found",
-            })
-            if stop_on_error:
-                raise RuntimeError(f"Month filter not found for issuer {iss}/{yr}")
-            continue
+        for iss, yr in pairs:
+            state.active_issuer = iss
+            state.active_month = ""
+            state.current_stage = "issuer_loop"
+            _stage_log(f"START issuer={iss}")
+            state.issuers_attempted.add(iss)
+            pipeline_parts = [p for p in all_partitions if p.issuer == iss and p.year == yr]
+            write_parts = [p for p in write_partitions if p.issuer == iss and p.year == yr]
+            if month_allow and not write_parts:
+                state.skipped.append({
+                    "issuer": iss, "year": yr, "month": ",".join(sorted(month_allow)),
+                    "reason": "month_not_found",
+                })
+                if stop_on_error:
+                    raise RuntimeError(f"Month filter not found for issuer {iss}/{yr}")
+                continue
 
-        issuer_failed = False
-        try:
-            res = process_issuer_year(
-                iss, yr, pipeline_parts, write_parts, state,
-                force=force, dry_run=dry_run, debug_trace=debug_trace,
-                export_errors=export_errors,
-            )
-            if res is None:
-                if not _is_benign_skip(state, iss):
-                    state.issuers_failed.add(iss)
-                    issuer_failed = True
-            else:
-                results.append(res)
-                if not dry_run:
-                    expected_months = res.get("expected_months", [])
-                    if _validate_issuer_outputs(state, iss, yr, expected_months):
-                        state.issuers_successfully_written.add(iss)
-                    else:
+            issuer_failed = False
+            try:
+                _stage_log(f"START process_issuer_year issuer={iss}")
+                res = process_issuer_year(
+                    iss, yr, pipeline_parts, write_parts, state,
+                    force=force, dry_run=dry_run, debug_trace=debug_trace,
+                    export_errors=export_errors,
+                )
+                _stage_log(f"DONE process_issuer_year issuer={iss}")
+                if res is None:
+                    if not _is_benign_skip(state, iss):
                         state.issuers_failed.add(iss)
                         issuer_failed = True
-                        for m in expected_months:
-                            state.months_failed.add(state.month_key(iss, yr, m))
                 else:
-                    state.issuers_successfully_written.add(iss)
-        except Exception as exc:
-            stage_name = state.last_stage_by_issuer.get(iss, state.current_stage)
-            fail_ctx = dict(state.last_failure_context_by_issuer.get(iss, {}))
-            fail_ctx["current_stage"] = stage_name
-            logger.error("ERROR issuer=%s year=%s stage=%s reason=%s", iss, yr, stage_name, exc)
-            failed_path = None
-            if not dry_run:
-                failed_path = write_issuer_failure(
-                    iss, yr, exc, stage=stage_name,
-                    context=fail_ctx,
-                    debug_trace=debug_trace,
-                )
-                append_run_errors_log(yr, iss, exc, stage=stage_name, failed_path=failed_path)
-                state.missing_output_files.append({
-                    "issuer": iss,
-                    "year": yr,
-                    "month": "",
-                    "expected_file": str(failed_path) if failed_path else "",
-                    "reason": f"exception at {stage_name}: {exc}",
+                    results.append(res)
+                    if not dry_run:
+                        expected_months = res.get("expected_months", [])
+                        if _validate_issuer_outputs(state, iss, yr, expected_months):
+                            state.issuers_successfully_written.add(iss)
+                        else:
+                            state.issuers_failed.add(iss)
+                            issuer_failed = True
+                            for m in expected_months:
+                                state.months_failed.add(state.month_key(iss, yr, m))
+                    else:
+                        state.issuers_successfully_written.add(iss)
+            except Exception as exc:
+                stage_name = state.last_stage_by_issuer.get(iss, state.current_stage)
+                fail_ctx = dict(state.last_failure_context_by_issuer.get(iss, {}))
+                fail_ctx["current_stage"] = stage_name
+                logger.error("ERROR issuer=%s year=%s stage=%s reason=%s", iss, yr, stage_name, exc)
+                traceback.print_exc()
+                failed_path = None
+                if not dry_run:
+                    failed_path = write_issuer_failure(
+                        iss, yr, exc, stage=stage_name,
+                        context=fail_ctx,
+                        debug_trace=debug_trace,
+                    )
+                    append_run_errors_log(yr, iss, exc, stage=stage_name, failed_path=failed_path)
+                    state.missing_output_files.append({
+                        "issuer": iss,
+                        "year": yr,
+                        "month": "",
+                        "expected_file": str(failed_path) if failed_path else "",
+                        "reason": f"exception at {stage_name}: {exc}",
+                    })
+                state.skipped.append({
+                    "issuer": iss, "year": yr, "month": "",
+                    "reason": f"exception at {stage_name}: {exc}; traceback={failed_path or 'dry_run'}",
                 })
-            state.skipped.append({
-                "issuer": iss, "year": yr, "month": "",
-                "reason": f"exception at {stage_name}: {exc}; traceback={failed_path or 'dry_run'}",
-            })
-            state.export_errors.append(f"{iss}/{yr}: {exc}")
-            state.issuers_failed.add(iss)
-            issuer_failed = True
-            if export_errors:
-                export_errors.record(f"Chandra report only {iss}/{yr}: {exc}")
-            if stop_on_error:
-                raise
+                state.export_errors.append(f"{iss}/{yr}: {exc}")
+                state.issuers_failed.add(iss)
+                issuer_failed = True
+                if export_errors:
+                    export_errors.record(f"Chandra report only {iss}/{yr}: {exc}")
+                if stop_on_error:
+                    raise
 
-        if issuer_failed and stop_on_error and not dry_run:
-            raise RuntimeError(
-                f"Stop on error: issuer {iss}/{yr} failed — "
-                f"{_issuer_failure_reason(state, iss)}"
-            )
+            if issuer_failed and stop_on_error and not dry_run:
+                raise RuntimeError(
+                    f"Stop on error: issuer {iss}/{yr} failed — "
+                    f"{_issuer_failure_reason(state, iss)}"
+                )
+            _stage_log(f"DONE issuer={iss}")
 
-    if not dry_run:
-        _write_year_rollup(year, state, export_errors)
-    summary_path = _write_run_summary(year, state, export_errors, dry_run=dry_run)
+        if not dry_run:
+            state.current_stage = "write_year_rollup"
+            _stage_log("START write_year_rollup")
+            _write_year_rollup(year, state, export_errors)
+            _stage_log("DONE write_year_rollup")
 
-    elapsed = time.monotonic() - run_start
-    final_status = _compute_final_status(state, dry_run=dry_run)
-    logger.info("Chandra report only complete in %.1fs → %s [%s]", elapsed, root, final_status)
+        state.current_stage = "write_run_summary"
+        _stage_log("START write_run_summary")
+        summary_path = _write_run_summary(year, state, export_errors, dry_run=dry_run)
+        _stage_log("DONE write_run_summary")
 
-    failed_issuers = sorted(state.issuers_failed)
-    return {
-        "output_root": str(root),
-        "year": year,
-        "issuer_filter": issuer_filter,
-        "month_filter": month_filter,
-        "issuer_years": len(results),
-        "results": results,
-        "run_summary": str(summary_path),
-        "elapsed_sec": elapsed,
-        "month_status_count": len(state.month_status),
-        "skipped_count": len(state.skipped),
-        "final_status": final_status,
-        "issuers_discovered": len(state.issuers_discovered),
-        "issuers_attempted": len(state.issuers_attempted),
-        "issuers_successfully_written": len(state.issuers_successfully_written),
-        "issuers_failed": len(state.issuers_failed),
-        "failed_issuers": failed_issuers,
-        "months_discovered": len(state.months_discovered),
-        "months_attempted": len(state.months_attempted),
-        "months_successfully_written": len(state.months_successfully_written),
-        "months_failed": len(state.months_failed),
-        "missing_output_files_count": len(state.missing_output_files),
-        "missing_output_files": state.missing_output_files,
-    }
+        elapsed = time.monotonic() - run_start
+        final_status = _compute_final_status(state, dry_run=dry_run)
+        logger.info("Chandra report only complete in %.1fs → %s [%s]", elapsed, root, final_status)
+        _stage_log(f"DONE run_chandra_report_only status={final_status}")
+
+        failed_issuers = sorted(state.issuers_failed)
+        return {
+            "output_root": str(root),
+            "year": year,
+            "issuer_filter": issuer_filter,
+            "month_filter": month_filter,
+            "issuer_years": len(results),
+            "results": results,
+            "run_summary": str(summary_path),
+            "elapsed_sec": elapsed,
+            "month_status_count": len(state.month_status),
+            "skipped_count": len(state.skipped),
+            "final_status": final_status,
+            "issuers_discovered": len(state.issuers_discovered),
+            "issuers_attempted": len(state.issuers_attempted),
+            "issuers_successfully_written": len(state.issuers_successfully_written),
+            "issuers_failed": len(state.issuers_failed),
+            "failed_issuers": failed_issuers,
+            "months_discovered": len(state.months_discovered),
+            "months_attempted": len(state.months_attempted),
+            "months_successfully_written": len(state.months_successfully_written),
+            "months_failed": len(state.months_failed),
+            "missing_output_files_count": len(state.missing_output_files),
+            "missing_output_files": state.missing_output_files,
+        }
+    except Exception as exc:
+        extra = {}
+        if state and state.active_issuer:
+            extra = dict(state.last_failure_context_by_issuer.get(state.active_issuer, {}))
+        write_fatal_error_file(
+            exc,
+            year=year,
+            issuer_filter=issuer_filter,
+            month_filter=month_filter,
+            current_stage=state.current_stage if state else "init",
+            active_issuer=state.active_issuer if state else "",
+            active_month=state.active_month if state else "",
+            extra_context=extra or None,
+            debug_trace=debug_trace,
+        )
+        raise
