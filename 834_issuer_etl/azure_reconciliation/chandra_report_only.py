@@ -30,6 +30,11 @@ from azure_reconciliation.chandra_business_format import (
     chandra_year_rollup,
     to_chandra_business_summary,
 )
+from azure_reconciliation.chandra_nan_safe import (
+    sanitize_business_ready_df,
+    sanitize_chandra_summary_df,
+    sanitize_dashboard_summary_df,
+)
 from azure_reconciliation.partition_discovery import Partition, discover_partitions
 from azure_reconciliation.prior_year_benefit_filter import (
     FILTER_ACTION_EXCLUDE,
@@ -80,9 +85,18 @@ class RunState:
     br_parts: list[pd.DataFrame] = field(default_factory=list)
     issuers_discovered: set[str] = field(default_factory=set)
     months_discovered: set[str] = field(default_factory=set)
-    issuers_processed: set[str] = field(default_factory=set)
-    months_processed: int = 0
+    issuers_attempted: set[str] = field(default_factory=set)
+    issuers_successfully_written: set[str] = field(default_factory=set)
+    issuers_failed: set[str] = field(default_factory=set)
+    months_attempted: set[str] = field(default_factory=set)
+    months_successfully_written: set[str] = field(default_factory=set)
+    months_failed: set[str] = field(default_factory=set)
+    missing_output_files: list[dict[str, Any]] = field(default_factory=list)
+    nan_cleanup_audit: list[dict[str, Any]] = field(default_factory=list)
     export_errors: list[str] = field(default_factory=list)
+
+    def month_key(self, issuer: str, year: str, month: str) -> str:
+        return f"{issuer}|{year}|{_zmonth(month)}"
 
     def claim(self, issuer: str, year: str, month: str) -> bool:
         key = f"{issuer}|{year}|{_zmonth(month)}"
@@ -195,12 +209,86 @@ def _statuses_present(chandra_month: pd.DataFrame) -> str:
     return ", ".join(v for v in vals if v and v not in ("nan", "None"))
 
 
+def _issuer_out_base(issuer: str, year: str) -> Path:
+    return chandra_report_only_root() / issuer / year
+
+
+def _expected_issuer_files(issuer: str, year: str) -> list[tuple[Path, str]]:
+    base = _issuer_out_base(issuer, year)
+    return [
+        (base / "business_ready" / "business_ready_all_months.xlsx", "issuer_business_ready_all_months"),
+        (base / "business_ready" / "business_ready_summary.xlsx", "issuer_business_ready_summary"),
+        (base / "reports" / "issuer_year_rollup.xlsx", "issuer_year_rollup"),
+    ]
+
+
+def _expected_month_file(issuer: str, year: str, month: str) -> tuple[Path, str]:
+    path = (
+        _issuer_out_base(issuer, year)
+        / "reports" / "monthly" / _zmonth(month) / "enrollment_summary.xlsx"
+    )
+    return path, "monthly_enrollment_summary"
+
+
+def _record_missing(
+    state: RunState,
+    *,
+    issuer: str,
+    year: str,
+    month: str,
+    path: Path,
+    reason: str,
+) -> None:
+    entry = {
+        "issuer": issuer,
+        "year": year,
+        "month": _zmonth(month) if month else "",
+        "expected_file": str(path),
+        "reason": reason,
+    }
+    state.missing_output_files.append(entry)
+    logger.error(
+        "MISSING OUTPUT issuer=%s year=%s month=%s file=%s reason=%s",
+        issuer, year, month or "", path, reason,
+    )
+
+
+def _validate_issuer_outputs(
+    state: RunState,
+    issuer: str,
+    year: str,
+    expected_months: list[str],
+) -> bool:
+    """Validate expected output files exist on disk. Returns True if all present."""
+    all_ok = True
+    for path, label in _expected_issuer_files(issuer, year):
+        if not path.is_file():
+            _record_missing(
+                state, issuer=issuer, year=year, month="",
+                path=path, reason=f"missing_{label}",
+            )
+            all_ok = False
+    for month in expected_months:
+        path, label = _expected_month_file(issuer, year, month)
+        if not path.is_file():
+            _record_missing(
+                state, issuer=issuer, year=year, month=month,
+                path=path, reason=f"missing_{label}",
+            )
+            all_ok = False
+    return all_ok
+
+
 def _clear_outputs(
     year: str,
     *,
     issuer_filter: str | None = None,
 ) -> None:
-    """Remove prior chandra_report_only outputs for the selected scope."""
+    """
+    Remove prior chandra_report_only outputs for the selected scope.
+
+    Called exactly once at run start — never during the issuer loop.
+    """
     root = chandra_report_only_root()
     year_dir = root / year
     if year_dir.exists():
@@ -225,6 +313,21 @@ def _clear_outputs(
         if yr_path.exists():
             shutil.rmtree(yr_path)
             logger.info("Cleared %s", yr_path)
+
+
+def _write_required_excel(
+    path: Path,
+    sheet_name: str,
+    df: pd.DataFrame,
+    export_errors: ExportErrors | None,
+) -> None:
+    """Write a required output file (creates parent dirs). Empty df still writes headers."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    safe_write_excel(
+        path, {sheet_name: df},
+        export_errors=export_errors,
+        drop_duplicate_value_columns=False,
+    )
 
 
 def _write_dashboards(
@@ -389,14 +492,17 @@ def process_issuer_year(
         for part in year_parts:
             if write_months and _zmonth(part.month) not in write_months:
                 continue
+            mkey = state.month_key(issuer, year, part.month)
+            state.months_attempted.add(mkey)
             state.month_status.append({
                 "issuer": issuer, "year": year, "month": _zmonth(part.month),
                 "source_file_count": _count_source_files(issuer, year, part.month),
                 "raw_rows": 0, "business_ready_rows": 0, "summary_rows": 0,
+                "statuses_present": "",
                 "status": "SKIPPED", "message": "no XML rows parsed",
             })
         state.skipped.append({"issuer": issuer, "year": year, "month": "", "reason": "no_xml_rows"})
-        logger.warning("No XML rows for %s/%s — skipping issuer folder", issuer, year)
+        logger.warning("No XML rows for %s/%s — no output folder created", issuer, year)
         return None
 
     raw_before = len(xml_raw)
@@ -406,6 +512,9 @@ def process_issuer_year(
     result = process_issuer_xml_business_quiet(issuer, xml_raw, year_parts)
 
     business_ready = _prepare_business_ready(result, issuer=issuer, year=year, xml_raw=xml_raw)
+    business_ready = sanitize_business_ready_df(
+        business_ready, state.nan_cleanup_audit, issuer=issuer, year=year,
+    )
     br_before = len(business_ready)
     if PY_FILTER_ENABLED and not business_ready.empty:
         business_ready = apply_prior_year_benefit_filter(business_ready, reporting_year=reporting_year)
@@ -440,6 +549,20 @@ def process_issuer_year(
         export_chandra_monthly = to_chandra_business_summary(scoped_h)
         export_chandra_yearly = chandra_year_rollup(export_chandra_monthly)
 
+    export_br = sanitize_business_ready_df(
+        export_br, state.nan_cleanup_audit, issuer=issuer, year=year,
+    )
+    br_summary = sanitize_dashboard_summary_df(
+        br_summary, state.nan_cleanup_audit, issuer=issuer, year=year,
+    )
+    export_chandra_monthly = sanitize_chandra_summary_df(
+        export_chandra_monthly, state.nan_cleanup_audit, issuer=issuer, year=year,
+    )
+    export_chandra_yearly = chandra_year_rollup(export_chandra_monthly)
+    export_chandra_yearly = sanitize_chandra_summary_df(
+        export_chandra_yearly, state.nan_cleanup_audit, issuer=issuer, year=year,
+    )
+
     state.filter_summary.append({
         "issuer": issuer,
         "year": year,
@@ -450,14 +573,19 @@ def process_issuer_year(
     })
 
     if dry_run:
+        expected_months: list[str] = []
         for part in year_parts:
             if write_months and _zmonth(part.month) not in write_months:
                 continue
+            mkey = state.month_key(issuer, year, part.month)
+            state.months_attempted.add(mkey)
             month_lifecycle = _lifecycle_for_partition(lifecycle, xml_raw, part)
             month_h = _chandra_dashboard(month_lifecycle, source="xml") if not month_lifecycle.empty else pd.DataFrame()
             chandra_month = to_chandra_business_summary(month_h)
             br_month = _br_for_partition(business_ready, part, xml_raw)
             raw_rows = _raw_rows_for_partition(xml_raw, part)
+            if not chandra_month.empty or not br_month.empty:
+                expected_months.append(_zmonth(part.month))
             logger.info(
                 "DONE issuer=%s year=%s month=%s raw=%d business_ready=%d summary_rows=%d",
                 issuer, year, part.month, raw_rows, len(br_month), len(chandra_month),
@@ -466,37 +594,51 @@ def process_issuer_year(
         return {
             "issuer": issuer, "year": year, "dry_run": True,
             "business_ready_rows": len(export_br), "summary_rows": len(export_chandra_monthly),
+            "expected_months": expected_months,
             "elapsed_sec": elapsed,
         }
 
-    br_dir = out_base / "business_ready"
-    rep_dir = out_base / "reports"
-    monthly_dir = rep_dir / "monthly"
-    dash_dir = out_base / "dashboards"
-    br_dir.mkdir(parents=True, exist_ok=True)
-    rep_dir.mkdir(parents=True, exist_ok=True)
-
-    _write_pair(br_dir, "business_ready_all_months", export_br, export_errors)
-    safe_write_excel(
-        br_dir / "business_ready_summary.xlsx",
-        {"Business_Ready_Summary": br_summary},
-        export_errors=export_errors,
-        drop_duplicate_value_columns=False,
-    )
-    _write_pair(rep_dir, "issuer_year_rollup", export_chandra_yearly, export_errors)
+    # Collect month results first — only create output dirs if at least one valid month.
+    month_writes: list[dict[str, Any]] = []
+    expected_months: list[str] = []
 
     for part in year_parts:
         if write_months and _zmonth(part.month) not in write_months:
             continue
         if not state.claim(issuer, year, part.month):
             continue
+
+        mkey = state.month_key(issuer, year, part.month)
+        state.months_attempted.add(mkey)
         logger.info("START issuer=%s year=%s month=%s", issuer, year, part.month)
 
-        month_lifecycle = _lifecycle_for_partition(lifecycle, xml_raw, part)
-        month_h = _chandra_dashboard(month_lifecycle, source="xml") if not month_lifecycle.empty else pd.DataFrame()
-        chandra_month = to_chandra_business_summary(month_h)
-
-        br_month = _br_for_partition(business_ready, part, xml_raw)
+        try:
+            month_lifecycle = _lifecycle_for_partition(lifecycle, xml_raw, part)
+            month_h = _chandra_dashboard(month_lifecycle, source="xml") if not month_lifecycle.empty else pd.DataFrame()
+            chandra_month = to_chandra_business_summary(month_h)
+            chandra_month = sanitize_chandra_summary_df(
+                chandra_month, state.nan_cleanup_audit,
+                issuer=issuer, year=year, month=_zmonth(part.month),
+            )
+            br_month = _br_for_partition(business_ready, part, xml_raw)
+        except Exception as exc:
+            logger.warning(
+                "Summary row warning issuer=%s year=%s month=%s: %s",
+                issuer, year, part.month, exc,
+            )
+            state.skipped.append({
+                "issuer": issuer, "year": year, "month": _zmonth(part.month),
+                "reason": f"summary_row_error: {exc}",
+            })
+            state.month_status.append({
+                "issuer": issuer, "year": year, "month": _zmonth(part.month),
+                "source_file_count": _count_source_files(issuer, year, part.month),
+                "raw_rows": _raw_rows_for_partition(xml_raw, part),
+                "business_ready_rows": 0, "summary_rows": 0,
+                "statuses_present": "",
+                "status": "WARN", "message": f"summary error: {exc}",
+            })
+            continue
 
         src_count = _count_source_files(issuer, year, part.month)
         raw_rows = _raw_rows_for_partition(xml_raw, part)
@@ -542,10 +684,6 @@ def process_issuer_year(
             )
             continue
 
-        month_out = monthly_dir / _zmonth(part.month)
-        month_out.mkdir(parents=True, exist_ok=True)
-        _write_pair(month_out, "enrollment_summary", chandra_month, export_errors)
-
         statuses = _statuses_present(chandra_month)
         xml_part = _xml_for_partition(xml_raw, part)
         part_audit = build_filter_audit(
@@ -559,27 +697,85 @@ def process_issuer_year(
             "filter_status": "PASS",
         })
 
-        state.month_status.append({
-            "issuer": issuer, "year": year, "month": _zmonth(part.month),
-            "source_file_count": src_count, "raw_rows": raw_rows,
-            "business_ready_rows": len(br_month),
+        month_writes.append({
+            "part": part,
+            "chandra_month": chandra_month,
+            "src_count": src_count,
+            "raw_rows": raw_rows,
+            "br_rows": len(br_month),
             "summary_rows": len(chandra_month),
-            "statuses_present": statuses,
-            "status": status, "message": message,
+            "statuses": statuses,
+            "status": status,
+            "message": message,
         })
-        state.months_processed += 1
-        state.issuers_processed.add(issuer)
+        expected_months.append(_zmonth(part.month))
         logger.info(
             "DONE issuer=%s year=%s month=%s raw=%d business_ready=%d summary_rows=%d",
             issuer, year, part.month, raw_rows, len(br_month), len(chandra_month),
         )
 
+    has_output = bool(month_writes) or not export_br.empty
+    if not has_output:
+        state.skipped.append({
+            "issuer": issuer, "year": year, "month": "",
+            "reason": "no_valid_month_output",
+        })
+        logger.warning("No valid month output for %s/%s — no output folder created", issuer, year)
+        return None
+
+    out_base = _issuer_out_base(issuer, year)
+    br_dir = out_base / "business_ready"
+    rep_dir = out_base / "reports"
+    monthly_dir = rep_dir / "monthly"
+    dash_dir = out_base / "dashboards"
+
+    br_cols = [c for c in CHANDRA_BUSINESS_READY_COLUMNS if c in export_br.columns]
+    br_out = export_br[br_cols] if not export_br.empty else pd.DataFrame(columns=br_cols)
+    _write_required_excel(
+        br_dir / "business_ready_all_months.xlsx",
+        "business_ready_all_months", br_out, export_errors,
+    )
+    safe_write_csv(br_dir / "business_ready_all_months.csv", br_out, export_errors=export_errors)
+    _write_required_excel(
+        br_dir / "business_ready_summary.xlsx",
+        "Business_Ready_Summary", br_summary, export_errors,
+    )
+
+    rollup_cols = [c for c in CHANDRA_BUSINESS_COLUMNS_CORE if c in export_chandra_yearly.columns]
+    rollup_out = export_chandra_yearly if not export_chandra_yearly.empty else pd.DataFrame(columns=rollup_cols)
+    _write_required_excel(
+        rep_dir / "issuer_year_rollup.xlsx",
+        "issuer_year_rollup", rollup_out, export_errors,
+    )
+    safe_write_csv(rep_dir / "issuer_year_rollup.csv", rollup_out, export_errors=export_errors)
+
+    for mw in month_writes:
+        part = mw["part"]
+        chandra_month = mw["chandra_month"]
+        month_out = monthly_dir / _zmonth(part.month)
+        _write_required_excel(
+            month_out / "enrollment_summary.xlsx",
+            "enrollment_summary", chandra_month, export_errors,
+        )
+        safe_write_csv(month_out / "enrollment_summary.csv", chandra_month, export_errors=export_errors)
+
+        mkey = state.month_key(issuer, year, part.month)
+        state.months_successfully_written.add(mkey)
+        state.month_status.append({
+            "issuer": issuer, "year": year, "month": _zmonth(part.month),
+            "source_file_count": mw["src_count"], "raw_rows": mw["raw_rows"],
+            "business_ready_rows": mw["br_rows"],
+            "summary_rows": mw["summary_rows"],
+            "statuses_present": mw["statuses"],
+            "status": mw["status"], "message": mw["message"],
+        })
+
     _write_dashboards(issuer, year, export_chandra_monthly, dash_dir)
 
     elapsed = time.monotonic() - t0
     logger.info(
-        "DONE issuer=%s year=%s total_time=%.1fs business_ready=%d summary=%d",
-        issuer, year, elapsed, len(export_br), len(export_chandra_monthly),
+        "DONE issuer=%s year=%s total_time=%.1fs business_ready=%d summary=%d months_written=%d",
+        issuer, year, elapsed, len(export_br), len(export_chandra_monthly), len(expected_months),
     )
 
     if not export_chandra_monthly.empty:
@@ -593,6 +789,7 @@ def process_issuer_year(
         "business_ready_rows": len(export_br),
         "summary_rows": len(export_chandra_monthly),
         "months": len(year_parts),
+        "expected_months": expected_months,
         "elapsed_sec": elapsed,
         "output_dir": str(out_base),
         "chandra_monthly": chandra_monthly,
@@ -687,31 +884,53 @@ def _write_run_summary(
 
     total_summary_rows = int(month_df["summary_rows"].sum()) if not month_df.empty and "summary_rows" in month_df.columns else 0
     months_skipped = len(skipped_df)
-    has_warn = (
-        (not month_df.empty and (month_df["status"] != "OK").any())
-        or months_skipped > 0
-        or bool(state.export_errors)
+    missing_count = len(state.missing_output_files)
+    expected_monthly = len(state.months_successfully_written)
+    actual_monthly = expected_monthly - sum(
+        1 for entry in state.missing_output_files
+        if "monthly_enrollment_summary" in str(entry.get("reason", ""))
     )
-    has_fail = bool(state.export_errors) or (
-        len(state.issuers_discovered) > 0 and len(state.issuers_processed) == 0 and not dry_run
-    )
-    if has_fail:
+
+    if missing_count > 0:
         final_status = "FAIL"
-    elif has_warn:
+    elif state.export_errors:
         final_status = "WARNINGS"
+    elif state.issuers_failed:
+        final_status = "WARNINGS"
+    elif (
+        (not month_df.empty and (month_df["status"] == "WARN").any())
+        or months_skipped > 0
+    ):
+        final_status = "WARNINGS"
+    elif dry_run:
+        final_status = "DRY_RUN"
     else:
         final_status = "SUCCESS"
 
     final_df = pd.DataFrame([{
         "year": year,
         "issuers_discovered": len(state.issuers_discovered),
-        "issuers_processed": len(state.issuers_processed),
+        "issuers_attempted": len(state.issuers_attempted),
+        "issuers_successfully_written": len(state.issuers_successfully_written),
+        "issuers_failed": len(state.issuers_failed),
         "months_discovered": len(state.months_discovered),
-        "months_processed": state.months_processed,
+        "months_attempted": len(state.months_attempted),
+        "months_successfully_written": len(state.months_successfully_written),
+        "months_failed": len(state.months_failed),
         "months_skipped": months_skipped,
+        "expected_monthly_files": expected_monthly,
+        "actual_monthly_files": actual_monthly,
+        "missing_output_files_count": missing_count,
         "total_summary_rows": total_summary_rows,
         "final_status": final_status,
     }])
+
+    missing_df = pd.DataFrame(state.missing_output_files) if state.missing_output_files else pd.DataFrame(
+        columns=["issuer", "year", "month", "expected_file", "reason"],
+    )
+    nan_audit_df = pd.DataFrame(state.nan_cleanup_audit) if state.nan_cleanup_audit else pd.DataFrame(
+        columns=["issuer", "year", "month", "column_name", "nan_count", "cleanup_action"],
+    )
 
     path = year_dir / "run_summary.xlsx"
     if dry_run:
@@ -725,6 +944,8 @@ def _write_run_summary(
             "Empty_Or_Skipped": skipped_df,
             "Filter_Audit_Summary": filter_df,
             "Final_Validation": final_df,
+            "Missing_Output_Files": missing_df,
+            "NaN_Cleanup_Audit": nan_audit_df,
         },
         export_errors=errors,
         drop_duplicate_value_columns=False,
@@ -732,19 +953,50 @@ def _write_run_summary(
     return path
 
 
-def _final_status(state: RunState, *, dry_run: bool = False) -> str:
-    has_fail = bool(state.export_errors)
-    has_warn = (
-        any(r.get("status") != "OK" for r in state.month_status)
-        or bool(state.skipped)
-    )
-    if has_fail:
-        return "FAIL"
+def _compute_final_status(state: RunState, *, dry_run: bool = False) -> str:
     if dry_run:
         return "DRY_RUN"
-    if has_warn:
+    if state.missing_output_files:
+        return "FAIL"
+    if state.export_errors or state.issuers_failed:
+        return "WARNINGS"
+    if state.skipped or any(r.get("status") == "WARN" for r in state.month_status):
         return "WARNINGS"
     return "SUCCESS"
+
+
+def _issuer_failure_reason(state: RunState, issuer: str) -> str:
+    for entry in state.missing_output_files:
+        if entry.get("issuer") == issuer:
+            return str(entry.get("reason", "missing_output"))
+    for entry in state.skipped:
+        if entry.get("issuer") == issuer and not entry.get("month"):
+            return str(entry.get("reason", "skipped"))
+    for err in state.export_errors:
+        if issuer in err:
+            return err
+    return "unknown_failure"
+
+
+_BENIGN_SKIP_REASONS = frozenset({
+    "no_xml_rows",
+    "no_valid_month_output",
+    "no_source_files",
+    "no_partitions",
+    "month_not_found",
+})
+
+
+def _is_benign_skip(state: RunState, issuer: str) -> bool:
+    for entry in state.skipped:
+        if entry.get("issuer") != issuer:
+            continue
+        reason = str(entry.get("reason", ""))
+        if reason in _BENIGN_SKIP_REASONS:
+            return True
+        if reason.startswith("no_"):
+            return True
+    return False
 
 
 def run_chandra_report_only(
@@ -754,6 +1006,7 @@ def run_chandra_report_only(
     month_filter: str | None = None,
     force: bool = False,
     dry_run: bool = False,
+    stop_on_error: bool = False,
     export_errors: ExportErrors | None = None,
 ) -> dict[str, Any]:
     """
@@ -787,21 +1040,23 @@ def run_chandra_report_only(
                 f"No source_data for year={year} month={month_filter} issuer={issuer_filter or 'all'}"
             )
 
-    pairs = sorted({(p.issuer, p.year) for p in write_partitions})
+    pairs = sorted({(p.issuer, p.year) for p in all_partitions})
     state = RunState()
     for p in all_partitions:
         state.issuers_discovered.add(p.issuer)
-        state.months_discovered.add(f"{p.issuer}|{p.year}|{_zmonth(p.month)}")
+        state.months_discovered.add(state.month_key(p.issuer, p.year, p.month))
 
     results: list[dict[str, Any]] = []
     run_start = time.monotonic()
 
     logger.info(
-        "Chandra report only: year=%s issuer=%s month=%s pairs=%d PY_filter=ON dry_run=%s",
-        year, issuer_filter or "all", month_filter or "all", len(pairs), dry_run,
+        "Chandra report only: year=%s issuer=%s month=%s issuers=%d months=%d PY_filter=ON dry_run=%s",
+        year, issuer_filter or "all", month_filter or "all",
+        len(state.issuers_discovered), len(state.months_discovered), dry_run,
     )
 
     for iss, yr in pairs:
+        state.issuers_attempted.add(iss)
         pipeline_parts = [p for p in all_partitions if p.issuer == iss and p.year == yr]
         write_parts = [p for p in write_partitions if p.issuer == iss and p.year == yr]
         if month_allow and not write_parts:
@@ -809,31 +1064,62 @@ def run_chandra_report_only(
                 "issuer": iss, "year": yr, "month": ",".join(sorted(month_allow)),
                 "reason": "month_not_found",
             })
+            if stop_on_error:
+                raise RuntimeError(f"Month filter not found for issuer {iss}/{yr}")
             continue
 
+        issuer_failed = False
         try:
             res = process_issuer_year(
                 iss, yr, pipeline_parts, write_parts, state,
                 force=force, dry_run=dry_run, export_errors=export_errors,
             )
-            if res:
+            if res is None:
+                if not _is_benign_skip(state, iss):
+                    state.issuers_failed.add(iss)
+                    issuer_failed = True
+            else:
                 results.append(res)
-                state.issuers_processed.add(iss)
+                if not dry_run:
+                    expected_months = res.get("expected_months", [])
+                    if _validate_issuer_outputs(state, iss, yr, expected_months):
+                        state.issuers_successfully_written.add(iss)
+                    else:
+                        state.issuers_failed.add(iss)
+                        issuer_failed = True
+                        for m in expected_months:
+                            state.months_failed.add(state.month_key(iss, yr, m))
+                else:
+                    state.issuers_successfully_written.add(iss)
         except Exception as exc:
-            logger.error("Failed %s/%s: %s", iss, yr, exc)
-            state.skipped.append({"issuer": iss, "year": yr, "month": "", "reason": f"error: {exc}"})
-            state.export_errors.append(str(exc))
+            logger.error("ERROR issuer=%s year=%s reason=%s", iss, yr, exc)
+            state.skipped.append({
+                "issuer": iss, "year": yr, "month": "",
+                "reason": f"exception: {exc}",
+            })
+            state.export_errors.append(f"{iss}/{yr}: {exc}")
+            state.issuers_failed.add(iss)
+            issuer_failed = True
             if export_errors:
                 export_errors.record(f"Chandra report only {iss}/{yr}: {exc}")
+            if stop_on_error:
+                raise
+
+        if issuer_failed and stop_on_error and not dry_run:
+            raise RuntimeError(
+                f"Stop on error: issuer {iss}/{yr} failed — "
+                f"{_issuer_failure_reason(state, iss)}"
+            )
 
     if not dry_run:
         _write_year_rollup(year, state, export_errors)
     summary_path = _write_run_summary(year, state, export_errors, dry_run=dry_run)
 
     elapsed = time.monotonic() - run_start
-    final_status = _final_status(state, dry_run=dry_run)
+    final_status = _compute_final_status(state, dry_run=dry_run)
     logger.info("Chandra report only complete in %.1fs → %s [%s]", elapsed, root, final_status)
 
+    failed_issuers = sorted(state.issuers_failed)
     return {
         "output_root": str(root),
         "year": year,
@@ -847,7 +1133,14 @@ def run_chandra_report_only(
         "skipped_count": len(state.skipped),
         "final_status": final_status,
         "issuers_discovered": len(state.issuers_discovered),
-        "issuers_processed": len(state.issuers_processed),
+        "issuers_attempted": len(state.issuers_attempted),
+        "issuers_successfully_written": len(state.issuers_successfully_written),
+        "issuers_failed": len(state.issuers_failed),
+        "failed_issuers": failed_issuers,
         "months_discovered": len(state.months_discovered),
-        "months_processed": state.months_processed,
+        "months_attempted": len(state.months_attempted),
+        "months_successfully_written": len(state.months_successfully_written),
+        "months_failed": len(state.months_failed),
+        "missing_output_files_count": len(state.missing_output_files),
+        "missing_output_files": state.missing_output_files,
     }

@@ -2,12 +2,12 @@
 """
 Chandra-style report-only runner — reads YEAR_FILTER / ISSUER_FILTER / MONTH_FILTER from .env.
 
-Optional CLI overrides: --year, --issuer, --month, --force, --dry-run
+Optional CLI overrides: --year, --issuer, --month, --force, --dry-run, --stop-on-error
 
 Examples:
     python run_chandra_report_only.py --force
     python run_chandra_report_only.py --dry-run
-    python run_chandra_report_only.py --issuer 15105 --year 2026 --force
+    python run_chandra_report_only.py --force --stop-on-error
 """
 
 from __future__ import annotations
@@ -69,6 +69,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Discover and process without writing output files",
     )
+    p.add_argument(
+        "--stop-on-error",
+        action="store_true",
+        help="Stop immediately on first issuer/month failure",
+    )
     return p.parse_args()
 
 
@@ -83,6 +88,33 @@ def _print_banner(year: str, issuer: str | None, month: str | None, *, dry_run: 
     print("Full exports: DISABLED")
     if dry_run:
         print("Mode: DRY RUN (no files written)")
+
+
+def _print_final_summary(result: dict, *, dry_run: bool) -> None:
+    year = result["year"]
+    status = result["final_status"]
+    print(f"\nCHANDRA REPORT ONLY FINAL STATUS: {status}")
+    print(f"Discovered issuers: {result['issuers_discovered']}")
+    print(f"Successfully written issuers: {result['issuers_successfully_written']}")
+    print(f"Failed issuers: {result['issuers_failed']}")
+    print(f"Discovered months: {result['months_discovered']}")
+    print(f"Successfully written months: {result['months_successfully_written']}")
+    print(f"Missing output files: {result['missing_output_files_count']}")
+    if not dry_run:
+        print(f"See: outputs/chandra_report_only/{year}/run_summary.xlsx")
+
+    if result.get("failed_issuers"):
+        print("\nFailed issuers:")
+        for iss in result["failed_issuers"]:
+            print(f"  - {iss}")
+
+    missing = result.get("missing_output_files") or []
+    if missing:
+        print("\nMissing output files:")
+        for entry in missing[:20]:
+            print(f"  - {entry.get('issuer')}/{entry.get('year')}/{entry.get('month', '')}: {entry.get('expected_file')}")
+        if len(missing) > 20:
+            print(f"  ... and {len(missing) - 20} more (see run_summary.xlsx)")
 
 
 def main() -> None:
@@ -107,26 +139,23 @@ def main() -> None:
             month_filter=month,
             force=args.force,
             dry_run=args.dry_run,
+            stop_on_error=args.stop_on_error,
             export_errors=errors,
         )
     except RuntimeError as exc:
         logger.error("%s", exc)
-        print(f"\nFAIL — {exc}")
+        print(f"\nCHANDRA REPORT ONLY FINAL STATUS: FAIL")
+        print(f"Reason: {exc}")
         sys.exit(1)
 
-    print(f"\n{result['final_status']}")
-    print(f"  Output root        : {result['output_root']}")
-    if not args.dry_run:
-        print(f"  Run summary        : {result['run_summary']}")
-    print(f"  Issuers discovered : {result['issuers_discovered']}")
-    print(f"  Issuers processed  : {result['issuers_processed']}")
-    print(f"  Months discovered  : {result['months_discovered']}")
-    print(f"  Months processed   : {result['months_processed']}")
-    print(f"  Months skipped     : {result['skipped_count']}")
-    print(f"  Elapsed            : {result['elapsed_sec']:.1f}s")
+    _print_final_summary(result, dry_run=args.dry_run)
+    print(f"\nElapsed: {result['elapsed_sec']:.1f}s")
+
     if errors.errors:
-        print(f"  Export errors      : {len(errors.errors)}")
-        sys.exit(1 if result["final_status"] == "FAIL" else 0)
+        print(f"Export errors: {len(errors.errors)}")
+
+    if result["final_status"] == "FAIL":
+        sys.exit(1)
 
 
 if __name__ == "__main__":

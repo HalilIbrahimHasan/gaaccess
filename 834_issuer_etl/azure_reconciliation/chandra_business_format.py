@@ -71,13 +71,87 @@ STATUS_ID_MAP = {
 }
 
 
-def _zmonth(m: str) -> str:
-    return str(m).strip().zfill(2)
+def _is_na(val: object) -> bool:
+    if val is None:
+        return True
+    try:
+        return bool(pd.isna(val))
+    except (TypeError, ValueError):
+        return False
 
 
-def gaa_load_date(year: str | int, month: str | int) -> str:
+def safe_count_int(val: object, default: int = 0) -> int:
+    """NaN-safe count conversion — missing/NaN becomes default."""
+    if _is_na(val):
+        return default
+    try:
+        num = float(val)  # type: ignore[arg-type]
+        if pd.isna(num):
+            return default
+        return int(num)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_year_str(val: object) -> str:
+    """Year as string for report outputs — never int-cast NaN."""
+    if _is_na(val):
+        return ""
+    s = str(val).strip()
+    if s.lower() in ("", "nan", "none", "<na>", "nat"):
+        return ""
+    try:
+        return str(int(float(s)))
+    except (TypeError, ValueError):
+        return s if s.isdigit() and len(s) == 4 else ""
+
+
+def safe_month_str(val: object) -> str:
+    """Month as zero-padded string — never int-cast NaN."""
+    if _is_na(val):
+        return ""
+    s = str(val).strip()
+    if s.lower() in ("", "nan", "none", "<na>", "nat", "all"):
+        return ""
+    try:
+        m = int(float(s))
+        return str(m).zfill(2) if 1 <= m <= 12 else ""
+    except (TypeError, ValueError):
+        return s.zfill(2) if s.isdigit() and len(s) <= 2 else ""
+
+
+def safe_status_id(
+    status_id_val: object = None,
+    *,
+    enrollee_status: object = None,
+) -> int:
+    """
+    NaN-safe status_Id:
+    CONFIRM=>1, CANCEL=>2, TERM=>3; derive from enrolleeStatus when missing.
+    """
+    if not _is_na(status_id_val):
+        try:
+            num = float(status_id_val)  # type: ignore[arg-type]
+            if not pd.isna(num) and int(num) in (1, 2, 3, 0):
+                return int(num)
+        except (TypeError, ValueError):
+            pass
+    if enrollee_status is not None and not _is_na(enrollee_status):
+        return status_id_for_display(enrollee_status_display(enrollee_status))
+    return 0
+
+
+def _zmonth(m: str | object) -> str:
+    return safe_month_str(m)
+
+
+def gaa_load_date(year: str | int | object, month: str | int | object) -> str:
     """First day of partition month — Chandra M/D/YYYY format."""
-    return f"{int(month)}/1/{int(year)}"
+    ys = safe_year_str(year)
+    ms = safe_month_str(month)
+    if not ys or not ms:
+        return ""
+    return f"{int(ms)}/1/{int(ys)}"
 
 
 def insurance_type_display(raw: str | None) -> str:
@@ -121,19 +195,25 @@ def to_chandra_business_summary(internal: pd.DataFrame) -> pd.DataFrame:
 
     rows: list[dict] = []
     for _, row in internal.iterrows():
-        year = str(row.get("year", ""))
-        month = _zmonth(str(row.get("month", "")))
+        year = safe_year_str(row.get("year", ""))
+        month = safe_month_str(row.get("month", ""))
+        if not year or not str(row.get("issuer", "")).strip() or str(row.get("issuer", "")).strip().lower() == "nan":
+            continue
         enrollee_status = enrollee_status_display(row.get("status"))
+        enroll_ct = row.get("Enrollment_Count", row.get("enrollment_count", 0))
+        enrollee_ct = row.get("Enrollee_Count", row.get("enrollee_count", 0))
         rows.append({
             "Coverage_Year": year,
-            "GAA_HIOS_ID": str(row.get("issuer", "")),
-            "GAA_Load_Date": gaa_load_date(year, month) if year and month not in ("", "ALL") else "",
+            "GAA_HIOS_ID": str(row.get("issuer", "")).strip(),
+            "GAA_Load_Date": gaa_load_date(year, month) if month else "",
             "Insurance_Type": insurance_type_display(row.get("insurance_type")),
-            "status_Id": status_id_for_display(enrollee_status),
+            "status_Id": safe_status_id(row.get("status_Id"), enrollee_status=enrollee_status),
             "enrolleeStatus": enrollee_status,
-            "Enrollment_Count": int(row.get("Enrollment_Count", row.get("enrollment_count", 0)) or 0),
-            "Enrollee_Count": int(row.get("Enrollee_Count", row.get("enrollee_count", 0)) or 0),
+            "Enrollment_Count": safe_count_int(enroll_ct, 0),
+            "Enrollee_Count": safe_count_int(enrollee_ct, 0),
         })
+    if not rows:
+        return pd.DataFrame(columns=CHANDRA_BUSINESS_COLUMNS_CORE)
     out = pd.DataFrame(rows)
     return out[CHANDRA_BUSINESS_COLUMNS_CORE]
 
@@ -151,6 +231,9 @@ def rollup_chandra_business(
         return chandra_df
     agg = {c: "sum" for c in sum_cols if c in chandra_df.columns}
     out = chandra_df.groupby(keys, dropna=False).agg(agg).reset_index()
+    for c in sum_cols:
+        if c in out.columns:
+            out[c] = out[c].apply(lambda v: safe_count_int(v, 0))
     return out[[c for c in group_keys + sum_cols if c in out.columns]]
 
 
