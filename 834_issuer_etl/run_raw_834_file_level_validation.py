@@ -85,7 +85,7 @@ def main() -> None:
     print(f"Output        : {OUTPUT_XLSX}")
     print("Scope: Parser834 raw output only (no business pipeline)")
 
-    work, months_processed, failed_files, total_source_files = parse_raw_rows()
+    work, months_processed, failed_files, _filename_warnings, total_source_files = parse_raw_rows()
     detail = build_file_level_report(work)
 
     total_raw = len(work)
