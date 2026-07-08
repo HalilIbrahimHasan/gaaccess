@@ -6,6 +6,7 @@ import argparse
 import sys
 
 from inbound_automation.constants import SUPPORTED_MODES
+from inbound_automation.azure_ddl import create_phase2a_tables
 from inbound_automation.pipeline import run_dry_run
 from inbound_automation.reports import write_dry_run_reports
 from inbound_automation.run_context import LoadRunContext
@@ -97,28 +98,29 @@ def _validate_args(args: argparse.Namespace) -> None:
     if len(modes) > 1:
         raise SystemExit(f"Error: mutually exclusive modes: {', '.join(modes)}")
 
-    if args.create_table or args.load:
+    if args.load:
         raise SystemExit(
-            "Error: --create-table and --load are not implemented yet (Phase 2+).\n"
-            "Phase 1 supports --dry-run only."
+            "Error: --load is not implemented yet (Phase 2+). Phase 2A supports --create-table only."
         )
 
-    if not args.all_years and not args.year:
-        raise SystemExit("Error: --year is required unless --all-years is set.")
+    # Phase 2A (--create-table) does not require year/month filters.
+    if args.dry_run:
+        if not args.all_years and not args.year:
+            raise SystemExit("Error: --year is required unless --all-years is set.")
 
-    if args.all_years and args.year:
-        raise SystemExit("Error: --year and --all-years are mutually exclusive.")
+        if args.all_years and args.year:
+            raise SystemExit("Error: --year and --all-years are mutually exclusive.")
 
-    if args.month:
-        try:
-            month = int(args.month)
-            if not 1 <= month <= 12:
-                raise ValueError
-        except ValueError:
-            raise SystemExit("Error: --month must be an integer between 1 and 12.")
+        if args.month:
+            try:
+                month = int(args.month)
+                if not 1 <= month <= 12:
+                    raise ValueError
+            except ValueError:
+                raise SystemExit("Error: --month must be an integer between 1 and 12.")
 
     if args.source == "sftp":
-        raise SystemExit("Error: --source sftp is not implemented in Phase 1.")
+        raise SystemExit("Error: --source sftp is not implemented.")
 
     if "dry_run" not in SUPPORTED_MODES and args.dry_run:
         raise SystemExit("Error: dry-run mode is not enabled in this build.")
@@ -128,6 +130,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _validate_args(args)
+
+    if args.create_table:
+        from inbound_automation.constants import PROJECT_ROOT
+        ddl_path = PROJECT_ROOT / "sql" / "inbound_automation_ddl.sql"
+        print("\nINBOUND AUTOMATION — CREATE TABLES (Phase 2A)")
+        return create_phase2a_tables(ddl_path=ddl_path, runner_name="inbound_automation_create_tables")
 
     issuer_filter = _parse_issuer_list(args.issuer)
     context = LoadRunContext.create(
