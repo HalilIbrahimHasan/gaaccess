@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import statistics
+import time
 from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from inbound_automation.azure_common import INBOUND_TABLES
+from inbound_automation.azure_common import INBOUND_TABLES, batch_size
+from inbound_automation.load_metrics import FileInsertMetrics
 from inbound_automation.pipeline import FileProcessResult
 from inbound_automation.run_context import LoadRunContext
 from utils.logger import get_logger
@@ -16,7 +19,6 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 SCHEMA = "dbo"
-BATCH_SIZE = 1000
 
 ALLOWED_TABLES = frozenset(INBOUND_TABLES)
 
@@ -272,21 +274,42 @@ def insert_file_log(
         conn.execute(sql, params)
 
 
+def _build_row_insert_sql() -> text:
+    col_list = ", ".join(f"[{c}]" for c in INBOUND_AUTOMATION_COLUMNS)
+    placeholders = ", ".join(f":{c}" for c in INBOUND_AUTOMATION_COLUMNS)
+    return text(
+        f"INSERT INTO [{SCHEMA}].[inbound_automation] ({col_list}) VALUES ({placeholders})"
+    )
+
+
+def _insert_rows_in_batches(
+    conn,
+    row_sql: text,
+    rows: list[dict[str, Any]],
+    *,
+    bs: int,
+) -> tuple[int, list[float]]:
+    """Execute batched inserts; build params per batch to limit peak memory."""
+    batch_durations: list[float] = []
+    inserted = 0
+    for start in range(0, len(rows), bs):
+        batch_rows = rows[start : start + bs]
+        batch = [row_to_insert_params(row) for row in batch_rows]
+        t0 = time.perf_counter()
+        conn.execute(row_sql, batch)
+        batch_durations.append(time.perf_counter() - t0)
+        inserted += len(batch)
+    return inserted, batch_durations
+
+
 def insert_rows_batch(engine: Engine, rows: list[dict[str, Any]]) -> int:
     if not rows:
         return 0
-    col_list = ", ".join(f"[{c}]" for c in INBOUND_AUTOMATION_COLUMNS)
-    placeholders = ", ".join(f":{c}" for c in INBOUND_AUTOMATION_COLUMNS)
-    sql = text(
-        f"INSERT INTO [{SCHEMA}].[inbound_automation] ({col_list}) VALUES ({placeholders})"
-    )
-    params = [row_to_insert_params(row) for row in rows]
+    row_sql = _build_row_insert_sql()
+    bs = batch_size()
     inserted = 0
     with engine.begin() as conn:
-        for start in range(0, len(params), BATCH_SIZE):
-            batch = params[start : start + BATCH_SIZE]
-            conn.execute(sql, batch)
-            inserted += len(batch)
+        inserted, _ = _insert_rows_in_batches(conn, row_sql, rows, bs=bs)
     return inserted
 
 
@@ -296,18 +319,20 @@ def load_file_rows(
     result: FileProcessResult,
     *,
     loaded_at: datetime,
-) -> int:
+    fast_executemany: bool = True,
+) -> tuple[int, FileInsertMetrics]:
     """Insert all rows for one file plus file_log entry in one transaction."""
+    bs = batch_size()
+    metrics = FileInsertMetrics(batch_size=bs, fast_executemany=fast_executemany)
+    t_load_start = time.perf_counter()
+
     if not result.rows:
         result.parse_status = "loaded"
         insert_file_log(engine, context, result, loaded_at=loaded_at)
-        return 0
+        metrics.load_duration_ms = int((time.perf_counter() - t_load_start) * 1000)
+        return 0, metrics
 
-    col_list = ", ".join(f"[{c}]" for c in INBOUND_AUTOMATION_COLUMNS)
-    placeholders = ", ".join(f":{c}" for c in INBOUND_AUTOMATION_COLUMNS)
-    row_sql = text(
-        f"INSERT INTO [{SCHEMA}].[inbound_automation] ({col_list}) VALUES ({placeholders})"
-    )
+    row_sql = _build_row_insert_sql()
     file_sql = text(f"""
         INSERT INTO [{SCHEMA}].[inbound_automation_file_log] (
             load_run_id, loaded_at, issuer, folder_year, folder_month,
@@ -321,7 +346,7 @@ def load_file_rows(
             :parse_status, :row_count, :parse_duration_ms, :error_message
         )
     """)
-    params = [row_to_insert_params(row) for row in result.rows]
+    row_count = len(result.rows)
     file_params = {
         "load_run_id": context.load_run_id,
         "loaded_at": loaded_at,
@@ -335,17 +360,52 @@ def load_file_rows(
         "file_hash": result.file_hash,
         "file_size_bytes": result.source.file_size,
         "parse_status": "loaded",
-        "row_count": len(params),
+        "row_count": row_count,
         "parse_duration_ms": result.parse_duration_ms,
         "error_message": result.error_message,
     }
 
+    batch_durations: list[float] = []
+    file_log_duration_sec = 0.0
     with engine.begin() as conn:
-        for start in range(0, len(params), BATCH_SIZE):
-            batch = params[start : start + BATCH_SIZE]
-            conn.execute(row_sql, batch)
+        _, batch_durations = _insert_rows_in_batches(
+            conn, row_sql, result.rows, bs=bs,
+        )
+        t_file_log = time.perf_counter()
         conn.execute(file_sql, file_params)
+        file_log_duration_sec = time.perf_counter() - t_file_log
+
+    load_duration_sec = time.perf_counter() - t_load_start
+    insert_sql_sec = sum(batch_durations)
+    commit_duration_sec = max(0.0, load_duration_sec - insert_sql_sec - file_log_duration_sec)
+
+    metrics.row_count = row_count
+    metrics.batch_count = len(batch_durations)
+    metrics.insert_sql_duration_ms = int(insert_sql_sec * 1000)
+    metrics.file_log_duration_ms = int(file_log_duration_sec * 1000)
+    metrics.commit_duration_ms = int(commit_duration_sec * 1000)
+    metrics.load_duration_ms = int(load_duration_sec * 1000)
+    if batch_durations:
+        metrics.avg_batch_duration_ms = round(
+            statistics.mean(batch_durations) * 1000, 2,
+        )
+        metrics.max_batch_duration_ms = round(max(batch_durations) * 1000, 2)
+        metrics.min_batch_duration_ms = round(min(batch_durations) * 1000, 2)
+    if insert_sql_sec > 0:
+        metrics.rows_per_sec = round(row_count / insert_sql_sec, 2)
 
     result.parse_status = "loaded"
-    result.row_count = len(params)
-    return len(params)
+    result.row_count = row_count
+    logger.info(
+        "Loaded %s: %d rows in %d batches (batch_size=%d) — "
+        "%.0f rows/sec SQL, load=%dms (sql=%dms commit=%dms)",
+        result.source.file_name,
+        row_count,
+        metrics.batch_count,
+        bs,
+        metrics.rows_per_sec,
+        metrics.load_duration_ms,
+        metrics.insert_sql_duration_ms,
+        metrics.commit_duration_ms,
+    )
+    return row_count, metrics

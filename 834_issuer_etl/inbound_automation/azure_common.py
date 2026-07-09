@@ -5,9 +5,10 @@ from __future__ import annotations
 import os
 import sys
 
+from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
-from azure_reconciliation.azure_client import get_engine, test_azure_connection_query
+from azure_reconciliation.azure_client import build_connection_url, test_azure_connection_query
 from config.config import reload_env, settings
 
 TRUTHY = frozenset({"true", "1", "yes", "y", "t"})
@@ -18,10 +19,28 @@ INBOUND_TABLES = (
     "inbound_automation_file_log",
 )
 
+# Default insert batch size (override via INBOUND_AUTOMATION_BATCH_SIZE).
+DEFAULT_BATCH_SIZE = 1000
+
 
 def env_enabled() -> bool:
     raw = os.getenv("INBOUND_AUTOMATION_ENABLED", "").strip().strip('"').strip("'")
     return bool(raw) and raw.lower() in TRUTHY
+
+
+def batch_size() -> int:
+    raw = os.getenv("INBOUND_AUTOMATION_BATCH_SIZE", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return DEFAULT_BATCH_SIZE
+
+
+def fast_executemany_enabled() -> bool:
+    raw = os.getenv("INBOUND_AUTOMATION_FAST_EXECUTEMANY", "true").strip().strip('"').strip("'")
+    return raw.lower() in TRUTHY
 
 
 def require_env_gate(action: str) -> None:
@@ -48,7 +67,22 @@ def presence_flags() -> dict[str, bool]:
     }
 
 
-def connect_automation_engine() -> Engine:
+def get_automation_engine(*, fast_executemany: bool | None = None) -> Engine:
+    """
+    Create SQLAlchemy engine for inbound automation writes.
+
+    Reuses build_connection_url() from azure_client (existing SERVER/DATABASE/USERNAME).
+    Does not modify azure_client.py.
+    """
+    use_fast = fast_executemany_enabled() if fast_executemany is None else fast_executemany
+    return create_engine(
+        build_connection_url(),
+        future=True,
+        fast_executemany=use_fast,
+    )
+
+
+def connect_automation_engine(*, fast_executemany: bool | None = None) -> Engine:
     """Connect using the existing project Azure config pattern."""
     flags = presence_flags()
     print("Azure config presence (no secrets):")
@@ -62,8 +96,12 @@ def connect_automation_engine() -> Engine:
         )
         raise SystemExit(1)
 
+    use_fast = fast_executemany_enabled() if fast_executemany is None else fast_executemany
+    print(f"  fast_executemany: {use_fast}")
+    print(f"  batch_size: {batch_size()}")
+
     try:
-        engine = get_engine()
+        engine = get_automation_engine(fast_executemany=use_fast)
         test_azure_connection_query(engine)
         print("Azure connection successful")
         return engine

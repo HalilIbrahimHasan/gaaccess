@@ -200,6 +200,63 @@ def build_skipped_duplicate_files(result: RunResult) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_file_load_log(result: RunResult) -> pd.DataFrame:
+    rows = []
+    for f in result.file_results:
+        m = f.insert_metrics
+        rows.append(
+            {
+                "source_file": f.source.file_name,
+                "source_file_path": str(f.source.file_path),
+                "issuer": f.source.issuer,
+                "folder_year": int(f.source.year),
+                "folder_month": int(f.source.month),
+                "file_hash": f.file_hash,
+                "parse_status": f.parse_status,
+                "row_count": f.row_count,
+                "parse_duration_ms": f.parse_duration_ms,
+                "load_duration_ms": m.load_duration_ms if m else None,
+                "insert_sql_duration_ms": m.insert_sql_duration_ms if m else None,
+                "commit_duration_ms": m.commit_duration_ms if m else None,
+                "file_log_duration_ms": m.file_log_duration_ms if m else None,
+                "rows_per_sec": m.rows_per_sec if m else None,
+                "batch_size": m.batch_size if m else None,
+                "batch_count": m.batch_count if m else None,
+                "avg_batch_duration_ms": m.avg_batch_duration_ms if m else None,
+                "min_batch_duration_ms": m.min_batch_duration_ms if m else None,
+                "max_batch_duration_ms": m.max_batch_duration_ms if m else None,
+                "fast_executemany": m.fast_executemany if m else None,
+                "error_message": f.error_message or "",
+            }
+        )
+    columns = [
+        "source_file",
+        "source_file_path",
+        "issuer",
+        "folder_year",
+        "folder_month",
+        "file_hash",
+        "parse_status",
+        "row_count",
+        "parse_duration_ms",
+        "load_duration_ms",
+        "insert_sql_duration_ms",
+        "commit_duration_ms",
+        "file_log_duration_ms",
+        "rows_per_sec",
+        "batch_size",
+        "batch_count",
+        "avg_batch_duration_ms",
+        "min_batch_duration_ms",
+        "max_batch_duration_ms",
+        "fast_executemany",
+        "error_message",
+    ]
+    if not rows:
+        return _empty(columns)
+    return pd.DataFrame(rows)
+
+
 def build_dry_run_manifest(result: RunResult) -> pd.DataFrame:
     rows = [
         {
@@ -248,6 +305,12 @@ def build_run_summary(result: RunResult) -> pd.DataFrame:
     ctx = result.context
     elapsed_s = (result.completed_at - ctx.started_at).total_seconds()
     is_load = ctx.run_mode == "load"
+    loaded_metrics = [
+        f.insert_metrics for f in result.file_results if f.insert_metrics is not None
+    ]
+    total_insert_sql_ms = sum(m.insert_sql_duration_ms for m in loaded_metrics)
+    total_load_ms = sum(m.load_duration_ms for m in loaded_metrics)
+    total_rows_loaded = sum(m.row_count for m in loaded_metrics)
     row = {
         "load_run_id": ctx.load_run_id,
         "run_mode": ctx.run_mode,
@@ -268,6 +331,13 @@ def build_run_summary(result: RunResult) -> pd.DataFrame:
         "files_loaded": result.files_loaded if is_load else 0,
         "rows_parsed": result.rows_parsed,
         "rows_inserted": result.rows_inserted if is_load else 0,
+        "insert_sql_duration_ms": total_insert_sql_ms if is_load else None,
+        "load_duration_ms": total_load_ms if is_load else None,
+        "avg_rows_per_sec": (
+            round(total_rows_loaded / (total_insert_sql_ms / 1000), 2)
+            if is_load and total_insert_sql_ms > 0
+            else None
+        ),
         "total_warning_count": result.total_warning_count,
         "azure_writes": "LOAD (inbound_automation tables only)" if is_load else "NONE (dry-run)",
         "status": "success" if is_load else "dry_run",
@@ -287,6 +357,7 @@ def write_run_reports(result: RunResult) -> dict[str, Path]:
         "failed_files": out / "failed_files.xlsx",
         "skipped_duplicate": out / "skipped_duplicate_files.xlsx",
         "dry_run_manifest": out / "dry_run_manifest.xlsx",
+        "file_load_log": out / "file_load_log.xlsx",
     }
 
     rows = result.enriched_rows
@@ -323,6 +394,11 @@ def write_run_reports(result: RunResult) -> dict[str, Path]:
     safe_write_excel(
         paths["dry_run_manifest"],
         {"dry_run_manifest": build_dry_run_manifest(result)},
+        drop_duplicate_value_columns=False,
+    )
+    safe_write_excel(
+        paths["file_load_log"],
+        {"file_load_log": build_file_load_log(result)},
         drop_duplicate_value_columns=False,
     )
 

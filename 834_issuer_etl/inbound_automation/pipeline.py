@@ -14,6 +14,7 @@ from database.loaders import file_hash
 from inbound_automation.discovery import discover_for_run
 from inbound_automation.enrich import collect_file_warnings, enrich_parser_row
 from inbound_automation.filename_utils import parse_filename_year_month
+from inbound_automation.load_metrics import FileInsertMetrics
 from inbound_automation.run_context import LoadRunContext
 from ingestion.xml_reader import read_xml_bytes
 from parsers.parser_834 import Parser834
@@ -35,6 +36,7 @@ class FileProcessResult:
     prior_load_run_id: str | None = None
     warnings: list[str] = field(default_factory=list)
     rows: list[dict[str, Any]] = field(default_factory=list)
+    insert_metrics: FileInsertMetrics | None = None
 
 
 @dataclass
@@ -200,7 +202,11 @@ def run_load(context: LoadRunContext) -> RunResult:
     Writes only to inbound_automation, inbound_automation_run_log,
     and inbound_automation_file_log.
     """
-    from inbound_automation.azure_common import connect_automation_engine, require_env_gate
+    from inbound_automation.azure_common import (
+        connect_automation_engine,
+        fast_executemany_enabled,
+        require_env_gate,
+    )
     from inbound_automation.azure_writer import (
         fetch_loaded_file_hashes,
         insert_file_log,
@@ -214,6 +220,7 @@ def run_load(context: LoadRunContext) -> RunResult:
     settings.refresh_from_env()
 
     engine = connect_automation_engine()
+    use_fast_executemany = fast_executemany_enabled()
     verify_tables_exist(engine)
 
     loaded_hashes = fetch_loaded_file_hashes(engine)
@@ -262,9 +269,11 @@ def run_load(context: LoadRunContext) -> RunResult:
 
             if result.parse_status == "parsed" and result.rows:
                 try:
-                    inserted = load_file_rows(
+                    inserted, insert_metrics = load_file_rows(
                         engine, context, result, loaded_at=loaded_at,
+                        fast_executemany=use_fast_executemany,
                     )
+                    result.insert_metrics = insert_metrics
                     rows_inserted += inserted
                     enriched_rows.extend(result.rows)
                     loaded_hashes[fhash] = context.load_run_id
