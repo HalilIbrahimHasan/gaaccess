@@ -5,10 +5,9 @@ from __future__ import annotations
 import argparse
 import sys
 
-from inbound_automation.constants import SUPPORTED_MODES
 from inbound_automation.azure_ddl import create_phase2a_tables
-from inbound_automation.pipeline import run_dry_run
-from inbound_automation.reports import write_dry_run_reports
+from inbound_automation.pipeline import run_dry_run, run_load
+from inbound_automation.reports import write_run_reports
 from inbound_automation.run_context import LoadRunContext
 from utils.logger import get_logger
 
@@ -32,10 +31,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Inbound automation — Parser834 raw ingestion to Azure SQL.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples (Phase 1 — dry-run only):
+Examples:
   python run_inbound_automation_load.py --year 2025 --dry-run
   python run_inbound_automation_load.py --issuer 15105 --year 2025 --month 10 --dry-run
-  python run_inbound_automation_load.py --all-years --dry-run
+  python run_inbound_automation_load.py --issuer 15105 --year 2025 --month 10 --load
+  python run_inbound_automation_load.py --year 2025 --load
+  python run_inbound_automation_load.py --create-table
         """.strip(),
     )
     parser.add_argument(
@@ -46,12 +47,12 @@ Examples (Phase 1 — dry-run only):
     parser.add_argument(
         "--create-table",
         action="store_true",
-        help="[Phase 2+] Create inbound_automation tables in Azure SQL.",
+        help="Create inbound_automation tables in Azure SQL (requires INBOUND_AUTOMATION_ENABLED=true).",
     )
     parser.add_argument(
         "--load",
         action="store_true",
-        help="[Phase 2+] Insert parsed rows into Azure SQL.",
+        help="Insert parsed rows into Azure SQL (requires INBOUND_AUTOMATION_ENABLED=true).",
     )
     parser.add_argument(
         "--year",
@@ -92,19 +93,15 @@ def _validate_args(args: argparse.Namespace) -> None:
 
     if not modes:
         raise SystemExit(
-            "Error: explicit mode required. Phase 1 supports --dry-run only.\n"
-            "Example: python run_inbound_automation_load.py --year 2025 --dry-run"
+            "Error: explicit mode required.\n"
+            "Examples:\n"
+            "  python run_inbound_automation_load.py --year 2025 --dry-run\n"
+            "  python run_inbound_automation_load.py --issuer 15105 --year 2025 --month 10 --load"
         )
     if len(modes) > 1:
         raise SystemExit(f"Error: mutually exclusive modes: {', '.join(modes)}")
 
-    if args.load:
-        raise SystemExit(
-            "Error: --load is not implemented yet (Phase 2+). Phase 2A supports --create-table only."
-        )
-
-    # Phase 2A (--create-table) does not require year/month filters.
-    if args.dry_run:
+    if args.dry_run or args.load:
         if not args.all_years and not args.year:
             raise SystemExit("Error: --year is required unless --all-years is set.")
 
@@ -122,8 +119,40 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.source == "sftp":
         raise SystemExit("Error: --source sftp is not implemented.")
 
-    if "dry_run" not in SUPPORTED_MODES and args.dry_run:
-        raise SystemExit("Error: dry-run mode is not enabled in this build.")
+
+def _print_run_header(context: LoadRunContext, *, azure_writes: str) -> None:
+    issuer_filter = context.issuer_filter
+    print(f"\nINBOUND AUTOMATION — {context.run_mode.upper().replace('_', ' ')}")
+    print(f"  load_run_id     : {context.load_run_id}")
+    print(f"  year filter     : {context.year_filter or 'ALL'}")
+    print(f"  issuer filter   : {', '.join(issuer_filter) if issuer_filter else 'ALL'}")
+    print(f"  month filter    : {context.month_filter or 'ALL'}")
+    print(f"  output dir      : {context.output_dir}")
+    print(f"  Azure writes    : {azure_writes}")
+    print("  Parser834       : unmodified raw parse")
+
+
+def _print_run_footer(result) -> int:
+    ctx = result.context
+    print("\nRun complete.")
+    print(f"  Files discovered        : {result.files_discovered}")
+    print(f"  Files parsed            : {result.files_parsed}")
+    print(f"  Files loaded            : {result.files_loaded}")
+    print(f"  Files skipped (dup hash): {result.files_skipped_duplicate}")
+    print(f"  Files failed            : {result.files_failed}")
+    print(f"  Rows parsed             : {result.rows_parsed}")
+    print(f"  Rows inserted           : {result.rows_inserted}")
+    print(f"  Warnings (rows)         : {result.total_warning_count}")
+    print(f"  Reports                 : {ctx.output_dir}")
+
+    report_paths = write_run_reports(result)
+    for name, path in report_paths.items():
+        print(f"    {name}: {path}")
+
+    if result.files_discovered == 0:
+        print("\nNo source files matched filters.")
+        return 1
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -138,8 +167,9 @@ def main(argv: list[str] | None = None) -> int:
         return create_phase2a_tables(ddl_path=ddl_path, runner_name="inbound_automation_create_tables")
 
     issuer_filter = _parse_issuer_list(args.issuer)
+    run_mode = "load" if args.load else "dry_run"
     context = LoadRunContext.create(
-        run_mode="dry_run",
+        run_mode=run_mode,
         year_filter=args.year,
         all_years=args.all_years,
         issuer_filter=issuer_filter,
@@ -147,32 +177,17 @@ def main(argv: list[str] | None = None) -> int:
         source_mode=args.source,
     )
 
-    print("\nINBOUND AUTOMATION — DRY RUN (Phase 1)")
-    print(f"  load_run_id     : {context.load_run_id}")
-    print(f"  year filter     : {context.year_filter or 'ALL'}")
-    print(f"  issuer filter   : {', '.join(issuer_filter) if issuer_filter else 'ALL'}")
-    print(f"  month filter    : {context.month_filter or 'ALL'}")
-    print(f"  output dir      : {context.output_dir}")
-    print("  Azure writes    : NONE")
-    print("  Parser834       : unmodified raw parse")
+    if args.load:
+        _print_run_header(
+            context,
+            azure_writes="dbo.inbound_automation + run_log + file_log",
+        )
+        result = run_load(context)
+        return _print_run_footer(result)
 
+    _print_run_header(context, azure_writes="NONE")
     result = run_dry_run(context)
-    report_paths = write_dry_run_reports(result)
-
-    print("\nDry-run complete.")
-    print(f"  Files discovered : {result.files_discovered}")
-    print(f"  Files parsed     : {result.files_parsed}")
-    print(f"  Files failed     : {result.files_failed}")
-    print(f"  Rows parsed      : {result.rows_parsed}")
-    print(f"  Warnings (rows)  : {result.total_warning_count}")
-    print(f"  Reports          : {context.output_dir}")
-    for name, path in report_paths.items():
-        print(f"    {name}: {path}")
-
-    if result.files_discovered == 0:
-        print("\nNo source files matched filters.")
-        return 1
-    return 0
+    return _print_run_footer(result)
 
 
 if __name__ == "__main__":

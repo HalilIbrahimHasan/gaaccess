@@ -2,60 +2,27 @@
 
 Safety:
 - Executes only the approved DDL file `sql/inbound_automation_ddl.sql`.
-- No INSERT/UPDATE/DELETE.
+- No INSERT/UPDATE/DELETE (except none here).
 - No DROP/TRUNCATE/ALTER existing production tables (DDL uses IF NOT EXISTS).
 """
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
 from sqlalchemy.engine import Engine
 
-from azure_reconciliation.azure_client import (
-    azure_configured,
-    get_engine,
-    test_azure_connection_query,
- )
-from config.config import reload_env, settings
-
-
-TRUTHY = frozenset({"true", "1", "yes", "y", "t"})
-
-
-def _env_enabled() -> bool:
-    raw = os.getenv("INBOUND_AUTOMATION_ENABLED", "").strip().strip('"').strip("'")
-    if not raw:
-        return False
-    return raw.lower() in TRUTHY
-
-
-def _presence_flags() -> dict[str, bool]:
-    """
-    Presence flags for the *existing* Azure configuration variables.
-
-    Do not print values (avoid secrets). Only presence.
-    """
-    # Ensure .env is loaded/reloaded.
-    settings.refresh_from_env()
-    reload_env()
-    return {
-        "SERVER present": bool(os.getenv("SERVER", "").strip()),
-        "DATABASE present": bool(os.getenv("DATABASE", "").strip()),
-        "USERNAME present": bool(os.getenv("USERNAME", "").strip()),
-        "DRIVER present": bool(os.getenv("DRIVER", "").strip()),
-        "AZURE_SQL_SCHEMA present": bool(os.getenv("AZURE_SQL_SCHEMA", "").strip()),
-    }
+from inbound_automation.azure_common import (
+    INBOUND_TABLES,
+    connect_automation_engine,
+    require_env_gate,
+)
+from config.config import settings
 
 
 def _split_sql_batches(sql_text: str) -> list[str]:
-    """
-    Split SQL script into batches separated by a standalone `GO` line.
-
-    `GO` is not understood by SQL Server via raw ODBC, so we split batches.
-    """
+    """Split SQL script into batches separated by a standalone `GO` line."""
     batches: list[str] = []
     buf: list[str] = []
 
@@ -82,14 +49,15 @@ def _execute_ddl_file(*, engine: Engine, ddl_path: Path) -> None:
 
     with engine.connect() as conn:
         for i, batch in enumerate(batches, start=1):
-            # Use execute directly; SQL is pre-approved and parameterless.
             conn.exec_driver_sql(batch)
             print(f"Executed DDL batch {i}/{len(batches)}")
 
 
 def _table_exists_sql(schema: str, table: str) -> str:
-    # Use OBJECT_ID with schema-qualified name.
-    return f"SELECT CASE WHEN OBJECT_ID(N'{schema}.{table}', N'U') IS NULL THEN 0 ELSE 1 END AS exists_flag"
+    return (
+        f"SELECT CASE WHEN OBJECT_ID(N'{schema}.{table}', N'U') IS NULL "
+        f"THEN 0 ELSE 1 END AS exists_flag"
+    )
 
 
 def _row_count_sql(schema: str, table: str) -> str:
@@ -105,74 +73,39 @@ def _run_scalar(engine: Engine, sql: str) -> int:
 
 
 def create_phase2a_tables(*, ddl_path: Path, runner_name: str = "inbound_automation_phase2a") -> int:
-    # Always reload env/flags at runner start.
     settings.refresh_from_env()
+    require_env_gate("DDL")
 
-    if not _env_enabled():
-        print(
-            "INBOUND_AUTOMATION_ENABLED is missing or not 'true'. "
-            "Failing safely and not executing any Azure DDL.",
-            file=sys.stderr,
-        )
-        return 1
-
-    flags = _presence_flags()
-    print("Azure config presence (no secrets):")
-    for k, v in flags.items():
-        print(f"  {k}: {v}")
-
-    # Require the legacy/working Azure settings to be present before attempting login.
-    if not (flags["SERVER present"] and flags["DATABASE present"] and flags["USERNAME present"]):
-        print(
-            "Azure config missing: SERVER, DATABASE, and USERNAME are required for --create-table.",
-            file=sys.stderr,
-        )
-        return 1
-
-    # Use the existing Azure connection pattern from azure_client.py.
-    try:
-        engine = get_engine()
-        test_azure_connection_query(engine)  # forces interactive login
-    except Exception as exc:
-        print(f"Azure connection failed: {exc}", file=sys.stderr)
-        return 1
+    engine = connect_automation_engine()
 
     schema = "dbo"
-    tables = [
-        "inbound_automation",
-        "inbound_automation_run_log",
-        "inbound_automation_file_log",
-    ]
+    tables = list(INBOUND_TABLES)
 
     print("Pre-check table existence:")
     pre_exists: dict[str, int] = {}
-    for t in tables:
-        sql = _table_exists_sql(schema, t)
-        flag = _run_scalar(engine, sql)
-        pre_exists[t] = flag
+    for table in tables:
+        flag = _run_scalar(engine, _table_exists_sql(schema, table))
+        pre_exists[table] = flag
         state = "EXISTS" if flag else "MISSING"
-        print(f"  {schema}.{t}: {state}")
+        print(f"  {schema}.{table}: {state}")
 
     print(f"Executing approved DDL from: {ddl_path}")
     _execute_ddl_file(engine=engine, ddl_path=ddl_path)
 
     print("Post-check table existence + row counts:")
-    with engine.connect() as conn:
-        # Build a single query per table for clarity.
-        for t in tables:
-            exists_flag = _run_scalar(engine, _table_exists_sql(schema, t))
-            row_count = _run_scalar(engine, _row_count_sql(schema, t))
-            created_or_existing = (
-                "created (was missing)" if pre_exists.get(t, 0) == 0 and exists_flag == 1 else "already existed"
-            )
-            print(f"  {schema}.{t}: exists={exists_flag} row_count={row_count} ({created_or_existing})")
+    for table in tables:
+        exists_flag = _run_scalar(engine, _table_exists_sql(schema, table))
+        row_count = _run_scalar(engine, _row_count_sql(schema, table))
+        created_or_existing = (
+            "created (was missing)" if pre_exists.get(table, 0) == 0 and exists_flag == 1 else "already existed"
+        )
+        print(f"  {schema}.{table}: exists={exists_flag} row_count={row_count} ({created_or_existing})")
 
     print("\nVerification SQL (run manually in Azure if desired):")
-    for t in tables:
-        print(f"- Table exists: {schema}.{t}")
-        print(f"  {_table_exists_sql(schema, t)}")
-        print(f"- Row count (should be 0 for fresh tables): {schema}.{t}")
-        print(f"  {_row_count_sql(schema, t)}")
+    for table in tables:
+        print(f"- Table exists: {schema}.{table}")
+        print(f"  {_table_exists_sql(schema, table)}")
+        print(f"- Row count (should be 0 for fresh tables): {schema}.{table}")
+        print(f"  {_row_count_sql(schema, table)}")
 
     return 0
-

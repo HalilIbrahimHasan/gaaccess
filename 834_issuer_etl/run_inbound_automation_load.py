@@ -2,13 +2,15 @@
 """
 Inbound automation loader — Parser834 raw ingestion to Azure SQL.
 
-Phase 1: dry-run only (discover, parse, enrich, Excel reports).
-No Azure connection, no DDL, no database writes.
+Phase 1: dry-run (discover, parse, enrich, Excel reports).
+Phase 2A: --create-table (DBA or automation DDL).
+Phase 2B: --load (insert to inbound_automation tables only).
 
 Examples:
     python run_inbound_automation_load.py --year 2025 --dry-run
     python run_inbound_automation_load.py --issuer 15105 --year 2025 --month 10 --dry-run
-    python run_inbound_automation_load.py --all-years --dry-run
+    python run_inbound_automation_load.py --issuer 15105 --year 2025 --month 10 --load
+    python run_inbound_automation_load.py --year 2025 --load
 """
 
 from __future__ import annotations

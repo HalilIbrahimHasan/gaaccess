@@ -8,7 +8,7 @@ from typing import Any
 import pandas as pd
 
 from azure_reconciliation.safe_export import safe_write_excel
-from inbound_automation.pipeline import DryRunResult
+from inbound_automation.pipeline import RunResult
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -142,7 +142,7 @@ def build_filename_month_summary(rows: list[dict[str, Any]]) -> pd.DataFrame:
     )
 
 
-def build_failed_files(result: DryRunResult) -> pd.DataFrame:
+def build_failed_files(result: RunResult) -> pd.DataFrame:
     rows = [
         {
             "source_file": f.source.file_name,
@@ -173,20 +173,34 @@ def build_failed_files(result: DryRunResult) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def build_skipped_duplicate_files() -> pd.DataFrame:
-    """Phase 1 dry-run has no Azure file_log — duplicates not evaluated yet."""
-    return _empty(
-        [
-            "source_file",
-            "file_hash",
-            "reason",
-            "prior_load_run_id",
-            "note",
-        ]
-    )
+def build_skipped_duplicate_files(result: RunResult) -> pd.DataFrame:
+    rows = [
+        {
+            "source_file": f.source.file_name,
+            "source_file_path": str(f.source.file_path),
+            "issuer": f.source.issuer,
+            "file_hash": f.file_hash,
+            "reason": "file_hash already loaded",
+            "prior_load_run_id": f.prior_load_run_id or "",
+        }
+        for f in result.file_results
+        if f.parse_status == "skipped_duplicate"
+    ]
+    if not rows:
+        return _empty(
+            [
+                "source_file",
+                "source_file_path",
+                "issuer",
+                "file_hash",
+                "reason",
+                "prior_load_run_id",
+            ]
+        )
+    return pd.DataFrame(rows)
 
 
-def build_dry_run_manifest(result: DryRunResult) -> pd.DataFrame:
+def build_dry_run_manifest(result: RunResult) -> pd.DataFrame:
     rows = [
         {
             "source_file": f.source.file_name,
@@ -230,9 +244,10 @@ def build_dry_run_manifest(result: DryRunResult) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def build_run_summary(result: DryRunResult) -> pd.DataFrame:
+def build_run_summary(result: RunResult) -> pd.DataFrame:
     ctx = result.context
     elapsed_s = (result.completed_at - ctx.started_at).total_seconds()
+    is_load = ctx.run_mode == "load"
     row = {
         "load_run_id": ctx.load_run_id,
         "run_mode": ctx.run_mode,
@@ -249,19 +264,20 @@ def build_run_summary(result: DryRunResult) -> pd.DataFrame:
         "files_discovered": result.files_discovered,
         "files_parsed": result.files_parsed,
         "files_failed": result.files_failed,
-        "files_skipped_duplicate": 0,
+        "files_skipped_duplicate": result.files_skipped_duplicate,
+        "files_loaded": result.files_loaded if is_load else 0,
         "rows_parsed": result.rows_parsed,
-        "rows_inserted": 0,
+        "rows_inserted": result.rows_inserted if is_load else 0,
         "total_warning_count": result.total_warning_count,
-        "azure_writes": "NONE (dry-run)",
-        "status": "dry_run",
+        "azure_writes": "LOAD (inbound_automation tables only)" if is_load else "NONE (dry-run)",
+        "status": "success" if is_load else "dry_run",
         "report_output_path": str(ctx.output_dir),
     }
     return pd.DataFrame([row])
 
 
-def write_dry_run_reports(result: DryRunResult) -> dict[str, Path]:
-    """Write all Phase 1 Excel reports; return path map."""
+def write_run_reports(result: RunResult) -> dict[str, Path]:
+    """Write Excel reports for dry-run or load; return path map."""
     out = result.context.output_dir
     paths = {
         "run_summary": out / "run_summary.xlsx",
@@ -301,12 +317,7 @@ def write_dry_run_reports(result: DryRunResult) -> dict[str, Path]:
     )
     safe_write_excel(
         paths["skipped_duplicate"],
-        {
-            "skipped_duplicate": build_skipped_duplicate_files(),
-            "note": pd.DataFrame(
-                [{"note": "Phase 1 dry-run: duplicate skip requires Azure file_log (Phase 2+)."}]
-            ),
-        },
+        {"skipped_duplicate": build_skipped_duplicate_files(result)},
         drop_duplicate_value_columns=False,
     )
     safe_write_excel(
@@ -317,3 +328,7 @@ def write_dry_run_reports(result: DryRunResult) -> dict[str, Path]:
 
     logger.info("Wrote inbound automation reports to %s", out)
     return paths
+
+
+# Backward-compatible alias.
+write_dry_run_reports = write_run_reports

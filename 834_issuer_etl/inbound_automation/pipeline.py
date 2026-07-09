@@ -1,4 +1,4 @@
-"""Dry-run pipeline — discover, parse, enrich (no Azure writes)."""
+"""Inbound automation pipeline — discover, parse, enrich, optional Azure load."""
 
 from __future__ import annotations
 
@@ -32,16 +32,18 @@ class FileProcessResult:
     filename_file_year: int | None = None
     filename_file_month: int | None = None
     error_message: str | None = None
+    prior_load_run_id: str | None = None
     warnings: list[str] = field(default_factory=list)
     rows: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
-class DryRunResult:
+class RunResult:
     context: LoadRunContext
     file_results: list[FileProcessResult]
     enriched_rows: list[dict[str, Any]]
     completed_at: datetime
+    rows_inserted: int = 0
 
     @property
     def files_discovered(self) -> int:
@@ -49,7 +51,18 @@ class DryRunResult:
 
     @property
     def files_parsed(self) -> int:
-        return sum(1 for f in self.file_results if f.parse_status == "parsed")
+        return sum(
+            1 for f in self.file_results
+            if f.parse_status in ("parsed", "loaded")
+        )
+
+    @property
+    def files_loaded(self) -> int:
+        return sum(1 for f in self.file_results if f.parse_status == "loaded")
+
+    @property
+    def files_skipped_duplicate(self) -> int:
+        return sum(1 for f in self.file_results if f.parse_status == "skipped_duplicate")
 
     @property
     def files_failed(self) -> int:
@@ -62,6 +75,10 @@ class DryRunResult:
     @property
     def total_warning_count(self) -> int:
         return sum(int(r.get("warning_count") or 0) for r in self.enriched_rows)
+
+
+# Backward-compatible alias used by reports module.
+DryRunResult = RunResult
 
 
 def _process_file(
@@ -134,7 +151,7 @@ def _process_file(
         )
 
 
-def run_dry_run(context: LoadRunContext) -> DryRunResult:
+def run_dry_run(context: LoadRunContext) -> RunResult:
     """
     Execute Phase 1 dry-run: discover, parse, enrich.
 
@@ -168,9 +185,152 @@ def run_dry_run(context: LoadRunContext) -> DryRunResult:
         file_results.append(result)
         enriched_rows.extend(result.rows)
 
-    return DryRunResult(
+    return RunResult(
         context=context,
         file_results=file_results,
         enriched_rows=enriched_rows,
         completed_at=datetime.now(timezone.utc),
+    )
+
+
+def run_load(context: LoadRunContext) -> RunResult:
+    """
+    Execute Phase 2B load: discover, parse, enrich, insert to Azure.
+
+    Writes only to inbound_automation, inbound_automation_run_log,
+    and inbound_automation_file_log.
+    """
+    from inbound_automation.azure_common import connect_automation_engine, require_env_gate
+    from inbound_automation.azure_writer import (
+        fetch_loaded_file_hashes,
+        insert_file_log,
+        insert_run_log_start,
+        load_file_rows,
+        update_run_log_finish,
+        verify_tables_exist,
+    )
+
+    require_env_gate("load")
+    settings.refresh_from_env()
+
+    engine = connect_automation_engine()
+    verify_tables_exist(engine)
+
+    loaded_hashes = fetch_loaded_file_hashes(engine)
+    logger.info("Found %d previously loaded file_hash value(s) in file_log", len(loaded_hashes))
+
+    insert_run_log_start(engine, context)
+
+    source_root = settings.source_data_path
+    cli_year = None if context.all_years else context.year_filter
+    sources = discover_for_run(
+        source_root,
+        year_filter=context.year_filter,
+        all_years=context.all_years,
+        issuer_filter=context.issuer_filter,
+        month_filter=context.month_filter,
+    )
+
+    parser = Parser834()
+    loaded_at = datetime.now(timezone.utc)
+    file_results: list[FileProcessResult] = []
+    enriched_rows: list[dict[str, Any]] = []
+    rows_inserted = 0
+    run_error: str | None = None
+
+    try:
+        for source in sources:
+            fhash = file_hash(source.file_path)
+            if fhash in loaded_hashes:
+                file_results.append(
+                    FileProcessResult(
+                        source=source,
+                        file_hash=fhash,
+                        parse_status="skipped_duplicate",
+                        prior_load_run_id=loaded_hashes[fhash],
+                    )
+                )
+                continue
+
+            result = _process_file(
+                source,
+                parser=parser,
+                context=context,
+                cli_year=cli_year,
+                loaded_at=loaded_at,
+            )
+
+            if result.parse_status == "parsed" and result.rows:
+                try:
+                    inserted = load_file_rows(
+                        engine, context, result, loaded_at=loaded_at,
+                    )
+                    rows_inserted += inserted
+                    enriched_rows.extend(result.rows)
+                    loaded_hashes[fhash] = context.load_run_id
+                except Exception as exc:
+                    result.parse_status = "failed"
+                    result.error_message = f"{source.file_path}: Azure insert failed: {exc}"
+                    logger.error("Azure insert failed for %s: %s", source.file_name, exc)
+                    try:
+                        insert_file_log(engine, context, result, loaded_at=loaded_at)
+                    except Exception as log_exc:
+                        logger.error("Could not write file_log for %s: %s", source.file_name, log_exc)
+            elif result.parse_status == "parsed":
+                result.parse_status = "loaded"
+                try:
+                    insert_file_log(engine, context, result, loaded_at=loaded_at)
+                except Exception as log_exc:
+                    logger.error("Could not write file_log for %s: %s", source.file_name, log_exc)
+            elif result.parse_status == "failed":
+                try:
+                    insert_file_log(engine, context, result, loaded_at=loaded_at)
+                except Exception as log_exc:
+                    logger.error("Could not write file_log for %s: %s", source.file_name, log_exc)
+
+            file_results.append(result)
+
+    except Exception as exc:
+        run_error = str(exc)
+        logger.exception("Load run failed: %s", exc)
+    finally:
+        completed_at = datetime.now(timezone.utc)
+        status = "failed" if run_error else "success"
+        stats = {
+            "files_discovered": len(file_results),
+            "files_parsed": sum(
+                1 for f in file_results if f.parse_status != "skipped_duplicate"
+            ),
+            "files_loaded": sum(1 for f in file_results if f.parse_status == "loaded"),
+            "files_skipped_duplicate": sum(
+                1 for f in file_results if f.parse_status == "skipped_duplicate"
+            ),
+            "files_failed": sum(1 for f in file_results if f.parse_status == "failed"),
+            "rows_parsed": len(enriched_rows),
+            "rows_inserted": rows_inserted,
+            "rows_skipped": sum(
+                r.row_count for r in file_results if r.parse_status == "skipped_duplicate"
+            ),
+            "total_warning_count": sum(
+                int(r.get("warning_count") or 0) for r in enriched_rows
+            ),
+        }
+        try:
+            update_run_log_finish(
+                engine,
+                context,
+                completed_at=completed_at,
+                stats=stats,
+                status=status,
+                error_summary=run_error,
+            )
+        except Exception as log_exc:
+            logger.error("Could not update run_log: %s", log_exc)
+
+    return RunResult(
+        context=context,
+        file_results=file_results,
+        enriched_rows=enriched_rows,
+        completed_at=datetime.now(timezone.utc),
+        rows_inserted=rows_inserted,
     )
