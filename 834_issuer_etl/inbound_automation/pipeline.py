@@ -209,10 +209,10 @@ def run_load(context: LoadRunContext) -> RunResult:
     )
     from inbound_automation.azure_writer import (
         fetch_loaded_file_hashes,
-        insert_file_log,
         insert_run_log_start,
         load_file_rows,
         update_run_log_finish,
+        upsert_file_log,
         verify_tables_exist,
     )
 
@@ -282,18 +282,18 @@ def run_load(context: LoadRunContext) -> RunResult:
                     result.error_message = f"{source.file_path}: Azure insert failed: {exc}"
                     logger.error("Azure insert failed for %s: %s", source.file_name, exc)
                     try:
-                        insert_file_log(engine, context, result, loaded_at=loaded_at)
+                        upsert_file_log(engine, context, result, loaded_at=loaded_at)
                     except Exception as log_exc:
                         logger.error("Could not write file_log for %s: %s", source.file_name, log_exc)
             elif result.parse_status == "parsed":
                 result.parse_status = "loaded"
                 try:
-                    insert_file_log(engine, context, result, loaded_at=loaded_at)
+                    upsert_file_log(engine, context, result, loaded_at=loaded_at)
                 except Exception as log_exc:
                     logger.error("Could not write file_log for %s: %s", source.file_name, log_exc)
             elif result.parse_status == "failed":
                 try:
-                    insert_file_log(engine, context, result, loaded_at=loaded_at)
+                    upsert_file_log(engine, context, result, loaded_at=loaded_at)
                 except Exception as log_exc:
                     logger.error("Could not write file_log for %s: %s", source.file_name, log_exc)
 

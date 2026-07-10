@@ -233,27 +233,47 @@ def update_run_log_finish(
         conn.execute(sql, params)
 
 
-def insert_file_log(
-    engine: Engine,
+_FILE_LOG_INSERT_SQL = text(f"""
+    INSERT INTO [{SCHEMA}].[inbound_automation_file_log] (
+        load_run_id, loaded_at, issuer, folder_year, folder_month,
+        filename_file_year, filename_file_month,
+        source_file, source_file_path, file_hash, file_size_bytes,
+        parse_status, row_count, parse_duration_ms, error_message
+    ) VALUES (
+        :load_run_id, :loaded_at, :issuer, :folder_year, :folder_month,
+        :filename_file_year, :filename_file_month,
+        :source_file, :source_file_path, :file_hash, :file_size_bytes,
+        :parse_status, :row_count, :parse_duration_ms, :error_message
+    )
+""")
+
+_FILE_LOG_UPDATE_SQL = text(f"""
+    UPDATE [{SCHEMA}].[inbound_automation_file_log]
+    SET load_run_id = :load_run_id,
+        loaded_at = :loaded_at,
+        issuer = :issuer,
+        folder_year = :folder_year,
+        folder_month = :folder_month,
+        filename_file_year = :filename_file_year,
+        filename_file_month = :filename_file_month,
+        source_file = :source_file,
+        source_file_path = :source_file_path,
+        file_size_bytes = :file_size_bytes,
+        parse_status = :parse_status,
+        row_count = :row_count,
+        parse_duration_ms = :parse_duration_ms,
+        error_message = :error_message
+    WHERE file_hash = :file_hash
+""")
+
+
+def _file_log_params(
     context: LoadRunContext,
     result: FileProcessResult,
     *,
     loaded_at: datetime,
-) -> None:
-    sql = text(f"""
-        INSERT INTO [{SCHEMA}].[inbound_automation_file_log] (
-            load_run_id, loaded_at, issuer, folder_year, folder_month,
-            filename_file_year, filename_file_month,
-            source_file, source_file_path, file_hash, file_size_bytes,
-            parse_status, row_count, parse_duration_ms, error_message
-        ) VALUES (
-            :load_run_id, :loaded_at, :issuer, :folder_year, :folder_month,
-            :filename_file_year, :filename_file_month,
-            :source_file, :source_file_path, :file_hash, :file_size_bytes,
-            :parse_status, :row_count, :parse_duration_ms, :error_message
-        )
-    """)
-    params = {
+) -> dict[str, Any]:
+    return {
         "load_run_id": context.load_run_id,
         "loaded_at": loaded_at,
         "issuer": result.source.issuer,
@@ -270,8 +290,50 @@ def insert_file_log(
         "parse_duration_ms": result.parse_duration_ms,
         "error_message": result.error_message,
     }
+
+
+def _file_log_exists(conn, file_hash: str) -> bool:
+    row = conn.execute(
+        text(
+            f"SELECT 1 FROM [{SCHEMA}].[inbound_automation_file_log] "
+            f"WHERE file_hash = :file_hash"
+        ),
+        {"file_hash": file_hash},
+    ).fetchone()
+    return row is not None
+
+
+def _write_file_log(conn, params: dict[str, Any], *, exists: bool) -> None:
+    """Insert or update file_log by file_hash (never duplicate INSERT)."""
+    if exists:
+        conn.execute(_FILE_LOG_UPDATE_SQL, params)
+    else:
+        conn.execute(_FILE_LOG_INSERT_SQL, params)
+
+
+def upsert_file_log(
+    engine: Engine,
+    context: LoadRunContext,
+    result: FileProcessResult,
+    *,
+    loaded_at: datetime,
+) -> None:
+    """Write file_log outside a load transaction (retry-safe upsert)."""
+    params = _file_log_params(context, result, loaded_at=loaded_at)
     with engine.begin() as conn:
-        conn.execute(sql, params)
+        exists = _file_log_exists(conn, result.file_hash)
+        _write_file_log(conn, params, exists=exists)
+
+
+def insert_file_log(
+    engine: Engine,
+    context: LoadRunContext,
+    result: FileProcessResult,
+    *,
+    loaded_at: datetime,
+) -> None:
+    """Backward-compatible alias for upsert_file_log."""
+    upsert_file_log(engine, context, result, loaded_at=loaded_at)
 
 
 def _build_row_insert_sql() -> text:
@@ -328,42 +390,21 @@ def load_file_rows(
 
     if not result.rows:
         result.parse_status = "loaded"
-        insert_file_log(engine, context, result, loaded_at=loaded_at)
+        result.row_count = 0
+        result.error_message = None
+        file_params = _file_log_params(context, result, loaded_at=loaded_at)
+        with engine.begin() as conn:
+            exists = _file_log_exists(conn, result.file_hash)
+            _write_file_log(conn, file_params, exists=exists)
         metrics.load_duration_ms = int((time.perf_counter() - t_load_start) * 1000)
         return 0, metrics
 
     row_sql = _build_row_insert_sql()
-    file_sql = text(f"""
-        INSERT INTO [{SCHEMA}].[inbound_automation_file_log] (
-            load_run_id, loaded_at, issuer, folder_year, folder_month,
-            filename_file_year, filename_file_month,
-            source_file, source_file_path, file_hash, file_size_bytes,
-            parse_status, row_count, parse_duration_ms, error_message
-        ) VALUES (
-            :load_run_id, :loaded_at, :issuer, :folder_year, :folder_month,
-            :filename_file_year, :filename_file_month,
-            :source_file, :source_file_path, :file_hash, :file_size_bytes,
-            :parse_status, :row_count, :parse_duration_ms, :error_message
-        )
-    """)
     row_count = len(result.rows)
-    file_params = {
-        "load_run_id": context.load_run_id,
-        "loaded_at": loaded_at,
-        "issuer": result.source.issuer,
-        "folder_year": int(result.source.year),
-        "folder_month": int(result.source.month),
-        "filename_file_year": result.filename_file_year,
-        "filename_file_month": result.filename_file_month,
-        "source_file": result.source.file_name,
-        "source_file_path": str(result.source.file_path),
-        "file_hash": result.file_hash,
-        "file_size_bytes": result.source.file_size,
-        "parse_status": "loaded",
-        "row_count": row_count,
-        "parse_duration_ms": result.parse_duration_ms,
-        "error_message": result.error_message,
-    }
+    result.parse_status = "loaded"
+    result.row_count = row_count
+    result.error_message = None
+    file_params = _file_log_params(context, result, loaded_at=loaded_at)
 
     batch_durations: list[float] = []
     file_log_duration_sec = 0.0
@@ -372,7 +413,8 @@ def load_file_rows(
             conn, row_sql, result.rows, bs=bs,
         )
         t_file_log = time.perf_counter()
-        conn.execute(file_sql, file_params)
+        exists = _file_log_exists(conn, result.file_hash)
+        _write_file_log(conn, file_params, exists=exists)
         file_log_duration_sec = time.perf_counter() - t_file_log
 
     load_duration_sec = time.perf_counter() - t_load_start
@@ -394,8 +436,6 @@ def load_file_rows(
     if insert_sql_sec > 0:
         metrics.rows_per_sec = round(row_count / insert_sql_sec, 2)
 
-    result.parse_status = "loaded"
-    result.row_count = row_count
     logger.info(
         "Loaded %s: %d rows in %d batches (batch_size=%d) — "
         "%.0f rows/sec SQL, load=%dms (sql=%dms commit=%dms)",
