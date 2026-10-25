@@ -1,0 +1,166 @@
+-- =============================================================================
+-- SCENARIO B VALIDATION — issuer breakdown + A vs B Pending delta
+-- =============================================================================
+-- Population under review (NOT locked yet):
+--   coverage_year = 2026
+--   AND enrollment_status_description IN ('Enrolled', 'Pending')
+--
+-- Safety: READ ONLY. No reconciliation. No RCNI. No permanent DDL/DML.
+-- =============================================================================
+
+SET NOCOUNT ON;
+
+DECLARE @coverage_year INT = 2026;
+
+-- -----------------------------------------------------------------------------
+-- 1) Scenario B by hios_issuer_id
+-- -----------------------------------------------------------------------------
+SELECT
+    e.hios_issuer_id,
+    COUNT(*) AS raw_rows,
+    COUNT(DISTINCT CAST(e.coverage_year AS VARCHAR(10)) + '|'
+                 + CAST(e.enrollment_id AS VARCHAR(50)) + '|'
+                 + CAST(e.enrollee_id AS VARCHAR(50))) AS distinct_policy_enrollee_pairs,
+    COUNT(DISTINCT e.enrollment_id) AS distinct_enrollment_id,
+    COUNT(DISTINCT e.enrollee_id) AS distinct_enrollee_id,
+    SUM(CASE WHEN UPPER(LTRIM(RTRIM(e.enrollment_status_description))) = 'ENROLLED'
+             THEN 1 ELSE 0 END) AS enrolled_raw_rows,
+    SUM(CASE WHEN UPPER(LTRIM(RTRIM(e.enrollment_status_description))) = 'PENDING'
+             THEN 1 ELSE 0 END) AS pending_raw_rows,
+    COUNT(DISTINCT CASE WHEN UPPER(LTRIM(RTRIM(e.enrollment_status_description))) = 'ENROLLED'
+        THEN CAST(e.coverage_year AS VARCHAR(10)) + '|'
+           + CAST(e.enrollment_id AS VARCHAR(50)) + '|'
+           + CAST(e.enrollee_id AS VARCHAR(50)) END) AS enrolled_distinct_pairs,
+    COUNT(DISTINCT CASE WHEN UPPER(LTRIM(RTRIM(e.enrollment_status_description))) = 'PENDING'
+        THEN CAST(e.coverage_year AS VARCHAR(10)) + '|'
+           + CAST(e.enrollment_id AS VARCHAR(50)) + '|'
+           + CAST(e.enrollee_id AS VARCHAR(50)) END) AS pending_distinct_pairs
+FROM dbo.Enrollments_TEST AS e
+WHERE e.coverage_year = @coverage_year
+  AND UPPER(LTRIM(RTRIM(e.enrollment_status_description))) IN ('ENROLLED', 'PENDING')
+GROUP BY e.hios_issuer_id
+ORDER BY raw_rows DESC;
+
+
+-- -----------------------------------------------------------------------------
+-- 2) Complete distinct issuer list for Scenario B (+ TOTAL row)
+-- -----------------------------------------------------------------------------
+SELECT
+    issuer_sort,
+    hios_issuer_id,
+    raw_rows
+FROM (
+    SELECT
+        0 AS issuer_sort,
+        CAST(e.hios_issuer_id AS VARCHAR(20)) AS hios_issuer_id,
+        COUNT(*) AS raw_rows
+    FROM dbo.Enrollments_TEST AS e
+    WHERE e.coverage_year = @coverage_year
+      AND UPPER(LTRIM(RTRIM(e.enrollment_status_description))) IN ('ENROLLED', 'PENDING')
+    GROUP BY e.hios_issuer_id
+
+    UNION ALL
+
+    SELECT
+        1 AS issuer_sort,
+        'TOTAL' AS hios_issuer_id,
+        COUNT(*) AS raw_rows
+    FROM dbo.Enrollments_TEST AS e
+    WHERE e.coverage_year = @coverage_year
+      AND UPPER(LTRIM(RTRIM(e.enrollment_status_description))) IN ('ENROLLED', 'PENDING')
+) AS x
+ORDER BY issuer_sort, raw_rows DESC;
+
+
+-- -----------------------------------------------------------------------------
+-- 3) Scenario A vs Scenario B by issuer (Pending delta)
+-- -----------------------------------------------------------------------------
+;WITH base AS (
+    SELECT
+        hios_issuer_id,
+        coverage_year,
+        enrollment_id,
+        enrollee_id,
+        UPPER(LTRIM(RTRIM(enrollment_status_description))) AS enr_status
+    FROM dbo.Enrollments_TEST
+    WHERE coverage_year = @coverage_year
+      AND UPPER(LTRIM(RTRIM(enrollment_status_description))) IN ('ENROLLED', 'PENDING')
+)
+SELECT
+    hios_issuer_id,
+    /* Scenario A = Enrolled only */
+    SUM(CASE WHEN enr_status = 'ENROLLED' THEN 1 ELSE 0 END) AS scenario_a_raw_rows,
+    COUNT(DISTINCT CASE WHEN enr_status = 'ENROLLED'
+        THEN CAST(coverage_year AS VARCHAR(10)) + '|'
+           + CAST(enrollment_id AS VARCHAR(50)) + '|'
+           + CAST(enrollee_id AS VARCHAR(50)) END) AS scenario_a_distinct_pairs,
+    /* Scenario B = Enrolled + Pending */
+    COUNT(*) AS scenario_b_raw_rows,
+    COUNT(DISTINCT CAST(coverage_year AS VARCHAR(10)) + '|'
+                 + CAST(enrollment_id AS VARCHAR(50)) + '|'
+                 + CAST(enrollee_id AS VARCHAR(50))) AS scenario_b_distinct_pairs,
+    /* Pending-only contribution (B - A) */
+    SUM(CASE WHEN enr_status = 'PENDING' THEN 1 ELSE 0 END) AS pending_raw_rows_added,
+    COUNT(DISTINCT CASE WHEN enr_status = 'PENDING'
+        THEN CAST(coverage_year AS VARCHAR(10)) + '|'
+           + CAST(enrollment_id AS VARCHAR(50)) + '|'
+           + CAST(enrollee_id AS VARCHAR(50)) END) AS pending_distinct_pairs_added
+FROM base
+GROUP BY hios_issuer_id
+ORDER BY pending_raw_rows_added DESC, scenario_b_raw_rows DESC;
+
+
+-- -----------------------------------------------------------------------------
+-- 4) Reference checklist of issuers commonly seen in this project
+--     Compare against Result Set 1/2 to spot absences.
+--     This is a REVIEW AID only — not proof of the official issuer list.
+-- -----------------------------------------------------------------------------
+IF OBJECT_ID('tempdb..#scenario_b_issuers') IS NOT NULL DROP TABLE #scenario_b_issuers;
+IF OBJECT_ID('tempdb..#reference_issuers') IS NOT NULL DROP TABLE #reference_issuers;
+
+SELECT DISTINCT CAST(hios_issuer_id AS VARCHAR(20)) AS hios_issuer_id
+INTO #scenario_b_issuers
+FROM dbo.Enrollments_TEST
+WHERE coverage_year = @coverage_year
+  AND UPPER(LTRIM(RTRIM(enrollment_status_description))) IN ('ENROLLED', 'PENDING');
+
+SELECT v.hios_issuer_id, v.note
+INTO #reference_issuers
+FROM (VALUES
+    ('15105', 'Cigna — seen in Swathi sample'),
+    ('37001', 'seen in prior inbound extracts'),
+    ('37301', 'EMI / prior 37301 reconciliation focus'),
+    ('43802', 'UnitedHealthcare — seen in Swathi sample'),
+    ('45334', 'Anthem Blue Value — seen in Swathi sample'),
+    ('49046', 'Anthem Pathway — seen in Swathi sample'),
+    ('58081', 'Oscar — seen in Swathi sample'),
+    ('60224', 'CareSource — seen in Swathi sample'),
+    ('68806', 'Dental — Sisense reference'),
+    ('70893', 'Ambetter / Peach State — seen in Swathi sample'),
+    ('82824', 'seen in prior inbound extracts'),
+    ('83502', 'Best Life Dental — Sisense/Best Life work'),
+    ('83761', 'Alliant — seen in Swathi sample'),
+    ('86637', 'seen in prior inbound extracts'),
+    ('89942', 'Kaiser — seen in Swathi sample')
+) AS v(hios_issuer_id, note);
+
+SELECT
+    r.hios_issuer_id,
+    r.note AS reference_note,
+    CASE WHEN b.hios_issuer_id IS NULL THEN 'ABSENT_FROM_SCENARIO_B' ELSE 'PRESENT_IN_SCENARIO_B' END AS scenario_b_presence
+FROM #reference_issuers AS r
+LEFT JOIN #scenario_b_issuers AS b
+    ON b.hios_issuer_id = r.hios_issuer_id
+ORDER BY
+    CASE WHEN b.hios_issuer_id IS NULL THEN 0 ELSE 1 END,
+    r.hios_issuer_id;
+
+-- Issuers present in Scenario B but not in the reference checklist above
+SELECT
+    b.hios_issuer_id,
+    'IN_SCENARIO_B_NOT_IN_REFERENCE_CHECKLIST' AS flag
+FROM #scenario_b_issuers AS b
+WHERE NOT EXISTS (
+    SELECT 1 FROM #reference_issuers AS r WHERE r.hios_issuer_id = b.hios_issuer_id
+)
+ORDER BY b.hios_issuer_id;

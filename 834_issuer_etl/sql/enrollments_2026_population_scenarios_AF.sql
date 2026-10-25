@@ -1,0 +1,213 @@
+-- =============================================================================
+-- POPULATION DISCOVERY ONLY — dbo.Enrollments_TEST coverage_year = 2026
+-- =============================================================================
+-- Goal: identify which status definition reproduces Swathi's ~950K population.
+-- Safety: READ ONLY. No reconciliation joins. No RCNI. No permanent DDL/DML.
+--
+-- Sample observation (format only — not the input file):
+--   enrollment_status_description = Enrolled
+--   enrollee_status_description   = Terminated
+-- Therefore AND(Enrolled/Pending on both columns) is unlikely to be correct,
+-- but we still report all scenarios before choosing.
+-- =============================================================================
+
+SET NOCOUNT ON;
+
+DECLARE @coverage_year INT = 2026;
+
+-- -----------------------------------------------------------------------------
+-- 0) Schema check: plan_name / insurer_name on Enrollments_TEST
+-- -----------------------------------------------------------------------------
+SELECT
+    'dbo.Enrollments_TEST' AS table_name,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'Enrollments_TEST'
+          AND COLUMN_NAME = 'plan_name'
+    ) THEN 'EXISTS' ELSE 'MISSING' END AS plan_name_status,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'Enrollments_TEST'
+          AND COLUMN_NAME = 'insurer_name'
+    ) THEN 'EXISTS' ELSE 'MISSING' END AS insurer_name_status;
+
+-- If missing on Enrollments_TEST, list other dbo tables that have these columns
+SELECT
+    TABLE_SCHEMA,
+    TABLE_NAME,
+    COLUMN_NAME,
+    DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'dbo'
+  AND COLUMN_NAME IN ('plan_name', 'insurer_name')
+ORDER BY TABLE_NAME, COLUMN_NAME;
+
+
+-- -----------------------------------------------------------------------------
+-- 1) Complete status combination inventory (coverage_year = 2026)
+-- -----------------------------------------------------------------------------
+SELECT
+    enrollment_status_description,
+    enrollee_status_description,
+    COUNT(*) AS raw_rows,
+    COUNT(DISTINCT CAST(coverage_year AS VARCHAR(10)) + '|'
+                 + CAST(enrollment_id AS VARCHAR(50)) + '|'
+                 + CAST(enrollee_id AS VARCHAR(50))) AS distinct_pairs,
+    COUNT(DISTINCT enrollment_id) AS distinct_enrollment_id,
+    COUNT(DISTINCT enrollee_id) AS distinct_enrollee_id,
+    COUNT(DISTINCT hios_issuer_id) AS distinct_issuers
+FROM dbo.Enrollments_TEST
+WHERE coverage_year = @coverage_year
+GROUP BY
+    enrollment_status_description,
+    enrollee_status_description
+ORDER BY raw_rows DESC;
+
+
+-- -----------------------------------------------------------------------------
+-- 2) Scenario counts A–F
+-- -----------------------------------------------------------------------------
+;WITH base AS (
+    SELECT
+        coverage_year,
+        enrollment_id,
+        enrollee_id,
+        hios_issuer_id,
+        UPPER(LTRIM(RTRIM(enrollment_status_description))) AS enr_status,
+        UPPER(LTRIM(RTRIM(enrollee_status_description)))   AS eel_status
+    FROM dbo.Enrollments_TEST
+    WHERE coverage_year = @coverage_year
+),
+flagged AS (
+    SELECT
+        *,
+        CASE WHEN enr_status = 'ENROLLED' THEN 1 ELSE 0 END AS a_enrolled_only,
+        CASE WHEN enr_status IN ('ENROLLED', 'PENDING') THEN 1 ELSE 0 END AS b_enr_enrolled_pending,
+        CASE WHEN enr_status IN ('ENROLLED', 'PENDING', 'PEND') THEN 1 ELSE 0 END AS c_enr_enrolled_pending_pend,
+        CASE WHEN eel_status IN ('ENROLLED', 'PENDING') THEN 1 ELSE 0 END AS d_eel_enrolled_pending,
+        CASE WHEN enr_status IN ('ENROLLED', 'PENDING')
+               OR eel_status IN ('ENROLLED', 'PENDING') THEN 1 ELSE 0 END AS e_either,
+        CASE WHEN enr_status IN ('ENROLLED', 'PENDING')
+              AND eel_status IN ('ENROLLED', 'PENDING') THEN 1 ELSE 0 END AS f_both
+    FROM base
+)
+SELECT
+    scenario_code,
+    scenario_definition,
+    raw_rows,
+    distinct_pairs,
+    distinct_enrollment_id,
+    distinct_enrollee_id,
+    distinct_issuers,
+    CASE
+        WHEN distinct_pairs BETWEEN 900000 AND 1000000
+            THEN 'NEAR_950K_BAND — candidate; confirm vs Swathi sample logic'
+        WHEN distinct_pairs BETWEEN 850000 AND 899999
+            THEN 'BELOW_950K_BUT_CLOSE — review'
+        WHEN distinct_pairs > 1000000
+            THEN 'ABOVE_950K — may be too broad'
+        ELSE 'FAR_FROM_950K'
+    END AS proximity_hint,
+    consistency_note
+FROM (
+    SELECT
+        'A' AS scenario_code,
+        'enrollment_status_description = Enrolled' AS scenario_definition,
+        SUM(a_enrolled_only) AS raw_rows,
+        COUNT(DISTINCT CASE WHEN a_enrolled_only = 1
+            THEN CAST(coverage_year AS VARCHAR(10)) + '|' + CAST(enrollment_id AS VARCHAR(50)) + '|' + CAST(enrollee_id AS VARCHAR(50)) END) AS distinct_pairs,
+        COUNT(DISTINCT CASE WHEN a_enrolled_only = 1 THEN enrollment_id END) AS distinct_enrollment_id,
+        COUNT(DISTINCT CASE WHEN a_enrolled_only = 1 THEN enrollee_id END) AS distinct_enrollee_id,
+        COUNT(DISTINCT CASE WHEN a_enrolled_only = 1 THEN hios_issuer_id END) AS distinct_issuers,
+        'Consistent with sample rows that are Enrolled/Terminated (enrollee status ignored)' AS consistency_note
+    FROM flagged
+
+    UNION ALL
+
+    SELECT
+        'B',
+        'enrollment_status_description IN (Enrolled, Pending)',
+        SUM(b_enr_enrolled_pending),
+        COUNT(DISTINCT CASE WHEN b_enr_enrolled_pending = 1
+            THEN CAST(coverage_year AS VARCHAR(10)) + '|' + CAST(enrollment_id AS VARCHAR(50)) + '|' + CAST(enrollee_id AS VARCHAR(50)) END),
+        COUNT(DISTINCT CASE WHEN b_enr_enrolled_pending = 1 THEN enrollment_id END),
+        COUNT(DISTINCT CASE WHEN b_enr_enrolled_pending = 1 THEN enrollee_id END),
+        COUNT(DISTINCT CASE WHEN b_enr_enrolled_pending = 1 THEN hios_issuer_id END),
+        'Provisional Enrolled+Pending on enrollment-level field only; Pend excluded'
+    FROM flagged
+
+    UNION ALL
+
+    SELECT
+        'C',
+        'enrollment_status_description IN (Enrolled, Pending, Pend)',
+        SUM(c_enr_enrolled_pending_pend),
+        COUNT(DISTINCT CASE WHEN c_enr_enrolled_pending_pend = 1
+            THEN CAST(coverage_year AS VARCHAR(10)) + '|' + CAST(enrollment_id AS VARCHAR(50)) + '|' + CAST(enrollee_id AS VARCHAR(50)) END),
+        COUNT(DISTINCT CASE WHEN c_enr_enrolled_pending_pend = 1 THEN enrollment_id END),
+        COUNT(DISTINCT CASE WHEN c_enr_enrolled_pending_pend = 1 THEN enrollee_id END),
+        COUNT(DISTINCT CASE WHEN c_enr_enrolled_pending_pend = 1 THEN hios_issuer_id END),
+        'Adds literal Pend on enrollment-level field; Pend NOT equated to Pending'
+    FROM flagged
+
+    UNION ALL
+
+    SELECT
+        'D',
+        'enrollee_status_description IN (Enrolled, Pending)',
+        SUM(d_eel_enrolled_pending),
+        COUNT(DISTINCT CASE WHEN d_eel_enrolled_pending = 1
+            THEN CAST(coverage_year AS VARCHAR(10)) + '|' + CAST(enrollment_id AS VARCHAR(50)) + '|' + CAST(enrollee_id AS VARCHAR(50)) END),
+        COUNT(DISTINCT CASE WHEN d_eel_enrolled_pending = 1 THEN enrollment_id END),
+        COUNT(DISTINCT CASE WHEN d_eel_enrolled_pending = 1 THEN enrollee_id END),
+        COUNT(DISTINCT CASE WHEN d_eel_enrolled_pending = 1 THEN hios_issuer_id END),
+        'Would EXCLUDE sample Enrolled/Terminated rows — likely inconsistent with sample'
+    FROM flagged
+
+    UNION ALL
+
+    SELECT
+        'E',
+        'EITHER status column IN (Enrolled, Pending)',
+        SUM(e_either),
+        COUNT(DISTINCT CASE WHEN e_either = 1
+            THEN CAST(coverage_year AS VARCHAR(10)) + '|' + CAST(enrollment_id AS VARCHAR(50)) + '|' + CAST(enrollee_id AS VARCHAR(50)) END),
+        COUNT(DISTINCT CASE WHEN e_either = 1 THEN enrollment_id END),
+        COUNT(DISTINCT CASE WHEN e_either = 1 THEN enrollee_id END),
+        COUNT(DISTINCT CASE WHEN e_either = 1 THEN hios_issuer_id END),
+        'OR logic; broader than enrollment-only; includes enrollee-Pending with non-Enrolled enrollment status'
+    FROM flagged
+
+    UNION ALL
+
+    SELECT
+        'F',
+        'BOTH status columns IN (Enrolled, Pending)',
+        SUM(f_both),
+        COUNT(DISTINCT CASE WHEN f_both = 1
+            THEN CAST(coverage_year AS VARCHAR(10)) + '|' + CAST(enrollment_id AS VARCHAR(50)) + '|' + CAST(enrollee_id AS VARCHAR(50)) END),
+        COUNT(DISTINCT CASE WHEN f_both = 1 THEN enrollment_id END),
+        COUNT(DISTINCT CASE WHEN f_both = 1 THEN enrollee_id END),
+        COUNT(DISTINCT CASE WHEN f_both = 1 THEN hios_issuer_id END),
+        'AND logic; EXCLUDES sample Enrolled/Terminated — inconsistent with observed sample'
+    FROM flagged
+) AS scenarios
+ORDER BY scenario_code;
+
+
+-- -----------------------------------------------------------------------------
+-- 3) Extra evidence: enrollment=Enrolled broken out by enrollee_status
+--     (shows how many Enrolled/Terminated-style rows scenario A would keep)
+-- -----------------------------------------------------------------------------
+SELECT
+    'A_detail' AS slice,
+    enrollee_status_description,
+    COUNT(*) AS raw_rows,
+    COUNT(DISTINCT CAST(coverage_year AS VARCHAR(10)) + '|'
+                 + CAST(enrollment_id AS VARCHAR(50)) + '|'
+                 + CAST(enrollee_id AS VARCHAR(50))) AS distinct_pairs
+FROM dbo.Enrollments_TEST
+WHERE coverage_year = @coverage_year
+  AND UPPER(LTRIM(RTRIM(enrollment_status_description))) = 'ENROLLED'
+GROUP BY enrollee_status_description
+ORDER BY raw_rows DESC;

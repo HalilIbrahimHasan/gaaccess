@@ -1,0 +1,105 @@
+coverage_year,enrollment_id,enrollee_id,plan_name,hios_issuer_id,insurer_name,enrollment_status_description,enrollee_status_description
+2026,211526089,1000403328,SoloCare Gold PPO $1000 20% Chiro,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,211954627,1006596521,SoloCare Standard Silver HMO $3000 40%,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,1000327041,1008311029,Standard Silver HMO $0 $0,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,210746442,1003036146,Gold Classic Standard HMO $2000 $30,58081,Oscar Health Plan of Georgia,Enrolled,Enrolled
+2026,211621585,1004779221,Low Premium Silver HMO 500 $0,60224,CareSource Georgia Co.,Enrolled,Enrolled
+2026,211526089,1000403350,SoloCare Gold PPO $1000 20% Chiro,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,1000274145,1007994626,Low Premium Silver HMO 6200 $40,60224,CareSource Georgia Co.,Enrolled,Enrolled
+2026,211526089,1000403313,SoloCare Gold PPO $1000 20% Chiro,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,211246954,1001797492,Standard Gold HMO $2000 $30,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,211964397,1006599039,KP GA Silver HMO $0 $0,89942,"Kaiser Foundation Health Plan of Georgia, Inc.",Enrolled,Enrolled
+2026,1000031522,1007150115,SoloCare Standard Silver HMO $0 25%,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,1000319331,1000000012,Anthem Bronze Pathway HMO 5000 $45 $0 Virtual PCP $0 Select Drugs,49046,Anthem Blue Cross and Blue Shield,Enrolled,Enrolled
+2026,211752189,1000000023,Clear Silver HMO $850 $5 with $0 Insulin Options,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,1000167955,1007150242,Everyday Gold HMO $800 $35 + Vision + Adult Dental,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,1000024044,1007150610,UHC Value Classic Bronze HMO $6350 $40,43802,UnitedHealthcare of Georgia Inc.,Enrolled,Enrolled
+2026,1000330684,1008328381,Connect Silver-4B HMO $0 $0,15105,"Cigna HealthCare of Georgia, Inc.",Enrolled,Enrolled
+2026,210746442,1003036158,Gold Classic Standard HMO $2000 $30,58081,Oscar Health Plan of Georgia,Enrolled,Enrolled
+2026,1000287540,1008140984,Everyday Gold HMO $800 $35,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,212167353,1006611759,SoloCare Exp Bronze HMO $8000 50%,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,1000287540,1008140979,Everyday Gold HMO $800 $35,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,210881880,1001811559,Complete Gold HMO $1450 $15,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,212167353,1006611760,SoloCare Exp Bronze HMO $8000 50%,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,1000333804,1008328703,SoloCare Silver PPO $500 40% Chiro,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,1000287547,1008140985,Standard Gold HMO $2000 $30,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,211619048,1006169302,Low Premium Silver HMO 6200 $40,60224,CareSource Georgia Co.,Enrolled,Enrolled
+2026,212214565,1006682991,Elite Gold HMO $0 $5,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,210881880,1001811557,Complete Gold HMO $1450 $15,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,1000333804,1008328712,SoloCare Silver PPO $500 40% Chiro,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,211704902,1000057191,SoloCare Silver PPO $6500 40% Chiro,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,211980731,1006620576,SoloCare Silver HMO $5000 40%,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,210881880,1001811558,Complete Gold HMO $1450 $15,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,1000332626,1008336112,KP GA Signature Gold HMO $500 $20,89942,"Kaiser Foundation Health Plan of Georgia, Inc.",Enrolled,Enrolled
+2026,211941038,1000070603,SoloCare Platinum PPO $1000 20% Chiro,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,210834437,1000086148,Complete Gold HMO $1450 $15,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,211632390,1006178964,Core Bronze HMO 7500 $50,60224,CareSource Georgia Co.,Enrolled,Enrolled
+2026,1000333484,1008336202,Bronze Classic 4700 HMO $4700 $70,58081,Oscar Health Plan of Georgia,Enrolled,Enrolled
+2026,1000336782,1008352847,Standard Silver HMO $0 $0,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,210834437,1000086144,Complete Gold HMO $1450 $15,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,210834437,1000086114,Complete Gold HMO $1450 $15,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,210834437,1000086141,Complete Gold HMO $1450 $15,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,210979598,1001819065,Focused Silver HMO $0 $20,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,210588401,1002867610,UHC Value Gold HMO $1500 $15 Gen Rx $3,43802,UnitedHealthcare of Georgia Inc.,Enrolled,Enrolled
+2026,211987184,1006629970,Clear Gold HMO $1200 $25,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,1000336782,1008352852,Standard Silver HMO $0 $0,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,1000339576,1008368753,Connect Silver-4B HMO $0 $0,15105,"Cigna HealthCare of Georgia, Inc.",Enrolled,Enrolled
+2026,211620006,1006183759,SoloCare Gold PPO $500 20% Chiro,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,211724069,1006179962,SoloCare Standard Silver HMO $0 25%,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,211726408,1004977154,SoloCare Standard Silver HMO $0 25%,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,1000130955,1002870930,KP GA Signature Silver HMO $0 $0,89942,"Kaiser Foundation Health Plan of Georgia, Inc.",Enrolled,Enrolled
+2026,212090962,1004905625,SoloCare Silver HMO $3500 40%,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,211054350,1002211848,Standard Silver HMO $700 $20,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,211751763,1002872348,Silver Simple Saver CSR 200 HMO $800 $10,58081,Oscar Health Plan of Georgia,Enrolled,Enrolled
+2026,210983759,1000125559,Core Gold HMO 1500 $20,60224,CareSource Georgia Co.,Enrolled,Enrolled
+2026,211712017,1000135414,Elite Gold HMO $0 $5,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,210913006,1000000166,Everyday Gold HMO $800 $35,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,211993251,1000000333,Everyday Bronze HMO $8450 $40,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,212009214,1000000430,Anthem Bronze Pathway Guided Access HMO 6000 $50 $0 Virtual PCP $0 Select Drugs,49046,Anthem Blue Cross and Blue Shield,Enrolled,Enrolled
+2026,212009214,1000000431,Anthem Bronze Pathway Guided Access HMO 6000 $50 $0 Virtual PCP $0 Select Drugs,49046,Anthem Blue Cross and Blue Shield,Enrolled,Enrolled
+2026,212009214,1000000432,Anthem Bronze Pathway Guided Access HMO 6000 $50 $0 Virtual PCP $0 Select Drugs,49046,Anthem Blue Cross and Blue Shield,Enrolled,Enrolled
+2026,211773386,1000000509,SoloCare Standard Silver PPO $6000 40% Chiro,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,211293658,1000000862,SoloCare Exp Bronze HMO $6800 40%,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,211487414,1000000908,SoloCare Gold PPO $1000 20% Chiro,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,211487414,1000000913,SoloCare Gold PPO $1000 20% Chiro,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,211487414,1000000911,SoloCare Gold PPO $1000 20% Chiro,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,211487414,1000000910,SoloCare Gold PPO $1000 20% Chiro,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,210556880,1000001490,Standard Expanded Bronze HMO $7500 $50,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,212226264,1000001544,Standard Gold HMO $2000 $30 + Vision + Adult Dental,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,211253089,1000001781,Anthem Silver Pathway Guided Access HMO 5500 $10 $0 Virtual PCP $0 Select Drugs,49046,Anthem Blue Cross and Blue Shield,Enrolled,Enrolled
+2026,212165867,1000002724,Core Bronze HMO 7500 $50,60224,CareSource Georgia Co.,Enrolled,Enrolled
+2026,211296923,1000002820,Clear Gold HMO $1200 $25,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,211296923,1000002818,Clear Gold HMO $1200 $25,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,211294350,1000003843,Silver Elite Saver Plus HMO $0 $70,58081,Oscar Health Plan of Georgia,Enrolled,Enrolled
+2026,211294350,1000003825,Silver Elite Saver Plus HMO $0 $70,58081,Oscar Health Plan of Georgia,Enrolled,Enrolled
+2026,211294350,1000003810,Silver Elite Saver Plus HMO $0 $70,58081,Oscar Health Plan of Georgia,Enrolled,Enrolled
+2026,211294350,1000003808,Silver Elite Saver Plus HMO $0 $70,58081,Oscar Health Plan of Georgia,Enrolled,Enrolled
+2026,211294350,1000003819,Silver Elite Saver Plus HMO $0 $70,58081,Oscar Health Plan of Georgia,Enrolled,Enrolled
+2026,211294350,1000003837,Silver Elite Saver Plus HMO $0 $70,58081,Oscar Health Plan of Georgia,Enrolled,Enrolled
+2026,211353087,1000004385,Elite Gold HMO $0 $5 + Vision + Adult Dental,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,211900960,1000004907,Bronze Elite Saver Plus HMO $0 $50,58081,Oscar Health Plan of Georgia,Enrolled,Enrolled
+2026,210955223,1000005488,Everyday Gold HMO $800 $35,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,211876509,1000005572,KP GA Signature Gold HMO $500 $20,89942,"Kaiser Foundation Health Plan of Georgia, Inc.",Enrolled,Enrolled
+2026,211876509,1000005571,KP GA Signature Gold HMO $500 $20,89942,"Kaiser Foundation Health Plan of Georgia, Inc.",Enrolled,Enrolled
+2026,211876509,1000005573,KP GA Signature Gold HMO $500 $20,89942,"Kaiser Foundation Health Plan of Georgia, Inc.",Enrolled,Enrolled
+2026,211490488,1000005577,UHC Advantage+ Gold HMO $1100 $10 Gen Rx $1 Adult Dental Vision,43802,UnitedHealthcare of Georgia Inc.,Enrolled,Enrolled
+2026,211272809,1000006331,SoloCare Standard Silver HMO $6000 40%,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,211641099,1000006631,Complete Gold HMO $1450 $15 + Vision + Adult Dental,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,212026728,1000007278,SoloCare Exp Bronze HMO $8000 50%,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,212026728,1000007274,SoloCare Exp Bronze HMO $8000 50%,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,212026728,1000007268,SoloCare Exp Bronze HMO $8000 50%,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,212026728,1000007277,SoloCare Exp Bronze HMO $8000 50%,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,211778673,1000007740,Clear Gold HMO $1200 $25,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,211778673,1003115615,Clear Gold HMO $1200 $25,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,211778673,1003115583,Clear Gold HMO $1200 $25,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,211285503,1000008470,SoloCare Standard Platinum PPO $0 0% Chiro,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,211126557,1000008841,SoloCare Exp Bronze HMO $6800 40%,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,211126557,1000008842,SoloCare Exp Bronze HMO $6800 40%,83761,"Alliant Health Plans, Inc.",Enrolled,Enrolled
+2026,212222279,1000009217,Standard Silver HMO $6000 $40,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,211041712,1000009622,Diabetes Gold HMO 3000 $10 $0 Chronic Care Services and Adult Vision and Fitness,60224,CareSource Georgia Co.,Enrolled,Enrolled
+2026,211746737,1000009904,Everyday Bronze HMO $8450 $40 + Vision + Adult Dental,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,211712017,1006102148,Elite Gold HMO $0 $5,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,212075868,1000010116,Everyday Bronze HMO $8450 $40,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,212075868,1000010120,Everyday Bronze HMO $8450 $40,70893,Ambetter from Peach State Health Plan,Enrolled,Enrolled
+2026,212075868,1000010125,Everyday Bronze HMO $8450 $40,70893,Ambetter from Peach State Health Plan,Enrolled,Terminated
+2026,211817189,1000011153,KP GA Signature Bronze HMO $7500 $50,89942,"Kaiser Foundation Health Plan of Georgia, Inc.",Enrolled,Enrolled
