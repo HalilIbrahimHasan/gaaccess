@@ -11,8 +11,9 @@ from outbound_automation.config import (
     resolve_outbound_remote_path,
     resolve_outbound_source_root,
     resolve_sftp_credentials,
+    resolve_source_json_policy,
 )
-from outbound_automation.constants import ENV_ENABLED, OUTPUT_ROOT
+from outbound_automation.constants import ENV_ENABLED, ENV_SOURCE_JSON_PII_POLICY, OUTPUT_ROOT
 from outbound_automation.run_context import OutboundRunContext, new_load_run_id
 from utils.logger import get_logger
 
@@ -30,14 +31,19 @@ def _parse_issuer_list(values: list[str] | None) -> list[str] | None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Outbound automation — TO 834 files -> Parser834 -> dbo.outbound_automation*.",
+        description=(
+            "Outbound automation — TO 834 files -> Parser834Outbound -> "
+            "dbo.outbound_automation + dbo.outbound_automation_monthly_premium."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
 Steps (each is a separate, explicit invocation):
-  python run_outbound_automation_load.py --sftp-audit --issuer 15105 --year 2026 --month 2
-  python run_outbound_automation_load.py --download   --issuer 15105 --year 2026 --month 2
-  python run_outbound_automation_load.py --dry-run    --issuer 15105 --year 2026 --month 2
-  python run_outbound_automation_load.py --load       --issuer 15105 --year 2026 --month 2
+  python run_outbound_automation_load.py --sftp-audit --issuer <HIOS> --year <YYYY> --month <M>
+  python run_outbound_automation_load.py --download   --issuer <HIOS> --year <YYYY> --month <M>
+  python run_outbound_automation_load.py --dry-run    --issuer <HIOS> --year <YYYY> --month <M>
+  python run_outbound_automation_load.py --load       --issuer <HIOS> --year <YYYY> --month <M>
+
+--load requires {ENV_ENABLED}=true and an approved {ENV_SOURCE_JSON_PII_POLICY} (full | redact).
         """.strip(),
     )
     parser.add_argument("--sftp-audit", action="store_true",
@@ -137,18 +143,27 @@ def _print_footer(result) -> int:
     from outbound_automation.reports import write_run_reports
 
     print("\nRun complete.")
+    print(f"  source_xml_json policy  : {result.pii_policy}")
     print(f"  Files discovered        : {result.files_discovered}")
+    print(f"  Files rejected (name)   : {len(result.rejected_files)}")
     print(f"  Files parsed            : {result.files_parsed}")
     print(f"  Files loaded            : {result.files_loaded}")
     print(f"  Files skipped (dup hash): {result.files_skipped_duplicate}")
     print(f"  Files failed            : {result.files_failed}")
     print(f"  Rows parsed             : {result.rows_parsed}")
+    print(f"  Premium rows parsed     : {result.premium_rows_parsed}")
     print(f"  Rows inserted           : {result.rows_inserted}")
+    print(f"  Premium rows inserted   : {result.premium_rows_inserted}")
+    print(f"  Warnings (total)        : {result.total_warning_count}")
+    print(f"  Unknown XML paths       : {result.unknown_path_count}")
     print(f"  Reports                 : {result.context.output_dir}")
     for name, path in write_run_reports(result).items():
         print(f"    {name}: {path}")
     if result.files_discovered == 0:
         print("\nNo outbound TO files matched filters.")
+        return 1
+    if result.files_failed:
+        print("\nOne or more files failed (see file_summary.xlsx); they remain retryable.")
         return 1
     return 0
 
@@ -165,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
 
         from outbound_automation.pipeline import run_dry_run, run_load
 
+        policy = resolve_source_json_policy(required=(mode == "load"))
         context = OutboundRunContext.create(
             run_mode=mode,
             year_filter=args.year,
@@ -185,11 +201,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  issuer filter   : {', '.join(issuers) if issuers else 'ALL'}")
     print(f"  month filter    : {context.month_filter or 'ALL'}")
     print(f"  output dir      : {context.output_dir}")
+    print(f"  JSON PII policy : {policy.name}")
     if mode == "load":
-        print("  Azure writes    : dbo.outbound_automation + run_log + file_log")
-        return _print_footer(run_load(context))
+        print("  Azure writes    : dbo.outbound_automation + monthly_premium + run_log + file_log")
+        return _print_footer(run_load(context, policy=policy))
     print("  Azure writes    : NONE")
-    return _print_footer(run_dry_run(context))
+    return _print_footer(run_dry_run(context, policy=policy))
 
 
 if __name__ == "__main__":

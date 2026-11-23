@@ -27,7 +27,7 @@ from ingestion.sftp_ingestion import (
 )
 from ingestion.sftp_tree_walk import _list_dirs, _list_files
 from outbound_automation.config import SftpCredentials
-from outbound_automation.file_rules import classify_outbound_filename
+from outbound_automation.file_rules import ALL_CLASSES, classify_outbound_filename
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -69,10 +69,7 @@ class OutboundPartitionResult:
             "failed": self.failed,
             "errors": "; ".join(self.errors),
         }
-        for cls in (
-            "valid_xml", "valid_gz", "valid_xz", "from",
-            "edi", "tracking", "report", "summary", "log", "other",
-        ):
+        for cls in ALL_CLASSES:
             row[f"count_{cls}"] = self.class_counts.get(cls, 0)
         return row
 
@@ -85,6 +82,10 @@ def _walk_folder(sftp, remote_path: str, depth: int, result: OutboundPartitionRe
         result.files_scanned += 1
         cls = classify_outbound_filename(filename)
         result.class_counts[cls] = result.class_counts.get(cls, 0) + 1
+        if cls == "to_nonstandard":
+            logger.warning(
+                "Unrecognized TO filename reported, not selected: %s/%s", remote_path, filename,
+            )
         remote_file = f"{remote_path}/{filename}"
         selected = cls in _FORMAT_BY_CLASS
         result.file_manifest.append(

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "source": "docs/_companion_guide_extract.txt — HD03 Insurance Line Code",
+  "description": "insuranceTypeLkp code -> insurance_type display value. Codes not listed here load with insurance_type = NULL and warning UNKNOWN_INSURANCE_TYPE; they are never defaulted.",
+  "mappings": {
+    "HLT": "Health",
+    "DEN": "Dental"
+  }
+}
