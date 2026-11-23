@@ -40,3 +40,7 @@ build/
 **/__pycache__/
 *.pyc
 834_issuer_etl/GetInsured 834 Companion Guide v23.09.00 (3).pdf
+
+# Runtime source data (SFTP downloads; contains member PII) — never commit
+834_issuer_etl/source_data/*
+!834_issuer_etl/source_data/.gitkeep
