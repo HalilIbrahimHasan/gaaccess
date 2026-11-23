@@ -10,15 +10,35 @@ from pathlib import Path
 from config.config import PROJECT_ROOT, settings
 from outbound_automation.constants import (
     DEFAULT_EXCHANGE_CODES,
+    DEFAULT_SFTP_CHUNK_BYTES,
+    DEFAULT_SFTP_CONNECT_TIMEOUT,
+    DEFAULT_SFTP_KEEPALIVE,
+    DEFAULT_SFTP_MAX_RECONNECTS,
+    DEFAULT_SFTP_MAX_RETRIES,
+    DEFAULT_SFTP_OP_TIMEOUT,
+    DEFAULT_SFTP_PROGRESS_INTERVAL,
+    DEFAULT_SFTP_STALL_ABORT,
+    DEFAULT_SFTP_STALL_WARN,
     DEFAULT_SOURCE_SUBDIR,
     ENV_EXCHANGE_CODES,
     ENV_REMOTE_PATH,
+    ENV_SFTP_CHUNK_BYTES,
+    ENV_SFTP_CONNECT_TIMEOUT,
+    ENV_SFTP_KEEPALIVE,
+    ENV_SFTP_MAX_RECONNECTS,
+    ENV_SFTP_MAX_RETRIES,
+    ENV_SFTP_OP_TIMEOUT,
+    ENV_SFTP_PROGRESS_INTERVAL,
+    ENV_SFTP_STALL_ABORT,
+    ENV_SFTP_STALL_WARN,
     ENV_SOURCE_DATA_PATH,
     ENV_SOURCE_JSON_PII_POLICY,
     PII_POLICIES,
     PII_POLICY_FULL,
     PII_POLICY_UNSET_DRY_RUN,
     SENSITIVE_TAGS_FILE,
+    SFTP_READ_PIECE_BYTES,
+    SFTP_RETRY_BACKOFF_SECONDS,
 )
 from outbound_automation.source_json import SourceJsonPolicy
 
@@ -112,6 +132,81 @@ def resolve_sftp_credentials() -> SftpCredentials:
             "SFTP credentials missing. SFTP_HOST and SFTP_USERNAME are required."
         )
     return SftpCredentials(host=host, port=int(port_raw), username=user, password=password)
+
+
+@dataclass(frozen=True)
+class SftpReliabilitySettings:
+    """Timeouts and retry limits for the outbound SFTP session (seconds unless noted)."""
+
+    connect_timeout: float = DEFAULT_SFTP_CONNECT_TIMEOUT
+    keepalive: int = DEFAULT_SFTP_KEEPALIVE
+    op_timeout: float = DEFAULT_SFTP_OP_TIMEOUT
+    stall_warn: float = DEFAULT_SFTP_STALL_WARN
+    stall_abort: float = DEFAULT_SFTP_STALL_ABORT
+    max_retries: int = DEFAULT_SFTP_MAX_RETRIES
+    max_reconnects: int = DEFAULT_SFTP_MAX_RECONNECTS
+    chunk_bytes: int = DEFAULT_SFTP_CHUNK_BYTES
+    progress_interval: float = DEFAULT_SFTP_PROGRESS_INTERVAL
+    retry_backoff: tuple[float, ...] = SFTP_RETRY_BACKOFF_SECONDS
+
+    def backoff_for(self, retry_number: int) -> float:
+        """Wait before retry `retry_number` (1-based)."""
+        if not self.retry_backoff:
+            return 0.0
+        return self.retry_backoff[min(retry_number, len(self.retry_backoff)) - 1]
+
+    def describe(self) -> list[tuple[str, str]]:
+        waits = ", ".join(f"{self.backoff_for(n):g}s" for n in range(1, self.max_retries + 1))
+        return [
+            ("connect timeout", f"{self.connect_timeout:g}s"),
+            ("SSH keepalive", f"{self.keepalive}s" if self.keepalive else "off"),
+            ("operation timeout", f"{self.op_timeout:g}s"),
+            ("no-progress warning", f"{self.stall_warn:g}s"),
+            ("stall abort", f"{self.stall_abort:g}s"),
+            ("retries per op/file", f"{self.max_retries} (waits: {waits or 'none'})"),
+            ("max reconnects", str(self.max_reconnects)),
+            ("chunk / read-ahead", f"{self.chunk_bytes} bytes"),
+            ("progress interval", f"{self.progress_interval:g}s"),
+        ]
+
+
+def _env_number(name: str, default, cast, minimum):
+    raw = _clean(os.getenv(name))
+    if not raw:
+        return default
+    try:
+        value = cast(raw)
+    except ValueError:
+        raise OutboundConfigError(f"{name}={raw!r} is not a valid number.") from None
+    if value < minimum:
+        raise OutboundConfigError(f"{name}={raw!r} must be >= {minimum}.")
+    return value
+
+
+def resolve_sftp_reliability_settings() -> SftpReliabilitySettings:
+    """OUTBOUND_SFTP_* timeouts/retry limits; every value has a safe default."""
+    settings.refresh_from_env()
+    resolved = SftpReliabilitySettings(
+        connect_timeout=_env_number(ENV_SFTP_CONNECT_TIMEOUT, DEFAULT_SFTP_CONNECT_TIMEOUT, float, 1.0),
+        keepalive=_env_number(ENV_SFTP_KEEPALIVE, DEFAULT_SFTP_KEEPALIVE, int, 0),
+        op_timeout=_env_number(ENV_SFTP_OP_TIMEOUT, DEFAULT_SFTP_OP_TIMEOUT, float, 1.0),
+        stall_warn=_env_number(ENV_SFTP_STALL_WARN, DEFAULT_SFTP_STALL_WARN, float, 1.0),
+        stall_abort=_env_number(ENV_SFTP_STALL_ABORT, DEFAULT_SFTP_STALL_ABORT, float, 1.0),
+        max_retries=_env_number(ENV_SFTP_MAX_RETRIES, DEFAULT_SFTP_MAX_RETRIES, int, 0),
+        max_reconnects=_env_number(ENV_SFTP_MAX_RECONNECTS, DEFAULT_SFTP_MAX_RECONNECTS, int, 0),
+        chunk_bytes=_env_number(
+            ENV_SFTP_CHUNK_BYTES, DEFAULT_SFTP_CHUNK_BYTES, int, SFTP_READ_PIECE_BYTES,
+        ),
+        progress_interval=_env_number(
+            ENV_SFTP_PROGRESS_INTERVAL, DEFAULT_SFTP_PROGRESS_INTERVAL, float, 1.0,
+        ),
+    )
+    if resolved.stall_warn >= resolved.stall_abort:
+        raise OutboundConfigError(
+            f"{ENV_SFTP_STALL_WARN} ({resolved.stall_warn:g}) must be lower than "
+            f"{ENV_SFTP_STALL_ABORT} ({resolved.stall_abort:g})."
+        )
+    return resolved
 
 
 def parse_exchange_codes(raw: str | None) -> frozenset[str]:

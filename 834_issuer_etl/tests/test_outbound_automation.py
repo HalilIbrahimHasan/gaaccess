@@ -8,9 +8,13 @@ Database behaviour is exercised with in-memory fakes only.
 
 from __future__ import annotations
 
+import errno
+import gzip
 import json
+import lzma
 import os
 import re
+import socket
 import sys
 import tempfile
 import unittest
@@ -27,10 +31,13 @@ from connectors.base_connector import SourceFile  # noqa: E402
 from outbound_automation import azure_writer as ow  # noqa: E402
 from outbound_automation.config import (  # noqa: E402
     OutboundConfigError,
+    SftpCredentials,
+    SftpReliabilitySettings,
     load_sensitive_local_names,
     parse_exchange_codes,
     resolve_outbound_remote_path,
     resolve_outbound_source_root,
+    resolve_sftp_reliability_settings,
     resolve_source_json_policy,
 )
 from outbound_automation.constants import OUTBOUND_TABLES  # noqa: E402
@@ -72,6 +79,12 @@ from outbound_automation.schema_v2 import (  # noqa: E402
     MONTHLY_PREMIUM_COLUMNS,
     OUTBOUND_AUTOMATION_COLUMNS,
 )
+from outbound_automation.sftp_download import (  # noqa: E402
+    run_outbound_sftp,
+    walk_outbound_partition,
+)
+from outbound_automation.sftp_session import OutboundSftpSession  # noqa: E402
+from outbound_automation.sftp_transfer import STATE_FIELDS, TransferProgress  # noqa: E402
 from outbound_automation.source_json import SourceJsonPolicy  # noqa: E402
 from parsers.parser_834_outbound import (  # noqa: E402
     OutboundParseError,
@@ -1125,6 +1138,603 @@ class ConfigIsolationTests(unittest.TestCase):
     def test_run_id_prefix(self) -> None:
         run_id = new_load_run_id(datetime(2031, 1, 2, 3, 4, 5, tzinfo=timezone.utc))
         self.assertRegex(run_id, r"^outbound_20310102_030405_[0-9a-f]{8}$")
+
+
+# =============================================================================
+# SFTP reliability (in-memory fake SFTP server; no network, no real data)
+# =============================================================================
+_DIR_MODE = 0o040755
+_FILE_MODE = 0o100644
+REMOTE_ROOT = "/out"
+MONTH_DIR = f"{REMOTE_ROOT}/{ISSUER}/2031/01"
+CREDS = SftpCredentials(host="sftp.invalid", port=22, username="user", password="secret")
+FAST = SftpReliabilitySettings(chunk_bytes=64 * 1024)
+
+
+def to_name(timestamp: str, ext: str = "") -> str:
+    return f"to_{ISSUER}_GA_834_INDV_{timestamp}.xml{ext}"
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class FakeTransport:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeRemoteFile:
+    def __init__(self, server: "FakeServer", transport: FakeTransport, path: str) -> None:
+        self.server, self.transport, self.path = server, transport, path
+        self.name = path.rsplit("/", 1)[-1]
+        self.data = server.files[path]
+        self.pos = 0
+
+    def prefetch(self, file_size=None, max_concurrent_requests=None) -> None:
+        self.server.prefetches.append((self.name, file_size, max_concurrent_requests))
+
+    def read(self, size: int) -> bytes:
+        if self.transport.closed:
+            raise EOFError("connection closed")
+        self.server.before_read(self)
+        piece = self.data[self.pos:self.pos + size]
+        self.pos += len(piece)
+        return piece
+
+    def close(self) -> None:
+        pass
+
+
+class FakeClient:
+    def __init__(self, server: "FakeServer", transport: FakeTransport) -> None:
+        self.server, self.transport = server, transport
+
+    def _check(self, op: str, path: str) -> None:
+        if self.transport.closed:
+            raise EOFError("connection closed")
+        self.server.ops.append((op, path))
+        fault = self.server.take_op_fault(op, path)
+        if fault is not None:
+            raise fault
+
+    def listdir(self, path: str) -> list[str]:
+        self._check("listdir", path)
+        return [a.filename for a in self.server.children(path)]
+
+    def listdir_attr(self, path: str) -> list[SimpleNamespace]:
+        self._check("listdir_attr", path)
+        return self.server.children(path)
+
+    def stat(self, path: str) -> SimpleNamespace:
+        self._check("stat", path)
+        return self.server.attr(path)
+
+    def open(self, path: str, mode: str = "r") -> FakeRemoteFile:
+        self._check("open", path)
+        self.server.opened.append(path.rsplit("/", 1)[-1])
+        return FakeRemoteFile(self.server, self.transport, path)
+
+    def close(self) -> None:
+        pass
+
+
+class FakeServer:
+    """Remote tree under /out with injectable operation and read faults."""
+
+    def __init__(self, files: dict[str, bytes], *, sizes: dict[str, int] | None = None) -> None:
+        self.files = dict(files)
+        self.sizes = dict(sizes or {})
+        self.mtime = 1_900_000_000
+        self.dirs = {REMOTE_ROOT}
+        for path in self.all_paths():
+            parts = path.split("/")
+            for i in range(2, len(parts)):
+                self.dirs.add("/".join(parts[:i]))
+        self.connections = 0
+        self.transports: list[FakeTransport] = []
+        self.ops: list[tuple[str, str]] = []
+        self.opened: list[str] = []
+        self.prefetches: list[tuple] = []
+        self.op_faults: list[tuple[str, str, BaseException]] = []
+        self.read_faults: list[tuple[str, int, object, bool]] = []
+
+    def connector(self):
+        def connect():
+            self.connections += 1
+            transport = FakeTransport()
+            self.transports.append(transport)
+            return transport, FakeClient(self, transport)
+        return connect
+
+    def all_paths(self) -> set[str]:
+        return set(self.files) | set(self.sizes)
+
+    def attr(self, path: str) -> SimpleNamespace:
+        name = path.rsplit("/", 1)[-1]
+        if path in self.dirs:
+            return SimpleNamespace(filename=name, st_mode=_DIR_MODE, st_size=0, st_mtime=self.mtime)
+        if path in self.all_paths():
+            size = self.sizes.get(path, len(self.files.get(path, b"")))
+            return SimpleNamespace(filename=name, st_mode=_FILE_MODE, st_size=size, st_mtime=self.mtime)
+        raise FileNotFoundError(errno.ENOENT, "No such file", path)
+
+    def children(self, path: str) -> list[SimpleNamespace]:
+        if path not in self.dirs:
+            raise FileNotFoundError(errno.ENOENT, "No such file", path)
+        prefix = path.rstrip("/") + "/"
+        names = {p[len(prefix):].split("/", 1)[0] for p in self.all_paths() | self.dirs if p.startswith(prefix)}
+        return [self.attr(prefix + n) for n in sorted(names)]
+
+    def take_op_fault(self, op: str, path: str):
+        for i, (fop, fpath, exc) in enumerate(self.op_faults):
+            if fop == op and fpath == path:
+                del self.op_faults[i]
+                return exc
+        return None
+
+    def before_read(self, handle: FakeRemoteFile) -> None:
+        for i, (name, at, action, persistent) in enumerate(self.read_faults):
+            if name == handle.name and handle.pos >= at:
+                if not persistent:
+                    del self.read_faults[i]
+                action(handle)
+                return
+
+
+def _raise_timeout(_handle) -> None:
+    raise socket.timeout("timed out")
+
+
+class SftpReliabilityBase(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.local_root = self.tmp / "outbound"
+        self.local_month = self.local_root / ISSUER / "2031" / "01"
+        self.clock = FakeClock()
+        self.sleeps: list[float] = []
+
+    def run_download(self, server: FakeServer, *, settings=FAST, force=False, keep_compressed=False):
+        return run_outbound_sftp(
+            creds=CREDS,
+            remote_root=REMOTE_ROOT,
+            local_root=self.local_root,
+            output_dir=self.tmp / "reports",
+            issuer_allow={ISSUER},
+            year_allow={"2031"},
+            month_allow=None,
+            download=True,
+            force_download=force,
+            keep_compressed=keep_compressed,
+            settings=settings,
+            connector=server.connector(),
+            sleep=self.sleeps.append,
+            clock=self.clock,
+            start_watchdog=False,
+        )
+
+    def local(self, name: str) -> Path:
+        return self.local_month / name
+
+    def outcome(self, run, filename: str) -> dict:
+        rows = [row for r in run.results for row in r.download_log if row["filename"] == filename]
+        self.assertEqual(len(rows), 1, filename)
+        return rows[0]
+
+    def temp_files(self) -> list[str]:
+        if not self.local_month.exists():
+            return []
+        return sorted(
+            p.name for p in self.local_month.iterdir()
+            if p.name.endswith((".part", ".tmp"))
+        )
+
+    def state_rows(self) -> list[dict]:
+        path = self.local_month / ".outbound_download_state.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+class SftpSkipAndResumeTests(SftpReliabilityBase):
+    def test_complete_plain_xml_is_skipped_and_untouched(self) -> None:
+        name = to_name("20310105000000")
+        remote_path = f"{MONTH_DIR}/{name}"
+        server = FakeServer({}, sizes={remote_path: 21_784_485})
+        self.local_month.mkdir(parents=True)
+        local = self.local(name)
+        with local.open("wb") as fh:
+            fh.truncate(21_784_485)
+        os.utime(local, ns=(1_000_000_000_000_000_000, 1_000_000_000_000_000_000))
+        before = local.stat()
+
+        with patch("outbound_automation.sftp_transfer.os.replace", wraps=os.replace) as rep:
+            run = self.run_download(server)
+
+        after = local.stat()
+        rep.assert_not_called()
+        self.assertEqual(server.opened, [])
+        self.assertNotIn(("stat", remote_path), server.ops)
+        self.assertEqual((after.st_size, after.st_mtime_ns, after.st_ino),
+                         (before.st_size, before.st_mtime_ns, before.st_ino))
+        row = self.outcome(run, name)
+        self.assertEqual(row["action"], "SKIP_ALREADY_DOWNLOADED")
+        self.assertEqual(run.results[0].existing, 1)
+        self.assertEqual(self.state_rows(), [])
+        self.assertFalse(run.failed)
+
+    def test_local_size_mismatch_is_redownloaded(self) -> None:
+        name = to_name("20310106000000")
+        data = b"<enrollments>" + b"x" * 5000 + b"</enrollments>"
+        server = FakeServer({f"{MONTH_DIR}/{name}": data})
+        self.local_month.mkdir(parents=True)
+        self.local(name).write_bytes(data[:100])
+
+        run = self.run_download(server)
+
+        row = self.outcome(run, name)
+        self.assertEqual((row["action"], row["reason"]), ("REDOWNLOADED", "LOCAL_SIZE_MISMATCH"))
+        self.assertEqual(self.local(name).read_bytes(), data)
+        self.assertEqual(self.temp_files(), [])
+        state = self.state_rows()[-1]
+        self.assertEqual((state["local_size"], state["remote_size"]), (len(data), len(data)))
+        self.assertEqual(run.results[0].redownloaded, 1)
+
+    def test_stale_part_file_is_discarded_and_never_treated_as_complete(self) -> None:
+        done, todo = to_name("20310101000000"), to_name("20310102000000")
+        data = b"<enrollments>complete</enrollments>"
+        server = FakeServer({f"{MONTH_DIR}/{done}": data, f"{MONTH_DIR}/{todo}": data})
+        self.local_month.mkdir(parents=True)
+        self.local(done).write_bytes(data)
+        (self.local_month / f".{done}.part").write_bytes(b"leftover")
+        (self.local_month / f".{todo}.part").write_bytes(data[:10])
+
+        run = self.run_download(server)
+
+        self.assertEqual(self.outcome(run, done)["action"], "SKIP_ALREADY_DOWNLOADED")
+        self.assertEqual((self.outcome(run, todo)["action"], self.outcome(run, todo)["reason"]),
+                         ("DOWNLOADED", "NEW"))
+        self.assertEqual(self.local(todo).read_bytes(), data)
+        self.assertEqual(self.temp_files(), [])
+        self.assertEqual(server.opened, [todo])
+
+    def test_rerun_after_failure_continues_with_incomplete_file_only(self) -> None:
+        names = [to_name(f"2031010{d}000000") for d in (1, 2, 3)]
+        files = {f"{MONTH_DIR}/{n}": f"<enrollments>{n}</enrollments>".encode() for n in names}
+        first = FakeServer(files)
+        first.read_faults.append((names[1], 0, _raise_timeout, True))
+        run1 = self.run_download(first)
+        self.assertTrue(run1.failed)
+        self.assertFalse(self.local(names[1]).exists())
+
+        second = FakeServer(files)
+        run2 = self.run_download(second)
+
+        self.assertFalse(run2.failed)
+        self.assertEqual(second.opened, [names[1]])
+        self.assertEqual([self.outcome(run2, n)["action"] for n in names],
+                         ["SKIP_ALREADY_DOWNLOADED", "DOWNLOADED", "SKIP_ALREADY_DOWNLOADED"])
+        for n in names:
+            self.assertEqual(self.local(n).read_bytes(), files[f"{MONTH_DIR}/{n}"])
+
+    def test_atomic_replacement_keeps_old_file_until_validated(self) -> None:
+        name = to_name("20310107000000")
+        new = b"<enrollments>" + b"n" * 70_000 + b"</enrollments>"
+        old = b"<enrollments>old</enrollments>"
+        server = FakeServer({f"{MONTH_DIR}/{name}": new})
+        self.local_month.mkdir(parents=True)
+        local = self.local(name)
+        local.write_bytes(old)
+        seen: list[bytes] = []
+        server.read_faults.append((name, 1, lambda _h: seen.append(local.read_bytes()), False))
+
+        with patch("outbound_automation.sftp_transfer.os.replace", wraps=os.replace) as rep:
+            self.run_download(server)
+
+        self.assertEqual(seen, [old])
+        self.assertEqual(local.read_bytes(), new)
+        moves = [(Path(a), Path(b)) for a, b in (c.args for c in rep.call_args_list)]
+        self.assertEqual(moves, [(self.local_month / f".{name}.part", local)])
+
+
+class SftpRetryTests(SftpReliabilityBase):
+    def test_stalled_read_is_aborted_reconnected_and_retried(self) -> None:
+        name = to_name("20310108000000")
+        data = b"<enrollments>" + b"s" * 100_000 + b"</enrollments>"
+        server = FakeServer({f"{MONTH_DIR}/{name}": data})
+        sessions: list[OutboundSftpSession] = []
+
+        class Recording(OutboundSftpSession):
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__(*args, **kwargs)
+                sessions.append(self)
+
+        checks: list[str | None] = []
+
+        def stall(_handle) -> None:
+            self.clock.advance(61)
+            checks.append(sessions[0].check_stall())
+            self.clock.advance(120)
+            checks.append(sessions[0].check_stall())
+            raise EOFError("Server connection dropped")
+
+        server.read_faults.append((name, 32 * 1024, stall, False))
+        with patch("outbound_automation.sftp_download.OutboundSftpSession", Recording):
+            run = self.run_download(server)
+
+        self.assertEqual(checks, ["warn", "abort"])
+        self.assertTrue(server.transports[0].closed)
+        self.assertEqual(self.local(name).read_bytes(), data)
+        self.assertEqual((run.stats.stall_retries, run.stats.reconnects, run.stats.stall_aborts), (1, 1, 1))
+        self.assertEqual(self.outcome(run, name)["attempts"], 2)
+        self.assertEqual(self.sleeps, [10.0])
+        self.assertFalse(run.failed)
+
+    def test_listing_operation_timeout_is_logged_and_retried_on_new_connection(self) -> None:
+        name = to_name("20310109000000")
+        server = FakeServer({f"{MONTH_DIR}/{name}": b"<enrollments/>"})
+        server.op_faults.append(("listdir_attr", MONTH_DIR, socket.timeout("timed out")))
+
+        with self.assertLogs("outbound_automation.sftp_session", level="INFO") as logs:
+            run = self.run_download(server)
+
+        text = "\n".join(logs.output)
+        self.assertIn(f"SFTP_OP_START listdir_attr {MONTH_DIR}", text)
+        self.assertIn(f"SFTP_OP_FAILED listdir_attr {MONTH_DIR}", text)
+        self.assertIn(f"SFTP_OP_END listdir_attr {MONTH_DIR}", text)
+        self.assertIn("SFTP_RETRY", text)
+        self.assertEqual(server.connections, 2)
+        self.assertEqual((run.stats.stall_retries, run.stats.reconnects), (1, 1))
+        self.assertEqual(self.local(name).read_bytes(), b"<enrollments/>")
+        self.assertFalse(run.failed)
+
+    def test_successful_retry_after_read_timeout(self) -> None:
+        name = to_name("20310110000000")
+        data = b"<enrollments>" + b"r" * 80_000 + b"</enrollments>"
+        server = FakeServer({f"{MONTH_DIR}/{name}": data})
+        server.read_faults.append((name, 32 * 1024, _raise_timeout, False))
+
+        run = self.run_download(server)
+
+        row = self.outcome(run, name)
+        self.assertEqual((row["action"], row["attempts"]), ("DOWNLOADED", 2))
+        self.assertEqual(self.local(name).read_bytes(), data)
+        self.assertEqual(self.temp_files(), [])
+        self.assertEqual(run.stats.stall_retries, 1)
+
+    def test_retry_exhaustion_fails_file_and_continues(self) -> None:
+        done, bad, good = (to_name(f"2031010{d}000000") for d in (1, 2, 3))
+        data = b"<enrollments>payload</enrollments>"
+        server = FakeServer({f"{MONTH_DIR}/{n}": data for n in (done, bad, good)})
+        self.local_month.mkdir(parents=True)
+        self.local(done).write_bytes(data)
+        done_mtime = self.local(done).stat().st_mtime_ns
+        server.read_faults.append((bad, 0, _raise_timeout, True))
+
+        run = self.run_download(server)
+
+        self.assertTrue(run.failed)
+        row = self.outcome(run, bad)
+        self.assertEqual((row["action"], row["attempts"]), ("FAILED", 4))
+        self.assertFalse(self.local(bad).exists())
+        self.assertEqual(self.outcome(run, good)["action"], "DOWNLOADED")
+        self.assertEqual(self.outcome(run, done)["action"], "SKIP_ALREADY_DOWNLOADED")
+        self.assertEqual(self.local(done).stat().st_mtime_ns, done_mtime)
+        self.assertEqual(self.sleeps, [10.0, 30.0, 90.0])
+        self.assertEqual((run.stats.stall_retries, run.stats.reconnects), (3, 4))
+        self.assertEqual(self.temp_files(), [])
+        self.assertEqual(run.results[0].failed, 1)
+
+    def test_reconnect_limit_stops_run(self) -> None:
+        first, second = to_name("20310111000000"), to_name("20310112000000")
+        server = FakeServer({f"{MONTH_DIR}/{first}": b"<a/>", f"{MONTH_DIR}/{second}": b"<b/>"})
+        server.read_faults.append((first, 0, _raise_timeout, True))
+
+        run = self.run_download(server, settings=SftpReliabilitySettings(max_reconnects=1))
+
+        self.assertTrue(run.failed)
+        self.assertEqual(len(run.run_errors), 1)
+        self.assertEqual(self.outcome(run, first)["reason"], "RECONNECT_LIMIT")
+        self.assertEqual([r["filename"] for r in run.results[0].download_log], [first])
+        self.assertFalse(self.local(second).exists())
+        self.assertEqual(run.stats.reconnects, 1)
+
+    def test_watchdog_tolerates_slow_progress_then_warns_and_aborts(self) -> None:
+        server = FakeServer({})
+        session = OutboundSftpSession(
+            server.connector(), FAST, sleep=self.sleeps.append, clock=self.clock, start_watchdog=False,
+        )
+        session.client  # noqa: B018 - connect
+        with session.activity("read slow-file"):
+            for _ in range(200):
+                self.clock.advance(50)
+                session.touch_progress()
+                self.assertIsNone(session.check_stall())
+            self.clock.advance(60)
+            self.assertEqual(session.check_stall(), "warn")
+            self.assertIsNone(session.check_stall())
+            self.clock.advance(120)
+            self.assertEqual(session.check_stall(), "abort")
+        self.assertTrue(server.transports[0].closed)
+        session.close()
+
+    def test_progress_line_reports_bytes_speed_and_eta(self) -> None:
+        mb = 1024 * 1024
+        progress = TransferProgress(22, 57, "to_x.xml", 48 * mb, interval=10, clock=self.clock)
+        self.clock.advance(4.0)
+        self.assertEqual(
+            progress.line(12 * mb),
+            "[22/57] to_x.xml remote=48.0 MB received=12.0 MB (25.0%) "
+            "speed=3.0 MB/s elapsed=4.0s eta=12.0s",
+        )
+
+
+class SftpCompressedTests(SftpReliabilityBase):
+    def test_legacy_compressed_file_is_fetched_once_and_replaced_atomically(self) -> None:
+        local_name = to_name("20310113000000")
+        remote_name = local_name + ".gz"
+        xml = b"<enrollments>fresh</enrollments>"
+        packed = gzip.compress(xml)
+        server = FakeServer({f"{MONTH_DIR}/{remote_name}": packed})
+        self.local_month.mkdir(parents=True)
+        self.local(local_name).write_bytes(b"<enrollments>legacy copy</enrollments>")
+
+        run = self.run_download(server)
+
+        row = self.outcome(run, remote_name)
+        self.assertEqual((row["action"], row["reason"]), ("REDOWNLOADED", "LEGACY_COMPRESSED_NO_STATE"))
+        self.assertEqual(self.local(local_name).read_bytes(), xml)
+        self.assertFalse(self.local(remote_name).exists())
+        self.assertEqual(self.temp_files(), [])
+        state = self.state_rows()[-1]
+        self.assertEqual(
+            (state["remote_filename"], state["remote_size"], state["local_size"], state["format"]),
+            (remote_name, len(packed), len(xml), "gz"),
+        )
+
+    def test_corrupt_compressed_download_never_replaces_existing_file(self) -> None:
+        local_name = to_name("20310114000000")
+        remote_name = local_name + ".gz"
+        legacy = b"<enrollments>legacy copy</enrollments>"
+        server = FakeServer({f"{MONTH_DIR}/{remote_name}": b"not a gzip stream"})
+        self.local_month.mkdir(parents=True)
+        self.local(local_name).write_bytes(legacy)
+
+        run = self.run_download(server)
+
+        row = self.outcome(run, remote_name)
+        self.assertEqual((row["action"], row["attempts"]), ("FAILED", 4))
+        self.assertEqual(self.local(local_name).read_bytes(), legacy)
+        self.assertEqual(self.temp_files(), [])
+        self.assertEqual(self.state_rows(), [])
+        self.assertEqual(run.stats.reconnects, 0)
+        self.assertTrue(run.failed)
+
+    def test_state_entry_skips_compressed_file_on_rerun(self) -> None:
+        local_name = to_name("20310115000000")
+        remote_name = local_name + ".xz"
+        xml = b"<enrollments>xz</enrollments>"
+        files = {f"{MONTH_DIR}/{remote_name}": lzma.compress(xml)}
+        self.run_download(FakeServer(files))
+        mtime = self.local(local_name).stat().st_mtime_ns
+
+        server = FakeServer(files)
+        run = self.run_download(server)
+
+        row = self.outcome(run, remote_name)
+        self.assertEqual((row["action"], row["reason"]), ("SKIP_ALREADY_DOWNLOADED", "STATE_MATCHES_REMOTE"))
+        self.assertEqual(server.opened, [])
+        self.assertEqual(self.local(local_name).stat().st_mtime_ns, mtime)
+        self.assertEqual(self.local(local_name).read_bytes(), xml)
+
+    def test_state_file_holds_metadata_only(self) -> None:
+        xml = (f"<enrollments><firstName>{PII_FIRST}</firstName>"
+               f"<ssn>{PII_SSN}</ssn></enrollments>").encode()
+        plain, packed = to_name("20310116000000"), to_name("20310117000000", ".gz")
+        server = FakeServer({f"{MONTH_DIR}/{plain}": xml, f"{MONTH_DIR}/{packed}": gzip.compress(xml)})
+
+        run = self.run_download(server)
+
+        rows = self.state_rows()
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(set(row), set(STATE_FIELDS))
+        texts = [(self.local_month / ".outbound_download_state.jsonl").read_text(encoding="utf-8")]
+        texts += [p.read_text(encoding="utf-8") for p in run.paths.values()]
+        for text in texts:
+            self.assertNotIn(PII_FIRST, text)
+            self.assertNotIn(PII_SSN, text)
+            self.assertNotIn("<enrollments", text)
+
+
+class SftpSelectionTests(SftpReliabilityBase):
+    FILES = {
+        f"{MONTH_DIR}/{to_name('20310101000000')}": b"<a/>",
+        f"{MONTH_DIR}/{to_name('20310102000000', '.gz')}": gzip.compress(b"<b/>"),
+        f"{MONTH_DIR}/15/{to_name('20310115000000', '.xz')}": lzma.compress(b"<c/>"),
+        f"{MONTH_DIR}/from_{ISSUER}_GA_834_INDV_20310101000000.xml": b"<d/>",
+        f"{MONTH_DIR}/to_{ISSUER}_report.xml": b"<e/>",
+        f"{MONTH_DIR}/to_{ISSUER}_GA_834_SHOP_20310101000000.xml": b"<f/>",
+    }
+
+    def test_walk_preserves_outbound_selection_rules_and_order(self) -> None:
+        server = FakeServer(self.FILES)
+        session = OutboundSftpSession(
+            server.connector(), FAST, sleep=self.sleeps.append, clock=self.clock, start_watchdog=False,
+        )
+        try:
+            result = walk_outbound_partition(session, REMOTE_ROOT, ISSUER, "2031", "01")
+        finally:
+            session.close()
+
+        self.assertEqual(
+            [(e["filename"], e["format"], e["local_name"]) for e in result.valid_files],
+            [
+                (to_name("20310101000000"), "xml", to_name("20310101000000")),
+                (to_name("20310102000000", ".gz"), "gz", to_name("20310102000000")),
+                (to_name("20310115000000", ".xz"), "xz", to_name("20310115000000")),
+            ],
+        )
+        expected_counts: dict[str, int] = {}
+        for path in self.FILES:
+            cls = classify_outbound_filename(path.rsplit("/", 1)[-1])
+            expected_counts[cls] = expected_counts.get(cls, 0) + 1
+        self.assertEqual(result.class_counts, expected_counts)
+        self.assertEqual((result.files_scanned, result.folders_scanned, result.max_depth), (6, 2, 1))
+        self.assertTrue(all(e["remote_size"] is not None for e in result.valid_files))
+
+    def test_only_selected_to_files_are_downloaded(self) -> None:
+        run = self.run_download(FakeServer(self.FILES))
+
+        self.assertFalse(run.failed)
+        on_disk = sorted(p.name for p in self.local_month.iterdir() if not p.name.startswith("."))
+        self.assertEqual(
+            on_disk,
+            sorted([to_name("20310101000000"), to_name("20310102000000"), to_name("20310115000000")]),
+        )
+
+
+class SftpSettingsTests(unittest.TestCase):
+    NAMES = (
+        "OUTBOUND_SFTP_CONNECT_TIMEOUT", "OUTBOUND_SFTP_KEEPALIVE", "OUTBOUND_SFTP_OP_TIMEOUT",
+        "OUTBOUND_SFTP_STALL_WARN", "OUTBOUND_SFTP_STALL_ABORT", "OUTBOUND_SFTP_MAX_RETRIES",
+        "OUTBOUND_SFTP_MAX_RECONNECTS", "OUTBOUND_SFTP_CHUNK_BYTES", "OUTBOUND_SFTP_PROGRESS_INTERVAL",
+    )
+
+    def _resolve(self, **overrides: str) -> SftpReliabilitySettings:
+        env = {name: "" for name in self.NAMES}
+        env.update(overrides)
+        with patch("outbound_automation.config.settings", SimpleNamespace(refresh_from_env=lambda: None)), \
+             patch.dict(os.environ, env, clear=False):
+            return resolve_sftp_reliability_settings()
+
+    def test_defaults(self) -> None:
+        resolved = self._resolve()
+        self.assertEqual(
+            (resolved.connect_timeout, resolved.keepalive, resolved.op_timeout, resolved.stall_warn,
+             resolved.stall_abort, resolved.max_retries, resolved.max_reconnects,
+             resolved.chunk_bytes, resolved.progress_interval),
+            (30.0, 30, 120.0, 60.0, 180.0, 3, 10, 1048576, 10.0),
+        )
+
+    def test_overrides_and_validation(self) -> None:
+        self.assertEqual(self._resolve(OUTBOUND_SFTP_OP_TIMEOUT="45").op_timeout, 45.0)
+        for bad in ({"OUTBOUND_SFTP_STALL_WARN": "200"}, {"OUTBOUND_SFTP_MAX_RETRIES": "abc"},
+                    {"OUTBOUND_SFTP_CHUNK_BYTES": "100"}, {"OUTBOUND_SFTP_MAX_RECONNECTS": "-1"}):
+            with self.assertRaises(OutboundConfigError, msg=str(bad)):
+                self._resolve(**bad)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from outbound_automation.config import (
     resolve_outbound_remote_path,
     resolve_outbound_source_root,
     resolve_sftp_credentials,
+    resolve_sftp_reliability_settings,
     resolve_source_json_policy,
 )
 from outbound_automation.constants import ENV_ENABLED, ENV_SOURCE_JSON_PII_POLICY, OUTPUT_ROOT
@@ -99,6 +100,7 @@ def _run_sftp(args: argparse.Namespace, *, download: bool) -> int:
     remote_root = resolve_outbound_remote_path()
     local_root = resolve_outbound_source_root()
     creds = resolve_sftp_credentials()
+    reliability = resolve_sftp_reliability_settings()
     issuers = _parse_issuer_list(args.issuer)
     output_dir = OUTPUT_ROOT / f"{new_load_run_id()}_sftp_{'download' if download else 'audit'}"
 
@@ -110,8 +112,11 @@ def _run_sftp(args: argparse.Namespace, *, download: bool) -> int:
     print(f"  year filter     : {args.year or 'ALL'}")
     print(f"  month filter    : {args.month or 'ALL'}")
     print(f"  reports         : {output_dir}")
+    print("  SFTP reliability:")
+    for label, value in reliability.describe():
+        print(f"    {label:<20}: {value}")
 
-    results, paths = run_outbound_sftp(
+    run = run_outbound_sftp(
         creds=creds,
         remote_root=remote_root,
         local_root=local_root,
@@ -122,19 +127,30 @@ def _run_sftp(args: argparse.Namespace, *, download: bool) -> int:
         download=download,
         force_download=args.force_download,
         keep_compressed=args.keep_compressed,
+        settings=reliability,
     )
+    results = run.results
 
-    print("\nOutbound SFTP complete.")
-    print(f"  Partitions          : {len(results)}")
-    print(f"  Remote files scanned: {sum(r.files_scanned for r in results)}")
-    print(f"  TO files selected   : {sum(r.valid_total for r in results)}")
+    print("\nOutbound SFTP complete." if not run.failed else "\nOutbound SFTP finished WITH FAILURES.")
+    print(f"  Partitions                  : {len(results)}")
+    print(f"  Partition listings failed   : {sum(1 for r in results if r.listing_failed)}")
+    print(f"  Remote files scanned        : {sum(r.files_scanned for r in results)}")
+    print(f"  TO files selected           : {sum(r.valid_total for r in results)}")
     if download:
-        print(f"  Downloaded          : {sum(r.downloaded for r in results)}")
-        print(f"  Existing (skipped)  : {sum(r.existing for r in results)}")
-        print(f"  Failed              : {sum(r.failed for r in results)}")
-    for name, path in paths.items():
+        print(f"  Downloaded                  : {sum(r.downloaded for r in results)}")
+        print(f"  Skipped already downloaded  : {sum(r.existing for r in results)}")
+        print(f"  Re-downloaded               : {sum(r.redownloaded for r in results)}")
+        print(f"  Failed                      : {sum(r.failed for r in results)}")
+    print(f"  Stall retries               : {run.stats.stall_retries}")
+    print(f"  Reconnects                  : {run.stats.reconnects}")
+    for error in run.run_errors:
+        print(f"  ERROR: {error}")
+    for name, path in run.paths.items():
         print(f"  {name}: {path}")
-    if download and any(r.failed for r in results):
+    if run.failed:
+        if download:
+            print("\nCompleted files were kept. Re-run the same command to continue; "
+                  "verified files are skipped (SKIP_ALREADY_DOWNLOADED).")
         return 1
     return 0
 
